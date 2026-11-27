@@ -51,7 +51,7 @@ export default function FrameCaptureOptIn({ setEnabled }: FrameCaptureOptInProps
   );
 }
 
-/** "Works without touching the game; some anti-cheat systems are untested" + the test matrix placeholder. */
+/** What capture does and that no anti-cheat system has been tested yet, plus the test matrix placeholder. */
 export function AntiCheatNote({ className }: { className?: string }) {
   return (
     <GlassCard title="Anti-cheat" icon={ShieldQuestion} className={className} bodyClassName="pt-1">

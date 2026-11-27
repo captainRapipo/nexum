@@ -4,6 +4,9 @@ import { boundByLabel, fmtFrametime } from "../../lib/frames";
 import { SERIES_HEX, StatusPill } from "../ui";
 import { BOUND_BY_RULE, HAGS_NOTE } from "./gamingText";
 
+/** Why the badge shows "—" (CONTRACT §1.6.5: boundBy is null without both busy times or below 30 frames). */
+const BOUND_NULL_REASON = "Not enough data: needs CPU and GPU busy times and at least 30 frames in the window.";
+
 export interface BusyBarsProps {
   stats: FrameStats | null;
 }
@@ -72,7 +75,11 @@ export default function BusyBars({ stats }: BusyBarsProps) {
         <span className="text-[12px] text-muted">
           Average frame time <span className="num text-slate-200">{t == null ? "—" : fmtFrametime(t)}</span>
         </span>
-        <StatusPill tone={bound == null ? "unknown" : "info"} icon={Gauge} title={`${BOUND_BY_RULE}\n\n${HAGS_NOTE}`}>
+        <StatusPill
+          tone={bound == null ? "unknown" : "info"}
+          icon={Gauge}
+          title={`${bound == null ? `${BOUND_NULL_REASON}\n\n` : ""}${BOUND_BY_RULE}\n\n${HAGS_NOTE}`}
+        >
           {boundByLabel(bound)}
         </StatusPill>
       </div>

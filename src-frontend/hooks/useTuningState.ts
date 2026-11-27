@@ -17,8 +17,8 @@ export interface TuningStateValue {
 
 /**
  * Read-only GPU tuning data (CONTRACT §4.4). While `active`, asks for a fresh state immediately and
- * every 5 s (the next request starts only after the previous one settled). While inactive it never
- * calls the backend, so no ADL call ever runs while the tab is hidden.
+ * every 5 s (the next request starts only after the previous one settled). While inactive, or while the
+ * window is hidden, it never calls the backend, so no ADL call ever runs while the tab is not on screen.
  */
 export function useTuningState(active: boolean): TuningStateValue {
   const [state, setState] = useState<TuningState | null>(null);
@@ -57,9 +57,17 @@ export function useTuningState(active: boolean): TuningStateValue {
     return run;
   }, []);
 
-  // Poll only while active.
+  // The window is hidden (minimized or in the tray): the tab is not visible, so no ADL reads either.
+  const [docVisible, setDocVisible] = useState(() => typeof document === "undefined" || !document.hidden);
   useEffect(() => {
-    if (!active) return;
+    const onVis = () => setDocVisible(!document.hidden);
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
+
+  // Poll only while active and visible (CONTRACT §2.14: never while the tab is hidden).
+  useEffect(() => {
+    if (!active || !docVisible) return;
     let stopped = false;
     let timer: number | null = null;
     const loop = async () => {
@@ -72,7 +80,7 @@ export function useTuningState(active: boolean): TuningStateValue {
       stopped = true;
       if (timer != null) window.clearTimeout(timer);
     };
-  }, [active, fetchState]);
+  }, [active, docVisible, fetchState]);
 
   // A probe or another caller refreshed the state.
   useEffect(

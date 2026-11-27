@@ -179,7 +179,7 @@ export default function CategoryList({
                   <button
                     type="button"
                     onClick={onOpenReliabilityMonitor}
-                    className="mt-1 inline-flex items-center gap-1 text-[11px] text-silver underline decoration-white/20 underline-offset-2 transition hover:text-ink"
+                    className="mt-1 mr-4 inline-flex items-center gap-1 text-[11px] text-silver underline decoration-white/20 underline-offset-2 transition hover:text-ink"
                   >
                     <ExternalLink size={11} aria-hidden="true" />
                     Open Reliability Monitor
@@ -188,7 +188,7 @@ export default function CategoryList({
                 {c.id === "recycle" && recycleAge && !compact && (
                   <div className="mt-1.5 flex flex-wrap items-center gap-2">
                     <span className="text-[11px] text-slate-400" id="nx-recycle-age-label">
-                      Items older than
+                      In the bin for more than
                     </span>
                     <Segmented
                       value={recycleAge.value ?? 0}
@@ -205,7 +205,7 @@ export default function CategoryList({
                     type="button"
                     onClick={() => toggleOpen(c.id)}
                     aria-expanded={open}
-                    aria-controls={detailsId}
+                    aria-controls={open ? detailsId : undefined}
                     className="mt-1 inline-flex items-center gap-1 text-[11px] text-silver transition hover:text-ink"
                   >
                     <ChevronRight

@@ -65,7 +65,8 @@ function isObj(v: unknown): v is Record<string, unknown> {
 /**
  * Frame capture state for the whole app (CONTRACT §4.4). Mounted in App.tsx above every view.
  * `frame-session` / `frame-target` are always followed (rare events); `frame-stats` (1 Hz, with up to
- * 1000 frame times each) only while capture is on and a consumer (Gaming view, Dashboard KPI) is mounted.
+ * 1000 frame times each) only while capture is on, the window is visible and a consumer (Gaming view,
+ * Dashboard KPI) is mounted.
  */
 export function FramesProvider({ children }: { children: ReactNode }) {
   const { settings } = useSettings();
@@ -175,14 +176,30 @@ export function FramesProvider({ children }: { children: ReactNode }) {
     };
   }, [applySession, applyTarget, reset, loadState]);
 
-  // Stats: only while capture is on and someone looks at them.
-  const following = enabled && interest > 0;
+  // The window is hidden (minimized or in the tray): nobody can see frame stats, so do not follow them.
+  // The agent's capture keeps running either way (CONTRACT §2: never paused while hidden).
+  const [docVisible, setDocVisible] = useState(() => typeof document === "undefined" || !document.hidden);
+  useEffect(() => {
+    const onVis = () => setDocVisible(!document.hidden);
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
+
+  // Stats: only while capture is on, the window is visible and a consumer (Gaming view, Dashboard KPI) is
+  // mounted. Leaving those views drops the 1 Hz stream and the rolling frame-time buffer (up to
+  // 120 s × 1000 values), so a later return never shows minutes-old frames joined to new ones.
+  const following = enabled && interest > 0 && docVisible;
   useEffect(() => {
     if (!following) return;
     loadState(); // catch up on session/target/stats missed while nobody listened
-    return subscribe<FrameStats>(EVENTS.frameStats, (s) => {
+    const off = subscribe<FrameStats>(EVENTS.frameStats, (s) => {
       if (isObj(s) && typeof s.pid === "number") applyStats(s);
     });
+    return () => {
+      off();
+      clearBatches(batches.current.pid);
+      setData((d) => (d.frametimes.length ? { ...d, frametimes: NO_FRAMETIMES } : d));
+    };
   }, [following, applyStats, loadState]);
 
   // Capture turned off in Settings: drop live data at once (the agent's events follow).

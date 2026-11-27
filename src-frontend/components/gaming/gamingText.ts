@@ -44,8 +44,12 @@ export const NO_DISPLAY_DATA = "PresentMon reported no display data for this app
 export const KNOWN_LIMITS =
   'Known limits: some apps (runtime "Other") report less detail; frames from driver frame generation may not be counted.';
 
+/**
+ * Honest status (CONTRACT §4.8): say what capture does, never "safe". No anti-cheat system has been
+ * tested yet, so the text must not suggest that some have.
+ */
 export const ANTI_CHEAT_SUMMARY =
-  "Works without touching the game. Some anti-cheat systems are untested; this list is updated when a test is done.";
+  "Frame capture reads Windows performance events and never touches the game. It has not been tested with any anti-cheat system yet; this list is updated when a test is done.";
 
 /**
  * Anti-cheat test matrix placeholder (ROADMAP §4.3). Every row stays "Not tested yet" until the
@@ -56,6 +60,7 @@ export const ANTI_CHEAT_MATRIX: readonly { system: string; status: string }[] = 
   { system: "BattlEye", status: "Not tested yet" },
   { system: "Riot Vanguard", status: "Not tested yet" },
   { system: "EA Javelin", status: "Not tested yet" },
+  { system: "Valve Anti-Cheat (VAC)", status: "Not tested yet" },
   { system: "FACEIT", status: "Not tested yet" },
 ];
 

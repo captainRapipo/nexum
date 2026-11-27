@@ -208,6 +208,10 @@ export const TIMINGS_SOURCE_HINT: Record<TimingsSource, string> = {
   unavailable: "Memory timings could not be read on this system.",
 };
 
+/** Shown under SPD-sourced timing rows so they are never read as the running timings (CONTRACT §1.4.1). */
+export const SPD_NOT_RUNNING_NOTE =
+  "These are the module's JEDEC minimum timings from its SPD chip, not the timings the memory runs at now.";
+
 const NOT_IN_SPD: SpecValue = {
   kind: "muted",
   text: "Not in SPD data",

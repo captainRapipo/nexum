@@ -54,6 +54,7 @@ import {
   securityRows,
   spdCycleRows,
   spdNsRows,
+  SPD_NOT_RUNNING_NOTE,
   timingRows,
   TIMINGS_SOURCE_HINT,
   TIMINGS_SOURCE_LABEL,
@@ -276,7 +277,11 @@ function TimingsCard({ memory, ctx }: { memory: MemorySpec; ctx: RowCtx }) {
       }
     >
       {rows.length > 0 ? (
-        <SpecRows rows={rows} />
+        <>
+          <SpecRows rows={rows} />
+          {/* The chip can truncate at narrow widths: SPD values are never shown without this sentence. */}
+          {src === "spd" && <Note>{SPD_NOT_RUNNING_NOTE}</Note>}
+        </>
       ) : (
         <div className="py-1.5">
           {memory.timingsNote ? (

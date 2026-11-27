@@ -31,6 +31,14 @@ export function fmtAge(ts: number | null, now: number): string {
   return plural(Math.floor(days / 365.25), "year");
 }
 
+/**
+ * Open folder is offered only for plain local drive paths (`C:\…`), the only kind `open_external`
+ * accepts: never UNC shares (an elevated probe of one leaks credentials), never `\\?\` device paths.
+ */
+export function isLocalDrivePath(p: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(p) && !/[\u0000-\u001f"]/.test(p);
+}
+
 /** Keeps the drive and the file name: `C:\Users\User\AppData\…\Cache_Data\f_00a1b2`. */
 export function middleTruncate(path: string, max = 72): string {
   if (path.length <= max) return path;
@@ -151,7 +159,7 @@ export default function CategoryDetails({ categoryId, recycleMinAgeDays, scanSta
               <span className="text-right font-mono text-[11px] text-ink">{fmtSize(it.bytes, unit)}</span>
               <span className="truncate text-[11px] text-slate-400">{fmtAge(it.modifiedTs, state.at)}</span>
               <span className="flex justify-end">
-                {!isRecycle && (
+                {!isRecycle && isLocalDrivePath(it.kind === "group" ? it.path : dirnameOf(it.path)) && (
                   <button
                     type="button"
                     onClick={() => openFolder(it)}
