@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+
+# Frontend build output
+dist/
+*.tsbuildinfo
+
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Compiled sidecar binaries (rebuilt from nexum-agent/)
+src-tauri/binaries/*.exe
+
+# .NET sidecar build output
+nexum-agent/bin/
+nexum-agent/obj/
+nexum-agent/publish/
+*.user
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Env / local overrides
+.env
+.env.*
+*.local
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# CI / local build staging
+build/
+out/
+
+# Local-only notes about the maintainer machine (personal)
+docs/target-hardware.md
