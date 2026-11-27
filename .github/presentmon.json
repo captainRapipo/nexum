@@ -1,0 +1,13 @@
+{
+  "$comment": "CONTRACT §7 item 7 / ROADMAP §4.3 gate 4. The single source of the pinned PresentMon build that CI downloads at build time and ships unmodified. Changing any value is a deliberate PR: also update the agent's pinned SHA-256 (CONTRACT §1.6.1), the Tauri resource name (CONTRACT §2.13, src-tauri/tauri.conf.json) and nexum-agent/Frames/HEADER-<version>.txt. Verified 2026-11-27: GitHub asset digest = local SHA-256, Authenticode Valid, signer CN=Intel Corporation, issuer CN=Sectigo Public Code Signing CA R36.",
+  "version": "2.6.0",
+  "tag": "v2.6.0",
+  "asset": "PresentMon-2.6.0-x64.exe",
+  "url": "https://github.com/GameTechDev/PresentMon/releases/download/v2.6.0/PresentMon-2.6.0-x64.exe",
+  "sha256": "b2a706bc6ad475749e3b7e3409263aa1e6906d45bdcf993f6dbc0f660188f1af",
+  "size": 980320,
+  "signerSubjectPrefix": "CN=Intel Corporation",
+  "license": "MIT",
+  "licenseUrl": "https://github.com/GameTechDev/PresentMon/blob/v2.6.0/LICENSE.txt",
+  "dest": "build/presentmon/PresentMon-2.6.0-x64.exe"
+}

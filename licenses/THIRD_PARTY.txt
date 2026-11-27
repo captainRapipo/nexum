@@ -1,0 +1,96 @@
+NEXUM - THIRD-PARTY COMPONENTS
+==============================
+
+Nexum is licensed under the GNU General Public License v3.0 (see LICENSE).
+This file lists every third-party component that is bundled with Nexum (compiled in,
+or shipped as a separate file in the installer and the portable build), plus the
+third-party material Nexum follows or calls but does not ship. Each entry gives the
+licence and the upstream URL. Full licence texts are in this folder; see README.md
+here for a readable version of the same list.
+
+
+1. SHIPPED AS A SEPARATE, UNMODIFIED, VENDOR-SIGNED FILE
+--------------------------------------------------------
+
+Intel PresentMon (console application) 2.6.0
+  File:      presentmon/PresentMon-2.6.0-x64.exe (Intel's release asset, byte for byte)
+  SHA-256:   b2a706bc6ad475749e3b7e3409263aa1e6906d45bdcf993f6dbc0f660188f1af
+  Signed by: Intel Corporation (Authenticode). Nexum never re-signs or modifies it.
+  Licence:   MIT, Copyright (C) 2017-2024 Intel Corporation
+  Text:      PresentMon/LICENSE.txt
+  Source:    https://github.com/GameTechDev/PresentMon (tag v2.6.0)
+  Use:       optional frame-rate capture (off by default). Started by Nexum's hardware
+             agent only after its hash and signature are checked; reads Windows ETW
+             events; nothing is injected into other processes.
+
+Mono.Posix.NETStandard native helpers 1.0.0
+  Files:     MonoPosixHelper.dll, libMonoPosixHelper.dll (vendor-signed)
+  Licence:   MIT
+  Source:    https://github.com/mono/mono
+
+
+2. COMPILED INTO THE HARDWARE AGENT (nexum-agent.exe)
+-----------------------------------------------------
+
+LibreHardwareMonitorLib 0.9.6           MPL-2.0       MPL-2.0.txt
+  https://github.com/LibreHardwareMonitor/LibreHardwareMonitor
+DiskInfoToolkit 1.1.2                   MPL-2.0       MPL-2.0.txt
+  https://github.com/Blacktempel/DiskInfoToolkit
+RAMSPDToolkit-NDD 1.4.2                 MPL-2.0       MPL-2.0.txt
+  https://github.com/Blacktempel/RAMSPDToolkit
+HidSharp 2.6.4                          Apache-2.0    Apache-2.0-HidSharp.txt
+  https://software.seekye.com/hidsharp
+.NET 8 runtime, System.Management,      MIT           (in the packages)
+System.IO.Ports, System.Threading.AccessControl
+  https://github.com/dotnet/runtime
+
+The MPL-2.0 libraries are used unmodified, exactly as published on NuGet; their
+source is available from the repositories above at the matching version tags.
+
+
+3. COMPILED INTO THE USER INTERFACE (Nexum.exe)
+-----------------------------------------------
+
+Apache ECharts 5.6.x                    Apache-2.0    Apache-2.0-ECharts.txt, NOTICE-ECharts.txt
+  https://github.com/apache/echarts     (contains BSD-3-Clause parts from d3: BSD-3-Clause-d3.txt)
+ZRender 5.6.x                           BSD-3-Clause  BSD-3-Clause-ZRender.txt
+  https://github.com/ecomfe/zrender
+React, React DOM 18.3.x                 MIT           MIT-React.txt
+  https://github.com/facebook/react
+Lucide icons (lucide-react) 0.468.x     ISC           ISC-Lucide.txt
+  https://github.com/lucide-icons/lucide
+Inter typeface (@fontsource/inter)      OFL-1.1       OFL-1.1-Inter.txt
+  https://github.com/rsms/inter
+JetBrains Mono (@fontsource/jetbrains-mono)  OFL-1.1  OFL-1.1-JetBrainsMono.txt
+  https://github.com/JetBrains/JetBrainsMono
+Tauri 2.x and plugins (shell, single-instance, notification) and the other Rust
+crates listed in src-tauri/Cargo.lock   MIT or Apache-2.0 (per crate)
+  https://github.com/tauri-apps/tauri
+
+
+4. NOT SHIPPED: USED AS A REFERENCE OR CALLED ON THE USER'S SYSTEM
+------------------------------------------------------------------
+
+AMD Display Library (ADL) SDK
+  Licence:   MIT (notice in include/adl_sdk.h)
+  Text:      ADL/LICENSE.txt
+  Source:    https://github.com/GPUOpen-LibrariesAndSDKs/display-library
+  Use:       read-only GPU tuning data. Nexum declares 11 ADL functions by hand (set-up,
+             tear-down and "Get"/"Caps" reads only) and calls the atiadlxx.dll that the
+             AMD graphics driver installs in System32.
+             No ADL file is shipped and no ADL "Set" function is ever called.
+
+ZenStates-Core
+  Licence:   GPL-3.0 (same as Nexum; text in LICENSE)
+  Notice:    ZenStates-Core/NOTICE.txt
+  Source:    https://github.com/irusanov/ZenStates-Core
+  Use:       the DDR4 memory-controller register map (Dictionaries/DDR4Dictionary.cs)
+             that nexum-agent/Spec/MemoryTimings.cs follows to read live DDR4 timings.
+
+PawnIO (kernel driver)
+  Not included, not redistributed, not installed by Nexum. Installed separately by
+  the user from https://pawnio.eu/ (source: https://github.com/namazso/PawnIO.Setup).
+
+Microsoft Edge WebView2 Runtime
+  Not included. Part of Windows 11; the installer downloads Microsoft's bootstrapper
+  when it is missing.

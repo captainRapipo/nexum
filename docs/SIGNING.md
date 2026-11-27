@@ -14,7 +14,7 @@ CI does not override it (`npm run tauri -- build` without `--bundles`), so the c
 | Artifact | Contents | Today |
 | --- | --- | --- |
 | `nexum-installers-unsigned` | one installer per `bundle.targets` entry: NSIS `Nexum_<ver>_x64-setup.exe`, and `Nexum_<ver>_x64_en-US.msi` if `msi` is listed | `bundle.targets = ["nsis"]`: the NSIS installer only |
-| `nexum-portable-unsigned` | `Nexum.exe`, `nexum-agent.exe`, any native `.dll` the agent publish leaves next to it, `LICENSE`, `licenses/` | |
+| `nexum-portable-unsigned` | `Nexum.exe`, `nexum-agent.exe`, any native `.dll` the agent publish leaves next to it, `presentmon/PresentMon-2.6.0-x64.exe` (Intel-signed, third-party), `LICENSE`, `licenses/` | |
 | `nexum-sha256-unsigned` | `SHA256SUMS-unsigned.txt` for every file above | |
 
 MSI is the documented fallback (ROADMAP MF-8 item 2): it is removed by Microsoft-signed `msiexec`, so it has no unsigned
@@ -24,6 +24,25 @@ NSIS checks below cannot be made to pass.
 Native libraries: once the agent is published with `IncludeNativeLibrariesForSelfExtract=false` (MF-8 item 1), its native
 DLLs (today `MonoPosixHelper.dll` and `libMonoPosixHelper.dll`, already signed by their vendor) sit next to
 `nexum-agent.exe` instead of being extracted to the user-writable `%TEMP%\.net`. They must be installed with the agent.
+
+### Intel PresentMon (third-party, shipped unmodified)
+
+Since v1.1 the installer and the portable build contain `presentmon/PresentMon-2.6.0-x64.exe`, Intel's PresentMon
+console application (MIT), used by the opt-in frame capture (ROADMAP §4, CONTRACT §1.6). It is **Intel's release asset
+byte for byte**, already Authenticode-signed by Intel Corporation:
+
+* CI downloads it at build time from the pinned GitHub release URL in [`.github/presentmon.json`](../.github/presentmon.json)
+  (the only place the URL and hash live) with [`fetch-presentmon.ps1`](../.github/scripts/fetch-presentmon.ps1), and fails
+  unless its SHA-256 is `b2a706bc6ad475749e3b7e3409263aa1e6906d45bdcf993f6dbc0f660188f1af`, `Get-AuthenticodeSignature`
+  is `Valid` and the signer subject starts with `CN=Intel Corporation`. This happens before anything compiles
+  `src-tauri`, because tauri-build checks that every `bundle.resources` file exists.
+* It is shipped through `bundle.resources` (not `externalBin`, which the bundler may sign) and is never committed
+  (`build/presentmon/` is gitignored).
+* **It must never be re-signed.** A re-signed copy has a different SHA-256, so the agent's pinned-hash check refuses
+  to start it at runtime (CONTRACT §1.6.1), and the CI checks below fail the build and the release.
+* Nexum itself never downloads it: the "no network code" rule (MF-11) covers the app; only CI downloads at build time.
+* Updating PresentMon is a deliberate pull request: change `.github/presentmon.json`, the agent's pinned hash, the
+  resource name in `tauri.conf.json` and the saved CSV header together (ROADMAP §4.3 gate 4).
 
 ## How releases are signed
 
@@ -67,6 +86,11 @@ eligibility for individuals is confirmed (ROADMAP Q12).
 | **Authenticode report** (MF-8) — `.github/scripts/check-authenticode.ps1` | `build` | report-only, unless the repository variable `NEXUM_SIGNING_ENABLED` is `true` (signing inside the build) |
 | **Authenticode must be `Valid`** (MF-8) | `sign` | any PE in the signed installers, the signed portable files, the installers' unpacked contents or the test-install image is not `Valid`. The release is not published. |
 | **Sidecar unit tests** | `build` | only runs when a `.csproj` references `Microsoft.NET.Test.Sdk` |
+| **Read-only GPU tuning** (CONTRACT §7.9) — `.github/scripts/check-tuning-readonly.mjs` | `policy` job | an ADL entry point with a `_Set` segment appears in the agent, Rust or frontend sources; anything under `nexum-agent/Tuning/` has a `_Set` segment, a native import outside `AdlNative.cs`, `GetProcAddress`, `NativeLibrary.*`, a function pointer or reflection; or `AdlNative.cs` imports an entry point that is not on the CONTRACT §1.7.1 whitelist or is not restricted to System32. No allow-list. |
+| **No injection or hooks** (CONTRACT §0) — `.github/scripts/check-no-injection.mjs` | `policy` job | `CreateRemoteThread`, `WriteProcessMemory`/`ReadProcessMemory`, `VirtualAllocEx`, `QueueUserAPC`, `SetThreadContext`, `SetWindowsHookEx`, `SetWinEventHook`, `PostMessage`/`SendMessage` and similar APIs appear in the agent, Rust or frontend sources. No allow-list. |
+| **PresentMon download** (CONTRACT §7.7) — `.github/scripts/fetch-presentmon.ps1` | `build` (before any Rust compile) | the pinned file cannot be downloaded, or its SHA-256, Authenticode status or Intel signer does not match `.github/presentmon.json` |
+| **Frame capture + tuning guard smoke test** — `.github/scripts/smoke-frames.ps1` | `build` | `tuningProbe write:true` is not rejected; the agent finds PresentMon without `--presentmon`; the trust check rejects the pinned Intel exe; PresentMon survives a hard kill of the agent (Job Object); or a `NexumFrames` ETW session is left after a clean stop (ROADMAP §4.3 gate 3) |
+| **PresentMon shipped unmodified** (MF-8 item 7) — `.github/scripts/check-presentmon-shipped.ps1` | `build` and `sign`, always enforcing | a PresentMon copy in the portable build, the unpacked installer, the test-install image or the signed release is missing, has a different SHA-256 (modified or re-signed), is not `Valid` or is not signed by Intel Corporation |
 
 The Authenticode checks find PE files by their header, not their extension, and cover:
 
@@ -95,9 +119,11 @@ in order of preference:
    files inside the MSI before signing the MSI itself.
 3. **MSI only** (ROADMAP MF-8 item 2) if NSIS cannot pass.
 
-Third-party binaries are **never re-signed** (MF-8 item 7). Every shipped third-party PE (for example the Xamarin-signed
-`MonoPosixHelper.dll`) must already carry its vendor's valid signature, and the SignPath artifact configurations must
-sign only Nexum's own files.
+Third-party binaries are **never re-signed** (MF-8 item 7). Every shipped third-party PE (the Xamarin-signed
+`MonoPosixHelper.dll` and the Intel-signed `presentmon/PresentMon-2.6.0-x64.exe`) must already carry its vendor's valid
+signature, and the SignPath artifact configurations must sign only Nexum's own files. With option 1, check that the
+bundler's `signCommand` is not applied to `presentmon/PresentMon-2.6.0-x64.exe` (it ships as a resource, not as a
+sidecar); the "PresentMon shipped unmodified" check fails the build if it is.
 
 ## One-time setup (maintainer)
 
@@ -105,10 +131,12 @@ sign only Nexum's own files.
 2. After approval, in the SignPath project create:
    * signing policy slug **`release-signing`** (manual approval required);
    * artifact configuration **`installers`**: a zip containing the installers produced by `bundle.targets`
-     (`*.exe`, plus `*.msi` if built) → sign each with Authenticode (for MSI, also the PE files inside it);
-   * artifact configuration **`portable`**: a zip containing `Nexum.exe`, `nexum-agent.exe`, third-party DLLs and
-     licence files → sign **only** `Nexum.exe` and `nexum-agent.exe` with Authenticode and pass everything else through
-     unchanged.
+     (`*.exe`, plus `*.msi` if built) → sign each with Authenticode (for MSI, also Nexum's own PE files inside it:
+     `Nexum.exe` and `nexum-agent.exe` only, **never** `PresentMon-*.exe` or the Mono DLLs);
+   * artifact configuration **`portable`**: a zip containing `Nexum.exe`, `nexum-agent.exe`, third-party DLLs,
+     `presentmon/PresentMon-2.6.0-x64.exe` and licence files → sign **only** `Nexum.exe` and `nexum-agent.exe` with
+     Authenticode and pass everything else through unchanged, keeping the `presentmon/` folder (Nexum looks for the exe
+     there).
 3. Install the SignPath GitHub App on the repository (enables origin verification).
 4. In GitHub → Settings → Secrets and variables → Actions:
    * secret `SIGNPATH_API_TOKEN` (a SignPath CI user token);
@@ -121,8 +149,12 @@ sign only Nexum's own files.
 ## Verifying a download
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\Nexum_1.0.0_x64-setup.exe   # compare with SHA256SUMS.txt on the release page
-Get-AuthenticodeSignature .\Nexum_1.0.0_x64-setup.exe        # Status must be Valid
+Get-FileHash -Algorithm SHA256 .\Nexum_1.1.0_x64-setup.exe   # compare with SHA256SUMS.txt on the release page
+Get-AuthenticodeSignature .\Nexum_1.1.0_x64-setup.exe        # Status must be Valid
+
+# Optional, after installing: the bundled PresentMon is Intel's unmodified file
+Get-FileHash -Algorithm SHA256 "$env:ProgramFiles\Nexum\presentmon\PresentMon-2.6.0-x64.exe"   # b2a706bc...0188f1af
+(Get-AuthenticodeSignature "$env:ProgramFiles\Nexum\presentmon\PresentMon-2.6.0-x64.exe").SignerCertificate.Subject   # starts with CN=Intel Corporation
 ```
 
 ## Roles

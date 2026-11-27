@@ -41,6 +41,9 @@ desktop.ini
 
 # CI / local build staging
 build/
+# Intel PresentMon, downloaded and verified at build time by
+# .github/scripts/fetch-presentmon.ps1 (CONTRACT §7.7). Never commit it.
+build/presentmon/
 out/
 
 # Local-only notes about the maintainer machine (personal)
