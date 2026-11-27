@@ -126,8 +126,14 @@ export function fmtDuration(ms: number): string {
  * Start a cache cleanup of `categories`. Categories that are not available in this session
  * (`available === false`) are never sent. Resolves with the result, or rejects on failure.
  * Rejects immediately if another cleanup is already running.
+ * `recycleMinAgeDays` [1.1] must be the value the shown estimate was scanned with (CONTRACT §2 purge_trash);
+ * `undefined` lets Rust use Settings.recycleMinAgeDays.
  */
-export async function startPurge(categories: TrashCategory[], source: string): Promise<PurgeResult> {
+export async function startPurge(
+  categories: TrashCategory[],
+  source: string,
+  recycleMinAgeDays?: number | null,
+): Promise<PurgeResult> {
   if (state.running) throw new Error("A cleanup is already running");
 
   const plan = categories.filter((c) => c.available !== false).map((c) => ({ id: c.id, label: c.label }));
@@ -171,7 +177,7 @@ export async function startPurge(categories: TrashCategory[], source: string): P
       unlisten = null; // progress overlay will fall back to the indeterminate animation
     }
 
-    const result = await api.purgeTrash(ids);
+    const result = await api.purgeTrash(ids, recycleMinAgeDays);
     const entry: PurgeHistoryEntry = {
       id: historySeq++,
       at: Date.now(),

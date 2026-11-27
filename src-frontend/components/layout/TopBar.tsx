@@ -5,6 +5,7 @@ import {
   Cpu,
   Eraser,
   Fan,
+  Gamepad2,
   HardDrive,
   LayoutDashboard,
   RefreshCw,
@@ -45,6 +46,7 @@ const VIEW_ICONS: Record<ViewId, LucideIcon> = {
   storage: HardDrive,
   cooling: Fan,
   drivers: CircuitBoard,
+  gaming: Gamepad2,
   cleaner: Eraser,
 };
 

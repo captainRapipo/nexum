@@ -1,5 +1,5 @@
 import { useId, useState, type ReactNode } from "react";
-import { Activity, Monitor, ScanLine, ShieldCheck, ShieldOff } from "lucide-react";
+import { Activity, Hourglass, Monitor, ScanLine, ShieldCheck, ShieldOff } from "lucide-react";
 import { useDriverScan } from "../../hooks/useDriverScan";
 import { useHealth } from "../../hooks/useHealth";
 import { useSettings } from "../../hooks/useSettings";
@@ -52,7 +52,7 @@ function HealthPill({ health }: { health: SystemHealth }) {
         onClick={() => requestNavigate("dashboard")}
         className="rounded-full focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal"
       >
-        <StatusPill tone={tone} pulse={tone === "crit"}>
+        <StatusPill tone={tone} pulse={tone === "crit" || health.level === "checking"} icon={health.level === "checking" ? Hourglass : undefined}>
           {text}
         </StatusPill>
       </button>
@@ -77,6 +77,8 @@ function HealthPill({ health }: { health: SystemHealth }) {
                 ))}
               </ul>
             </>
+          ) : health.level === "checking" ? (
+            <p className="mb-3 text-slate-300">Checking: the drive, temperature and free-space rules have not been evaluated yet.</p>
           ) : (
             <p className="mb-3 text-slate-300">No active alerts. Every rule below is satisfied.</p>
           )}

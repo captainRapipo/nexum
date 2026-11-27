@@ -6,6 +6,7 @@ import { DottedLeaderRow, StatCells, StatusPill } from "../ui";
 import { driveHealthView } from "../../lib/status";
 import { driveDisplayName } from "../../lib/disks";
 import { fmtCount, fmtTemp } from "../../lib/format";
+import WearHistory from "./WearHistory";
 
 export interface SmartDrawerProps {
   tele: DiskTelemetry | null;
@@ -133,6 +134,13 @@ export default function SmartDrawer({ tele, disk, health, tempUnit, onClose }: S
               <DottedLeaderRow label="Data read" value={tb(tele?.dataReadTb)} valueClassName="font-mono" />
             </div>
           </section>
+
+          {tele?.serial && tele.serial.trim() && (
+            <section>
+              <SectionLabel>Wear history</SectionLabel>
+              <WearHistory serial={tele.serial} />
+            </section>
+          )}
 
           <section>
             <SectionLabel>Errors and events</SectionLabel>

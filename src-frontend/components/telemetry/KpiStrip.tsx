@@ -1,8 +1,11 @@
-import { useMemo, type ReactNode } from "react";
-import { SERIES_HEX, Unavailable, UNAVAILABLE_TEXT } from "../ui";
+import { useMemo, type KeyboardEvent, type ReactNode } from "react";
+import { SERIES_HEX, TONE_HEX, Unavailable, UNAVAILABLE_TEXT } from "../ui";
 import { useTelemetry } from "../../hooks/useTelemetryStream";
 import { useSettings } from "../../hooks/useSettings";
 import { useSensorLabels } from "../../hooks/useSensorLabels";
+import { useFrames } from "../../hooks/useFrames";
+import { fmtFps, fpsKpi } from "../../lib/frames";
+import { requestNavigate } from "../../lib/nav";
 import { resolveUnavailable } from "../../lib/status";
 import { clamp, cn, fmtGhz, fmtTemp } from "../../lib/format";
 import type { AgentStatus, FanPreset, TelemetryPacket } from "../../types";
@@ -34,6 +37,10 @@ interface Kpi {
   meter: number | null;
   /** Small neutral badge on the value row (e.g. "Zero-RPM idle"). */
   badge?: ReactNode;
+  /** Makes the whole card a button (the FPS card opens the Gaming view). */
+  onClick?: () => void;
+  /** Accessible name / tooltip of a clickable card. */
+  clickTitle?: string;
 }
 
 const PRESET_LABEL: Record<FanPreset, string> = {
@@ -191,31 +198,88 @@ function buildKpis(
   return [cpuKpi, gpuKpi, vramKpi, ramKpi, fanKpi];
 }
 
+/** 6th KPI (CONTRACT §4.10.2): shown only while fpsKpi(useFrames()).visible. */
+function buildFpsKpi(fps: number | null, low1: number | null, process: string | null): Kpi {
+  const low = `P1 ${fmtFps(low1)}`;
+  return {
+    key: "fps",
+    label: "FPS",
+    color: TONE_HEX.purple,
+    value: fmtFps(fps),
+    unit: null,
+    sub: (
+      <>
+        <span>{low}</span>
+        {process ? <span className="min-w-0 truncate"> · {process}</span> : null}
+      </>
+    ),
+    subShort: <span>{low}</span>,
+    subTitle: `Rendered frames per second of ${process ?? "the game"}, measured with Intel PresentMon. P1 = 1000 / 99th-percentile frame time.`,
+    meter: null,
+    onClick: () => requestNavigate("gaming"),
+    clickTitle: "Open the Gaming view (F8)",
+  };
+}
+
 export default function KpiStrip() {
   const { latest, agent } = useTelemetry();
   const { settings } = useSettings();
   const { labelOf } = useSensorLabels();
+  const frames = useFrames();
   const tempUnit = settings?.tempUnit ?? "C";
 
   const kpis = useMemo(() => buildKpis(latest, agent, tempUnit, labelOf), [latest, agent, tempUnit, labelOf]);
+  const fpsView = fpsKpi({
+    enabled: frames.enabled,
+    session: frames.session,
+    target: frames.target,
+    stats: frames.stats,
+    statsFresh: frames.statsFresh,
+  });
+  const all = fpsView.visible ? [...kpis, buildFpsKpi(fpsView.fps, fpsView.low1, fpsView.process)] : kpis;
+  // Six cards are tighter at 1280 px: smaller numbers so values never clip.
+  const dense = all.length > 5;
 
   return (
-    <div className="grid grid-cols-5 gap-3 max-[1439px]:gap-2">
-      {kpis.map((k) => (
-        <KpiCard key={k.key} kpi={k} />
+    <div
+      className="grid gap-3 max-[1439px]:gap-2"
+      // auto-fit re-flows 5 → 6 cards on one row without wrapping (CONTRACT §4.10.2).
+      style={{ gridTemplateColumns: "repeat(auto-fit, minmax(92px, 1fr))" }}
+    >
+      {all.map((k) => (
+        <KpiCard key={k.key} kpi={k} dense={dense} />
       ))}
     </div>
   );
 }
 
-function KpiCard({ kpi }: { kpi: Kpi }) {
+function KpiCard({ kpi, dense }: { kpi: Kpi; dense: boolean }) {
   const color = kpi.color;
   const meter = kpi.meter === null ? null : clamp(kpi.meter, 0, 100);
+  const clickable = !!kpi.onClick;
+  const interactive = clickable
+    ? {
+        role: "button" as const,
+        tabIndex: 0,
+        title: kpi.clickTitle,
+        "aria-label": `${kpi.label} ${typeof kpi.value === "string" ? kpi.value : ""}. ${kpi.clickTitle ?? ""}`.trim(),
+        onClick: kpi.onClick,
+        onKeyDown: (e: KeyboardEvent<HTMLDivElement>) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            kpi.onClick?.();
+          }
+        },
+      }
+    : {};
   return (
     <div
+      {...interactive}
       className={cn(
         "glass relative min-w-0 overflow-hidden py-3 pl-4 pr-3",
-        "max-[1439px]:py-2.5 max-[1439px]:pl-3.5 max-[1439px]:pr-2",
+        dense ? "max-[1439px]:py-2.5 max-[1439px]:pl-3 max-[1439px]:pr-1.5" : "max-[1439px]:py-2.5 max-[1439px]:pl-3.5 max-[1439px]:pr-2",
+        clickable &&
+          "cursor-pointer transition hover:bg-white/[0.03] focus-visible:outline focus-visible:outline-2 focus-visible:outline-teal/60",
       )}
     >
       {/* Vertical series line (decoration, not state) */}
@@ -231,7 +295,12 @@ function KpiCard({ kpi }: { kpi: Kpi }) {
       />
       <div className="truncate text-[10px] font-medium uppercase tracking-[0.2em] text-muted">{kpi.label}</div>
       <div className="mt-1.5 flex items-baseline gap-1">
-        <span className="font-mono text-[28px] font-semibold leading-none tabular-nums text-ink max-[1439px]:text-[22px]">
+        <span
+          className={cn(
+            "font-mono font-semibold leading-none tabular-nums text-ink",
+            dense ? "text-[25px] max-[1439px]:text-[18px]" : "text-[28px] max-[1439px]:text-[22px]",
+          )}
+        >
           {kpi.value}
         </span>
         {kpi.unit && (

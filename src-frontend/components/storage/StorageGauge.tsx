@@ -5,8 +5,10 @@ import { EChart, StatusPill } from "../ui";
 import { GlassCard } from "../layout/GlassCard";
 import { useSystemInfo } from "../../hooks/useSystemInfo";
 import { useTrashEstimate } from "../../hooks/useTrashEstimate";
+import { useSettings } from "../../hooks/useSettings";
+import { spaceThresholds } from "../../lib/status";
 import { cn, fmtBytes } from "../../lib/format";
-import { HEALTH_THRESHOLDS, type Volume } from "../../types";
+import type { Volume } from "../../types";
 
 
 /** The Windows system volume: isSystem flag, else C:, else the largest fixed volume. */
@@ -33,10 +35,11 @@ const C = {
   free: "rgba(148,163,184,0.16)",
 };
 
-const SPACE_RULE = `Attention below ${HEALTH_THRESHOLDS.freeSpaceWarnPct}% free, critical below ${HEALTH_THRESHOLDS.freeSpaceCritPct}% free.`;
-
 export default function StorageGauge() {
   const { volumes } = useSystemInfo();
+  const { settings } = useSettings();
+  const th = spaceThresholds(settings);
+  const spaceRule = `Attention below ${th.warnPct}% free, critical below ${th.critPct}% free.`;
   const { totalBytes: trashBytes, loading: trashLoading } = useTrashEstimate();
   const vol = useMemo(() => pickSystemVolume(volumes), [volumes]);
 
@@ -139,8 +142,10 @@ export default function StorageGauge() {
   }, [model, usedColor]);
 
   const freePct = model ? 100 - model.usedPct : null;
-  const crit = freePct !== null && freePct < HEALTH_THRESHOLDS.freeSpaceCritPct;
-  const warn = freePct !== null && freePct < HEALTH_THRESHOLDS.freeSpaceWarnPct;
+  // Same rule as Rust's space alert, which only applies to fixed volumes.
+  const fixed = vol?.driveType === "Fixed";
+  const crit = fixed && freePct !== null && freePct < th.critPct;
+  const warn = fixed && freePct !== null && freePct < th.warnPct;
 
   return (
     <GlassCard
@@ -153,7 +158,7 @@ export default function StorageGauge() {
           // (drive health lives in the Drives card and on Storage).
           <StatusPill
             tone={crit ? "crit" : warn ? "warn" : "ok"}
-            title={`${vol.letter || "System volume"} free space. ${SPACE_RULE} Drive health is shown under Drives.`}
+            title={`${vol.letter || "System volume"} free space. ${spaceRule} Drive health is shown under Drives.`}
           >
             {vol.letter || "SYS"}
             {freePct !== null ? ` ${freePct.toFixed(0)}% free` : ""}

@@ -6,6 +6,7 @@ import { driveHealthView, resolveUnavailable } from "../../lib/status";
 import { cn, fmtBytes, fmtCount, fmtTemp, maskSerial } from "../../lib/format";
 import ThroughputChart, { fmtRate } from "./ThroughputChart";
 import { mediaChips, type MediaChip } from "./diskMatch";
+import { DiskWearLine } from "./WearHistory";
 
 const CHIP_STYLE: Record<MediaChip["tone"], string> = {
   teal: "border-teal/40 bg-teal/10 text-teal",
@@ -158,6 +159,8 @@ export default function PhysicalDiskCard({
           />
         </div>
       )}
+
+      {telemetry?.serial && <DiskWearLine serial={telemetry.serial} onDetails={onDetails} />}
 
       {/* Live throughput */}
       <div className="mt-4 rounded-lg border border-line bg-canvas-0/50 px-3 pb-1 pt-2.5">

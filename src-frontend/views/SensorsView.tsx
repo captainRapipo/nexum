@@ -18,6 +18,7 @@ import { isModalOpen } from "../components/ui/Modal";
 import { toast } from "../components/feedback/Toast";
 import { SensorTable, type FocusRequest } from "../components/sensors/SensorTable";
 import { SensorToolbar } from "../components/sensors/SensorToolbar";
+import { SensorLogControls } from "../components/sensors/SensorLogControls";
 import type { SensorStats } from "../components/sensors/SensorRow";
 import {
   flattenTree,
@@ -282,7 +283,7 @@ export default function SensorsView() {
           <div className="text-[10.5px] uppercase tracking-[0.22em] text-gold/80">F2 · Hardware sensors</div>
           <h1 className="mt-1 text-[22px] font-semibold tracking-tight text-ink">Sensors</h1>
           <p className="mt-0.5 text-[12.5px] text-muted">
-            Every sensor the hardware agent reads, with session Min, Max and Avg.
+            Every sensor the hardware agent reads, with session Min, Max and Avg. Log any of them to a CSV file.
           </p>
         </div>
         <div className="flex flex-col items-end gap-1 text-right">
@@ -329,6 +330,7 @@ export default function SensorsView() {
           onCollapseAll={collapseAll}
           disabled={!tree}
         />
+        <SensorLogControls selectedIds={selectedIds} disabled={!tree || !agentUp} />
 
         {tree && flat ? (
           <>

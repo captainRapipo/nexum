@@ -14,12 +14,22 @@
 //   ?mock=limited,hot,noagent,failing,usb
 //     limited  = admin=0 · hot = CPU + GPU near their limits · noagent = sidecar never starts
 //     failing  = second NVMe reports a critical warning · usb = adds a USB stick without S.M.A.R.T.
+//   [NEW 1.1]
+//   ?fps=on          frame capture starts enabled (with ?rig=owner a game "Game.exe" is running)
+//   ?fps=error       frame capture fails its PresentMon signature check (session error)
+//   ?alerts=hot      Rust alert engine also reports a cpu-temp crit and a gpu-temp:0 warn
+//   ?gpu=nvidia      owner rig without an AMD GPU for the tuning panel (supported:false, noAmdGpu)
 
 import type {
   AgentAck,
   AgentStatus,
+  AlertSettings,
+  CpuLimitInfo,
+  DiskLink,
   DiskTelemetry,
   DriveHealth,
+  DriveHistory,
+  DriveHistoryPoint,
   DriverBackupResult,
   DriverCategory,
   DriverInfo,
@@ -29,32 +39,69 @@ import type {
   FanPreset,
   FanSafety,
   FanTelemetry,
+  FrameSession,
+  FrameSessionCode,
+  FrameSignature,
+  FrameState,
+  FrameStats,
+  FrameTarget,
   GpuSpec,
   GpuTelemetry,
   HardwareKind,
   HardwareNode,
+  HealthAlert,
+  HealthAlertsSnapshot,
   LimitedReason,
+  MemorySpec,
   PhysicalDisk,
+  PresentingProcess,
   PurgeCategoryResult,
   PurgeProgress,
   PurgeResult,
+  ReportFormat,
   SelfUsage,
   SensorDriverStatus,
   SensorKind,
+  SensorLogStatus,
   SensorMeta,
   SensorTree,
   SensorUnit,
   SensorValues,
   Settings,
+  SpdInfo,
   SystemInfo,
   SystemSpec,
   TelemetryPacket,
   TrashCategory,
   TrashCategoryId,
+  TrashDetailItem,
   TrashScan,
+  TuningProbeSummary,
+  TuningState,
   Volume,
 } from "../types";
-import { AGENT_PROTOCOL, DEFAULT_SETTINGS } from "../types";
+import {
+  AGENT_PROTOCOL,
+  CPU_DEFAULT_LIMIT_C,
+  CPU_TJMAX_TABLE,
+  DEFAULT_ALERT_SETTINGS,
+  DEFAULT_SETTINGS,
+  EVENTS,
+  FIXED_FRAME_EXCLUDES,
+  FPS_EXCLUDE_PATTERN,
+  FPS_EXCLUDES_MAX,
+  GPU_EDGE_CRIT_C,
+  GPU_EDGE_WARN_C,
+  GPU_HOTSPOT_CRIT_DEFAULT_C,
+  GPU_MEM_JUNCTION_CRIT_DEFAULT_C,
+  RECYCLE_AGE_OPTIONS,
+  SENSOR_LOG_INTERVALS_MS,
+  TRASH_DETAILS_LIMIT,
+} from "../types";
+import { driveDisplayName, joinDisks, normSerial } from "./disks";
+import { fmtBytes } from "./format";
+import { driveDetailSentence } from "./status";
+import { computeForecast, computeFrameStats, evaluateSustained, newSustainState, type SimFrame, type SustainState } from "./mockSim";
 
 /* ------------------------------------------------------------------ */
 /* Scenario flags                                                      */
@@ -97,6 +144,12 @@ const NO_AGENT = SCENARIO.has("noagent");
 const DRIVE_FAIL = SCENARIO.has("failing");
 const WITH_USB = SCENARIO.has("usb");
 const GENERIC_LABELS = (readParam("labels") ?? "").toLowerCase() === "generic";
+/** [NEW 1.1] ?fps=on → capture starts enabled; ?fps=error → signature check fails. */
+const FPS_PARAM = (readParam("fps") ?? "").toLowerCase();
+/** [NEW 1.1] ?alerts=hot → forced cpu-temp crit + gpu-temp:0 warn in the Rust alert snapshot. */
+const ALERTS_HOT = (readParam("alerts") ?? "").toLowerCase() === "hot";
+/** [NEW 1.1] ?gpu=nvidia → no AMD GPU for the tuning panel. */
+const GPU_PARAM = (readParam("gpu") ?? "").toLowerCase();
 const FAILSAFE_PARAM: FanFailsafeKind | null = (() => {
   const v = (readParam("failsafe") ?? "").toLowerCase();
   if (v === "interrupted") return "interrupted";
@@ -228,6 +281,19 @@ function sanitizeSettings(input: Partial<Settings>): Settings {
     }
   }
   const choice = input.sensorDriverChoice;
+  const fpsWindow =
+    typeof input.fpsWindowSec === "number" && Number.isFinite(input.fpsWindowSec)
+      ? Math.round(clampN(input.fpsWindowSec, 5, 120))
+      : d.fpsWindowSec;
+  const logMs = SENSOR_LOG_INTERVALS_MS.includes(input.sensorLogIntervalMs as number)
+    ? (input.sensorLogIntervalMs as number)
+    : d.sensorLogIntervalMs;
+  const recycle =
+    input.recycleMinAgeDays === null
+      ? null
+      : RECYCLE_AGE_OPTIONS.includes(input.recycleMinAgeDays as number)
+        ? (input.recycleMinAgeDays as number)
+        : d.recycleMinAgeDays;
   return {
     launchOnStartup: bool(input.launchOnStartup, d.launchOnStartup),
     minimizeToTray: bool(input.minimizeToTray, d.minimizeToTray),
@@ -243,6 +309,45 @@ function sanitizeSettings(input: Partial<Settings>): Settings {
     hideUnusedSensors: bool(input.hideUnusedSensors, d.hideUnusedSensors),
     dismissedAlerts: dedupe(input.dismissedAlerts, 200, true),
     sensorDriverChoice: choice === "pawnio" || choice === "none" || choice === "undecided" ? choice : "undecided",
+    fpsCaptureEnabled: bool(input.fpsCaptureEnabled, d.fpsCaptureEnabled),
+    fpsWindowSec: fpsWindow,
+    fpsExcludes: sanitizeExcludeList(input.fpsExcludes),
+    sensorLogIntervalMs: logMs,
+    alerts: sanitizeAlertSettings(input.alerts),
+    recycleMinAgeDays: recycle,
+  };
+}
+
+/** Rust's set_frame_excludes sanitization (CONTRACT §2.13). */
+function sanitizeExcludeList(list: unknown): string[] {
+  if (!Array.isArray(list)) return [];
+  const fixed = new Set(FIXED_FRAME_EXCLUDES.map((n) => n.toLowerCase()));
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of list) {
+    if (typeof raw !== "string") continue;
+    const n = raw.trim();
+    if (!FPS_EXCLUDE_PATTERN.test(n) || fixed.has(n.toLowerCase()) || seen.has(n.toLowerCase())) continue;
+    seen.add(n.toLowerCase());
+    out.push(n);
+    if (out.length >= FPS_EXCLUDES_MAX) break;
+  }
+  return out;
+}
+
+/** AlertSettings: each member on its own; missing/malformed → its default (CONTRACT §2.2). */
+function sanitizeAlertSettings(raw: unknown): AlertSettings {
+  const d = DEFAULT_ALERT_SETTINGS;
+  const a = raw && typeof raw === "object" ? (raw as Partial<AlertSettings>) : {};
+  const num = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+  const opt = (v: unknown, lo: number, hi: number) => (num(v) ? Math.round(clampN(v, lo, hi)) : null);
+  return {
+    desktopNotifications: typeof a.desktopNotifications === "boolean" ? a.desktopNotifications : d.desktopNotifications,
+    cpuTempC: opt(a.cpuTempC, 60, 105),
+    gpuHotspotC: opt(a.gpuHotspotC, 70, 115),
+    gpuMemJunctionC: opt(a.gpuMemJunctionC, 70, 115),
+    freeSpacePct: num(a.freeSpacePct) ? Math.round(clampN(a.freeSpacePct, 1, 50)) : d.freeSpacePct,
+    sustainSec: num(a.sustainSec) ? Math.round(clampN(a.sustainSec, 10, 600)) : d.sustainSec,
   };
 }
 
@@ -266,6 +371,8 @@ function persistSettings(s: Settings): void {
 }
 
 let settings: Settings = loadSettings();
+// ?fps=on|error: the preview starts with capture enabled (not persisted until the user saves).
+if (FPS_PARAM === "on" || FPS_PARAM === "error") settings = { ...settings, fpsCaptureEnabled: true };
 
 /* ------------------------------------------------------------------ */
 /* Hardware model                                                      */
@@ -836,6 +943,9 @@ function step(dt: number, ts: number): Frame {
   else if (sim.gpuTemp <= 47) sim.gpuFanOn = false;
   const gpuFanPct = sim.gpuFanOn ? clampN(30 + (sim.gpuTemp - 50) * 1.15, 30, 100) : 0;
   const gpuFanRpm = sim.gpuFanOn ? 380 + gpuFanPct * 24 + gauss() * 6 : 0;
+  // Memory junction: LHM "GPU Memory Junction" (NVIDIA) / "GPU Memory" (AMD, ~6 °C lower in this model).
+  const memJunction = sim.gpuTemp + 12 + gLoad * 0.08;
+  const memJunctionReported = RIG.dgpuVendor === "amd" ? memJunction - 6 : memJunction;
   const dgpu: GpuTelemetry = {
     name: DGPU_NAME,
     vendor: RIG.dgpuVendor,
@@ -849,6 +959,7 @@ function step(dt: number, ts: number): Frame {
     powerW: r1(Math.max(8, RIG.gpuPowerBase + gLoad * RIG.gpuPowerSlope + gauss() * 2)),
     fanRpm: r1(Math.max(0, gpuFanRpm)),
     fanPct: r1(gpuFanPct),
+    memJunctionTempC: r1(memJunctionReported),
   };
   const igpu: GpuTelemetry = {
     name: IGPU_NAME,
@@ -863,6 +974,7 @@ function step(dt: number, ts: number): Frame {
     powerW: null,
     fanRpm: null,
     fanPct: null,
+    memJunctionTempC: null,
   };
 
   // RAM
@@ -1059,7 +1171,7 @@ function step(dt: number, ts: number): Frame {
     },
     gpuFanRpm: gpuFanRpms,
     gpuFanPct,
-    gpuMemJunction: sim.gpuTemp + 12 + gLoad * 0.08,
+    gpuMemJunction: memJunction,
     netUpGb: sim.net.upGb,
     netDownGb: sim.net.downGb,
   };
@@ -1650,7 +1762,7 @@ function agentStatus(): AgentStatus {
       FAILSAFE_PARAM === "agentLost" && !NO_AGENT
         ? "Hardware agent exited unexpectedly (simulated). Restarting…"
         : "nexum-agent.exe could not be started (simulated failure)";
-  else message = `Hardware agent v1.0.0 online (pid ${AGENT_PID})`;
+  else message = `Hardware agent v1.1.0 online (pid ${AGENT_PID})`;
   const reasons = running ? limitedReasons() : [];
   return {
     running,
@@ -1680,6 +1792,7 @@ function produce(dt: number, ts: number, live: boolean): void {
   lastPacketTs = f.pkt.ts;
   emit("telemetry", f.pkt);
   if (live && sensorsState.streamOn) emit("sensor-values", sensorValuesPacket(ts, values));
+  if (live) onLivePacketV11(f.pkt);
 }
 
 function tick(): void {
@@ -1750,6 +1863,8 @@ function agentStarted(): void {
     previousBootReported = true;
     setFailsafe(failsafeOf("previousBoot"));
   }
+  // [NEW 1.1] hello → one `stopped` frameSession; Rust re-sends frameWindow/frameExclude/frames when enabled.
+  framesOnHello();
 }
 
 let selfUsageTimer: ReturnType<typeof setInterval> | null = null;
@@ -2352,19 +2467,28 @@ function available(def: CacheDef): boolean {
 }
 
 /** Bytes/files this session can act on (rules 8/9 exclusions applied). */
-function cleanable(def: CacheDef): { bytes: number; files: number } {
+function cleanable(def: CacheDef, recycleMinAgeDays: number | null = settings.recycleMinAgeDays): { bytes: number; files: number } {
+  if (def.id === "recycle") {
+    // [NEW 1.1] Real items with deletion dates (§3.2); a purge removes them.
+    const q = recycleQualifying(recycleMinAgeDays);
+    return { bytes: q.reduce((s, x) => s + x.bytes, 0), files: q.length };
+  }
   const f = regrowth(def.id) * (def.id === "temp" && ADMIN0 ? def.userFraction ?? 1 : 1);
   const keep = def.skipped ? 1 - def.skipped.fraction : 1;
   return { bytes: Math.round(def.gb * GIB * f * keep), files: Math.round(def.files * f * keep) };
 }
 
-function toCategory(def: CacheDef, includeBrowser: boolean): TrashCategory {
+function toCategory(def: CacheDef, includeBrowser: boolean, recycleMinAgeDays: number | null = settings.recycleMinAgeDays): TrashCategory {
   const avail = available(def);
-  const { bytes, files } = cleanable(def);
+  const { bytes, files } = cleanable(def, recycleMinAgeDays);
+  const ageNote = def.id === "recycle" && recycleMinAgeDays != null ? `Keeps items deleted in the last ${dayWord(recycleMinAgeDays)}.` : null;
   return {
     id: def.id,
     label: def.label,
-    description: def.description,
+    description:
+      def.id === "recycle" && recycleMinAgeDays != null
+        ? `Permanently deletes items that have been in the Recycle Bin for more than ${dayWord(recycleMinAgeDays)}.`
+        : def.description,
     bytes,
     files,
     enabled: avail && (def.id === "browser" ? includeBrowser && def.defaultOn : def.defaultOn),
@@ -2372,7 +2496,7 @@ function toCategory(def: CacheDef, includeBrowser: boolean): TrashCategory {
     requiresAdmin: def.requiresAdmin,
     available: avail,
     unavailableReason: avail ? null : "needsAdmin",
-    note: !avail ? NEEDS_ADMIN_NOTE : (def.skipped?.note ?? null),
+    note: !avail ? NEEDS_ADMIN_NOTE : (ageNote ?? def.skipped?.note ?? null),
   };
 }
 
@@ -2382,23 +2506,176 @@ function toCategory(def: CacheDef, includeBrowser: boolean): TrashCategory {
 
 const INSTR_BASE = ["MMX", "SSE", "SSE2", "SSE3", "SSSE3", "SSE4.1", "SSE4.2", "SSE4A", "AES", "AVX", "AVX2"];
 
+/* ── [NEW 1.1] System view full (CONTRACT §1.4.1) ── */
+
+const TIMINGS_NOTE = {
+  notElevated: "Live timings need administrator rights.",
+  pawnIo: "Live timings need the PawnIO driver.",
+  unsupported: "Live timings are only read on AMD Ryzen (Zen 1 to Zen 3) with DDR4.",
+} as const;
+
+/** JEDEC minimum times (ns) → cycles at `mts`: ceil(ns / (2000 / mts) − 0.025). */
+function spdInfo(mts: number | null, ns: SpdInfo["timingsNs"], tempC: number | null): SpdInfo {
+  const cyc = (v: number | null) => (v == null || mts == null ? null : Math.ceil(v / (2000 / mts) - 0.025));
+  return {
+    source: "jedec",
+    jedecSpeedMts: mts,
+    timingsNs: ns,
+    cycles: {
+      cl: cyc(ns.tAA),
+      rcd: cyc(ns.tRCD),
+      rp: cyc(ns.tRP),
+      ras: cyc(ns.tRAS),
+      rc: cyc(ns.tRC),
+      rfc: cyc(ns.tRFC1),
+      faw: cyc(ns.tFAW),
+      rrds: cyc(ns.tRRD_S),
+      rrdl: cyc(ns.tRRD_L),
+      wr: cyc(ns.tWR),
+      wtrs: cyc(ns.tWTR_S),
+      wtrl: cyc(ns.tWTR_L),
+    },
+    tempC,
+    matchedBy: "order",
+  };
+}
+
+/** DDR4-2666 JEDEC (19-19-19, 16 Gb dies) minimum times. */
+const DDR4_2666_NS: SpdInfo["timingsNs"] = {
+  tAA: 14.25, tRCD: 14.25, tRP: 14.25, tRAS: 32, tRC: 46.25, tRFC1: 350, tRFC2: 260, tRFC4: 160,
+  tFAW: 21, tRRD_S: 3, tRRD_L: 4.9, tCCD_L: 5.355, tWR: 15, tWTR_S: 2.5, tWTR_L: 7.5,
+};
+
+/** DDR5-4800 JEDEC (40-39-39) minimum times; keys LHM does not report for DDR5 stay null. */
+const DDR5_4800_NS: SpdInfo["timingsNs"] = {
+  tAA: 16.666, tRCD: 16.25, tRP: 16.25, tRAS: 32, tRC: 48.25, tRFC1: 295, tRFC2: 160, tRFC4: null,
+  tFAW: 13.333, tRRD_S: 3.333, tRRD_L: 5, tCCD_L: 5, tWR: 30, tWTR_S: 2.5, tWTR_L: 10,
+};
+
+function memorySpec(): MemorySpec {
+  // SPD needs elevation + PawnIO (LHM DimmMemory); live UMC timings additionally need Zen 1–3 + DDR4.
+  const spdOk = !NO_RING0;
+  if (OWNER) {
+    const dimms = ["DIMM_A2", "DIMM_B2"].map((slot) => ({
+      slot,
+      manufacturer: "G.Skill",
+      partNumber: "F4-3600C16-16GVKC",
+      sizeGb: 16,
+      speedMts: 2666,
+      configuredSpeedMts: 3600,
+      ranks: 1,
+      voltage: 1.35,
+      formFactor: "DIMM",
+      spd: spdOk ? spdInfo(2666, DDR4_2666_NS, null) : null,
+    }));
+    const live = !ADMIN0 && PAWNIO_STATE === "ok";
+    return {
+      type: "DDR4",
+      totalGb: 32,
+      channels: 2,
+      slotsUsed: 2,
+      slotsTotal: 4,
+      dimms,
+      timings: live
+        ? { cl: 16, rcdRd: 19, rcdWr: 19, rp: 19, ras: 39, rc: 58, rfc: 630, rrds: 6, rrdl: 9, faw: 36, wtrs: 4, wtrl: 12, wr: 24, rtp: 12, cwl: 16, commandRate: "1T", gearDown: true }
+        : null,
+      timingsSource: live ? "umc" : "unavailable",
+      timingsNote: live ? null : ADMIN0 ? TIMINGS_NOTE.notElevated : TIMINGS_NOTE.pawnIo,
+      // UMC ratio when live, else configuredSpeedMts / 2: 1800 either way for DDR4-3600.
+      memclkMhz: 1800,
+      fclkMhz: NO_RING0 ? null : 1800,
+      uclkMhz: NO_RING0 ? null : 1800,
+      xmp: null,
+    };
+  }
+  const dimms = ["DIMM_A2", "DIMM_B2"].map((slot) => ({
+    slot,
+    manufacturer: "G.Skill",
+    partNumber: "F5-6000J3038F32G",
+    sizeGb: 32,
+    speedMts: 4800,
+    configuredSpeedMts: 6000,
+    ranks: 2,
+    voltage: 1.35,
+    formFactor: "DIMM",
+    spd: spdOk ? spdInfo(4800, DDR5_4800_NS, r1(rand(38, 41))) : null,
+  }));
+  const first = dimms[0].spd;
+  return {
+    type: "DDR5",
+    totalGb: 64,
+    channels: 2,
+    slotsUsed: 2,
+    slotsTotal: 4,
+    dimms,
+    // Zen 4 + DDR5: no live read; the first DIMM's SPD JEDEC cycles are the fallback.
+    timings: first
+      ? {
+          cl: first.cycles.cl, rcdRd: first.cycles.rcd, rcdWr: first.cycles.rcd, rp: first.cycles.rp, ras: first.cycles.ras,
+          rc: first.cycles.rc, rfc: first.cycles.rfc, rrds: first.cycles.rrds, rrdl: first.cycles.rrdl, faw: first.cycles.faw,
+          wtrs: first.cycles.wtrs, wtrl: first.cycles.wtrl, wr: first.cycles.wr, rtp: null, cwl: null, commandRate: null, gearDown: null,
+        }
+      : null,
+    timingsSource: first ? "spd" : "unavailable",
+    timingsNote: ADMIN0 ? TIMINGS_NOTE.notElevated : NO_RING0 ? TIMINGS_NOTE.pawnIo : TIMINGS_NOTE.unsupported,
+    memclkMhz: 3000,
+    fclkMhz: null,
+    uclkMhz: null,
+    xmp: null,
+  };
+}
+
+function diskLinks(): DiskLink[] {
+  return OWNER
+    ? [
+        { diskNumber: 0, model: "addlink M.2 PCIE G3x4 NVMe", bus: "nvme", gen: 3, width: 4, maxGen: 3, maxWidth: 4, sataGen: null },
+        { diskNumber: 1, model: "CT1000P2SSD8", bus: "nvme", gen: 3, width: 4, maxGen: 3, maxWidth: 4, sataGen: null },
+        { diskNumber: 2, model: "ST1000DM010-2EP102", bus: "sata", gen: null, width: null, maxGen: null, maxWidth: null, sataGen: 3 },
+      ]
+    : [
+        { diskNumber: 0, model: "Samsung SSD 990 PRO 2TB", bus: "nvme", gen: 4, width: 4, maxGen: 4, maxWidth: 4, sataGen: null },
+        { diskNumber: 1, model: "WD_BLACK SN850X 1000GB", bus: "nvme", gen: 4, width: 4, maxGen: 4, maxWidth: 4, sataGen: null },
+        { diskNumber: 2, model: "ST4000DM004-2CV104", bus: "sata", gen: null, width: null, maxGen: null, maxWidth: null, sataGen: 3 },
+        ...(WITH_USB
+          ? [{ diskNumber: 3, model: "SanDisk Extreme 64GB", bus: "usb" as const, gen: null, width: null, maxGen: null, maxWidth: null, sataGen: null }]
+          : []),
+      ];
+}
+
 function systemSpec(): SystemSpec {
   const os = { ...OS_INFO, bootTs: bootedAt };
   delete (os as Partial<OsInfo>).version;
   const security = { secureBoot: true, tpm: { present: true, version: "2.0" }, biosMode: "UEFI" as const };
   const base = { capturedTs: Date.now(), os: os as SystemSpec["os"], security };
   if (!agentRunning || restarting) {
-    return { ...base, cpu: null, board: null, memory: null, gpus: [], errors: ["Hardware agent is not running"] };
+    return { ...base, cpu: null, board: null, memory: null, gpus: [], diskLinks: [], errors: ["Hardware agent is not running"] };
   }
   const gpus: GpuSpec[] = OWNER
-    ? [{ name: DGPU_NAME, vendor: "amd", vramGb: 16, driverVersion: "32.0.21025.1024", driverDate: isoDate(inventoryEpoch - 26 * DAY_MS) }]
+    ? [
+        {
+          name: DGPU_NAME,
+          vendor: "amd",
+          vramGb: 16,
+          driverVersion: "32.0.21025.1024",
+          driverDate: isoDate(inventoryEpoch - 26 * DAY_MS),
+          link: { gen: 4, width: 16, maxGen: 4, maxWidth: 16, source: "adl", note: null },
+        },
+      ]
     : [
-        { name: DGPU_NAME, vendor: "nvidia", vramGb: 16, driverVersion: "32.0.15.6614", driverDate: isoDate(inventoryEpoch - 48 * DAY_MS) },
-        { name: IGPU_NAME, vendor: "amd", vramGb: 0.5, driverVersion: "31.0.24033.1003", driverDate: isoDate(inventoryEpoch - 265 * DAY_MS) },
+        {
+          name: DGPU_NAME,
+          vendor: "nvidia",
+          vramGb: 16,
+          driverVersion: "32.0.15.6614",
+          driverDate: isoDate(inventoryEpoch - 48 * DAY_MS),
+          link: { gen: 4, width: 16, maxGen: 4, maxWidth: 16, source: "devpkey", note: null },
+        },
+        { name: IGPU_NAME, vendor: "amd", vramGb: 0.5, driverVersion: "31.0.24033.1003", driverDate: isoDate(inventoryEpoch - 265 * DAY_MS), link: null },
       ];
   if (OWNER) {
     return {
       ...base,
+      diskLinks: diskLinks(),
       cpu: {
         name: CPU_TELEMETRY_NAME,
         vendor: "AMD",
@@ -2427,33 +2704,14 @@ function systemSpec(): SystemSpec {
         biosDate: BIOS.releaseDate,
         superIo: NO_RING0 ? null : RIG.superIoName,
       },
-      memory: {
-        type: "DDR4",
-        totalGb: 32,
-        channels: 2,
-        slotsUsed: 2,
-        slotsTotal: 4,
-        dimms: ["DIMM_A2", "DIMM_B2"].map((slot) => ({
-          slot,
-          manufacturer: "G.Skill",
-          partNumber: "F4-3600C16-16GVKC",
-          sizeGb: 16,
-          speedMts: 3600,
-          configuredSpeedMts: 3600,
-          ranks: 1,
-          voltage: 1.35,
-          formFactor: "DIMM",
-        })),
-        timings: null,
-        timingsSource: "unavailable",
-        xmp: null,
-      },
+      memory: memorySpec(),
       gpus,
       errors: [],
     };
   }
   return {
     ...base,
+    diskLinks: diskLinks(),
     cpu: {
       name: CPU_TELEMETRY_NAME,
       vendor: "AMD",
@@ -2482,31 +2740,1038 @@ function systemSpec(): SystemSpec {
       biosDate: BIOS.releaseDate,
       superIo: NO_RING0 ? null : RIG.superIoName,
     },
-    memory: {
-      type: "DDR5",
-      totalGb: 64,
-      channels: 2,
-      slotsUsed: 2,
-      slotsTotal: 4,
-      dimms: ["DIMM_A2", "DIMM_B2"].map((slot) => ({
-        slot,
-        manufacturer: "G.Skill",
-        partNumber: "F5-6000J3038F32G",
-        sizeGb: 32,
-        speedMts: 4800,
-        configuredSpeedMts: 6000,
-        ranks: 2,
-        voltage: 1.35,
-        formFactor: "DIMM",
-      })),
-      timings: null,
-      timingsSource: "unavailable",
-      xmp: null,
-    },
+    memory: memorySpec(),
     gpus,
     errors: [],
   };
 }
+
+/* ------------------------------------------------------------------ */
+/* [NEW 1.1] Frame capture (CONTRACT §1.6, §2.13)                      */
+/* ------------------------------------------------------------------ */
+
+interface SimApp {
+  pid: number;
+  process: string;
+  title: string;
+  runtime: string;
+  presentMode: string;
+  allowsTearing: boolean;
+  syncInterval: number;
+  foreground: boolean;
+  /** Frame time sampler (ms) and per-frame CPU / GPU busy (ms). */
+  sample: () => { ft: number; cpu: number; gpu: number };
+  /** Share of frames never displayed. */
+  dropP: number;
+  latency: number;
+}
+
+const GAME_PID = 18320;
+const LAUNCHER_PID = 20544;
+
+/** ~140 fps (144 Hz display, no cap) with jitter, 1.4% hitches and a rare 30–40 ms spike. */
+function sampleGameFrame(): { ft: number; cpu: number; gpu: number } {
+  const x = Math.random();
+  if (x < 0.0007) {
+    const ft = rand(30, 40);
+    return { ft, cpu: ft * rand(0.7, 0.85), gpu: rand(6.2, 7.2) };
+  }
+  if (x < 0.0147) {
+    const ft = rand(9.5, 12.5);
+    return { ft, cpu: rand(5, 7), gpu: ft * rand(0.82, 0.92) };
+  }
+  const ft = clampN(7.08 + gauss() * 0.42, 5.9, 8.9);
+  return { ft, cpu: clampN(4.8 + gauss() * 0.3, 3.6, 6.2), gpu: clampN(Math.min(ft - 0.25, 6.6 + gauss() * 0.28), 5.2, 8.6) };
+}
+
+const SIM_APPS: SimApp[] = OWNER
+  ? [
+      {
+        pid: GAME_PID,
+        process: "Game.exe",
+        title: "Game",
+        runtime: "DXGI",
+        presentMode: "Hardware: Independent Flip",
+        allowsTearing: true,
+        syncInterval: 0,
+        foreground: true,
+        sample: sampleGameFrame,
+        dropP: 0.003,
+        latency: 11.2,
+      },
+      {
+        pid: LAUNCHER_PID,
+        process: "Launcher.exe",
+        title: "Launcher",
+        runtime: "DXGI",
+        presentMode: "Composed: Flip",
+        allowsTearing: false,
+        syncInterval: 1,
+        foreground: false,
+        sample: () => ({ ft: clampN(33.33 + gauss() * 0.35, 31.5, 35.5), cpu: rand(1.6, 2.6), gpu: rand(1.1, 1.8) }),
+        dropP: 0,
+        latency: 41,
+      },
+    ]
+  : [];
+
+const SIGNATURE_NOT_CHECKED: FrameSignature = { status: "notChecked", signer: null, sha256Match: null };
+const SIGNATURE_VALID: FrameSignature = { status: "valid", signer: "Intel Corporation", sha256Match: true };
+const SIGNATURE_INVALID: FrameSignature = { status: "invalid", signer: null, sha256Match: false };
+const FRAME_MESSAGES: Record<FrameSessionCode, string> = {
+  notElevated: "Frame capture needs administrator rights.",
+  exeMissing: "PresentMon is not installed with this copy of Nexum.",
+  signatureInvalid: "PresentMon failed its signature check, so it was not started.",
+  spawnFailed: "PresentMon could not be started: Access is denied.",
+  unsupportedOutput: "PresentMon output is missing the MsBetweenAppStart column.",
+  exited: "PresentMon stopped unexpectedly (exit code 1).",
+};
+
+const frames = {
+  session: null as FrameSession | null,
+  target: null as FrameTarget | null,
+  stats: null as FrameStats | null,
+  manualPid: null as number | null,
+  buffers: new Map<number, SimFrame[]>(),
+  pending: new Map<number, number[]>(),
+  lastT: new Map<number, number>(),
+  timer: null as ReturnType<typeof setInterval> | null,
+  startTimer: null as ReturnType<typeof setTimeout> | null,
+};
+
+function frameSession(state: FrameSession["state"], code: FrameSessionCode | null, signature: FrameSignature): FrameSession {
+  const message =
+    state === "stopped"
+      ? "Frame capture is off."
+      : state === "starting"
+        ? "Starting PresentMon…"
+        : state === "running"
+          ? "Capturing frames with Intel PresentMon 2.6.0."
+          : FRAME_MESSAGES[code ?? "exited"];
+  return {
+    type: "frameSession",
+    state,
+    code: state === "error" ? code : null,
+    message,
+    backend: "presentmon-console",
+    backendVersion: "2.6.0",
+    sessionName: "NexumFrames",
+    signature,
+    childPid: state === "starting" || state === "running" ? 23716 : null,
+    sinceTs: Date.now(),
+  };
+}
+
+function setFrameSession(s: FrameSession): void {
+  frames.session = s;
+  emit(EVENTS.frameSession, s);
+}
+
+const NO_TARGET: FrameTarget = {
+  type: "frameTarget",
+  pid: null,
+  process: null,
+  windowTitle: null,
+  reason: "none",
+  runtime: null,
+  presentMode: null,
+  fullscreenExclusive: null,
+};
+
+function setFrameTargetState(t: FrameTarget): void {
+  const prev = frames.target;
+  frames.target = t;
+  if (!prev || prev.pid !== t.pid || prev.reason !== t.reason) emit(EVENTS.frameTarget, t);
+}
+
+const isExcluded = (app: SimApp) => settings.fpsExcludes.some((n) => n.toLowerCase() === app.process.toLowerCase());
+const frameCaptureRunning = () => frames.session?.state === "running";
+
+/** Valid frames of `pid` (primary swap chain) whose CPU start is within the last `sec` seconds. */
+function framesWithin(pid: number, sec: number, now: number): SimFrame[] {
+  const buf = frames.buffers.get(pid) ?? [];
+  const from = now - sec * 1000;
+  return buf.filter((f) => f.t >= from);
+}
+
+function presenting(now: number): SimApp[] {
+  return SIM_APPS.filter((a) => !isExcluded(a) && framesWithin(a.pid, 2, now).length > 0);
+}
+
+/** Generate the frames each app presented since the last tick (simulation clock = performance.now()). */
+function generateFrames(now: number): void {
+  const keepMs = Math.max(settings.fpsWindowSec, 5) * 1000;
+  for (const app of SIM_APPS) {
+    if (isExcluded(app)) {
+      frames.buffers.delete(app.pid);
+      frames.pending.delete(app.pid);
+      frames.lastT.delete(app.pid);
+      continue;
+    }
+    let t = frames.lastT.get(app.pid) ?? now - 1000;
+    const buf = frames.buffers.get(app.pid) ?? [];
+    const pend = frames.pending.get(app.pid) ?? [];
+    while (t < now) {
+      const s = app.sample();
+      const shown = Math.random() >= app.dropP;
+      buf.push({
+        t,
+        ft: s.ft,
+        cpuBusy: s.cpu,
+        gpuBusy: s.gpu,
+        displayed: shown ? clampN(s.ft + gauss() * 0.2, 0.5, 200) : null,
+        latency: shown ? app.latency + s.ft * 0.35 + gauss() * 0.6 : null,
+      });
+      pend.push(r2(s.ft));
+      t += s.ft;
+    }
+    frames.lastT.set(app.pid, t);
+    while (buf.length > 0 && buf[0].t < now - keepMs) buf.shift();
+    frames.buffers.set(app.pid, buf);
+    frames.pending.set(app.pid, pend);
+  }
+}
+
+/** Target rule (§1.6.4): manual while presenting, else the presenting foreground app, else none. */
+function evaluateFrameTarget(now: number): void {
+  const live = presenting(now);
+  let app: SimApp | undefined;
+  let reason: FrameTarget["reason"] = "none";
+  if (frames.manualPid != null) {
+    app = live.find((a) => a.pid === frames.manualPid);
+    if (app) reason = "manual";
+    else frames.manualPid = null;
+  }
+  if (!app) {
+    app = live.find((a) => a.foreground);
+    if (app) reason = "foreground";
+  }
+  if (!app) {
+    setFrameTargetState(NO_TARGET);
+    return;
+  }
+  setFrameTargetState({
+    type: "frameTarget",
+    pid: app.pid,
+    process: app.process,
+    windowTitle: app.title,
+    reason,
+    runtime: app.runtime,
+    presentMode: app.presentMode,
+    fullscreenExclusive: app.presentMode.startsWith("Hardware: Legacy"),
+  });
+}
+
+function frameTick(): void {
+  if (!frameCaptureRunning() || !agentRunning || restarting) return;
+  const now = performance.now();
+  generateFrames(now);
+  evaluateFrameTarget(now);
+  const t = frames.target;
+  // Drop pending batches of non-targets (the agent only sends the target's frame times).
+  for (const pid of [...frames.pending.keys()]) if (pid !== t?.pid) frames.pending.set(pid, []);
+  if (!t || t.pid == null) {
+    frames.stats = null;
+    return;
+  }
+  const app = SIM_APPS.find((a) => a.pid === t.pid);
+  if (!app) return;
+  const windowSec = settings.fpsWindowSec;
+  const s = computeFrameStats(framesWithin(app.pid, windowSec, now));
+  const pend = frames.pending.get(app.pid) ?? [];
+  const omitted = Math.max(0, pend.length - 1000);
+  const stats: FrameStats = {
+    type: "frameStats",
+    ts: Date.now(),
+    pid: app.pid,
+    process: app.process,
+    windowSec,
+    ...s,
+    presentMode: app.presentMode,
+    runtime: app.runtime,
+    allowsTearing: app.allowsTearing,
+    syncInterval: app.syncInterval,
+    frametimes: omitted > 0 ? pend.slice(-1000) : pend,
+    frametimesOmitted: omitted,
+  };
+  frames.pending.set(app.pid, []);
+  frames.stats = stats;
+  emit(EVENTS.frameStats, stats);
+}
+
+function clearFrameBuffers(): void {
+  frames.buffers.clear();
+  frames.pending.clear();
+  frames.lastT.clear();
+  frames.stats = null;
+}
+
+function stopFrameTimers(): void {
+  if (frames.timer) clearInterval(frames.timer);
+  if (frames.startTimer) clearTimeout(frames.startTimer);
+  frames.timer = null;
+  frames.startTimer = null;
+}
+
+/** `{cmd:"frames", enabled:true}` → { ok, message } (the ack). */
+function framesEnable(): { ok: boolean; message: string } {
+  const st = frames.session?.state;
+  if (st === "starting" || st === "running") return { ok: true, message: "Frame capture is already on" };
+  if (ADMIN0) {
+    setFrameSession(frameSession("error", "notElevated", SIGNATURE_NOT_CHECKED));
+    return { ok: false, message: FRAME_MESSAGES.notElevated };
+  }
+  if (FPS_PARAM === "error") {
+    setFrameSession(frameSession("error", "signatureInvalid", SIGNATURE_INVALID));
+    return { ok: false, message: FRAME_MESSAGES.signatureInvalid };
+  }
+  setFrameSession(frameSession("starting", null, SIGNATURE_VALID));
+  stopFrameTimers();
+  frames.startTimer = setTimeout(() => {
+    frames.startTimer = null;
+    if (!agentRunning || restarting || frames.session?.state !== "starting") return;
+    setFrameSession(frameSession("running", null, SIGNATURE_VALID));
+    frames.lastT.clear();
+    frameTick();
+    frames.timer = setInterval(frameTick, 1000);
+  }, 900);
+  return { ok: true, message: "Frame capture started" };
+}
+
+/** `{cmd:"frames", enabled:false}`: terminate the session, clear buffers, target none. */
+function framesDisable(): { ok: boolean; message: string } {
+  stopFrameTimers();
+  clearFrameBuffers();
+  frames.manualPid = null;
+  const sig = frames.session?.signature ?? SIGNATURE_NOT_CHECKED;
+  setFrameSession(frameSession("stopped", null, sig));
+  if (frames.target && frames.target.reason !== "none") setFrameTargetState(NO_TARGET);
+  else frames.target = NO_TARGET;
+  return { ok: true, message: "Frame capture stopped" };
+}
+
+/** Rust after every hello: one `stopped` session from the agent, then re-enable when the setting is on. */
+function framesOnHello(): void {
+  stopFrameTimers();
+  clearFrameBuffers();
+  frames.manualPid = null;
+  // Delayed so listeners registered in the same tick as boot() receive it.
+  setTimeout(() => {
+    if (!agentRunning || restarting) return;
+    setFrameSession(frameSession("stopped", null, SIGNATURE_NOT_CHECKED));
+    frames.target = NO_TARGET;
+    if (settings.fpsCaptureEnabled) {
+      const r = framesEnable();
+      ack("frames", r.ok, r.message, 0);
+    }
+  }, 120);
+}
+
+/** Agent exited: Rust clears its caches (session null). */
+function framesAgentDown(): void {
+  stopFrameTimers();
+  clearFrameBuffers();
+  frames.session = null;
+  frames.target = null;
+  frames.manualPid = null;
+}
+
+/** Apply a changed fpsCaptureEnabled exactly like set_frame_capture (§2.13). */
+function applyFrameCaptureSetting(enabled: boolean): void {
+  if (!agentRunning || restarting) return;
+  const r = enabled ? framesEnable() : framesDisable();
+  ack("frames", r.ok, r.message);
+}
+
+function presentingList(): PresentingProcess[] {
+  if (!frameCaptureRunning()) return [];
+  const now = performance.now();
+  generateFrames(now); // the agent's buffers are current to the last CSV line, not the last stats tick
+  return presenting(now)
+    .map((a) => ({
+      pid: a.pid,
+      process: a.process,
+      windowTitle: a.title,
+      fps: r1(framesWithin(a.pid, 2, now).length / 2),
+      runtime: a.runtime,
+      presentMode: a.presentMode,
+      isForeground: a.foreground,
+      isTarget: frames.target?.pid === a.pid,
+    }))
+    .sort((x, y) => y.fps - x.fps);
+}
+
+/* ------------------------------------------------------------------ */
+/* [NEW 1.1] CSV sensor log (CONTRACT §2.9)                            */
+/* ------------------------------------------------------------------ */
+
+const LOG_FOLDER = "C:\\Users\\User\\Documents\\Nexum\\Logs";
+
+const sensorLog = {
+  status: {
+    active: false,
+    path: null,
+    folder: LOG_FOLDER,
+    rows: 0,
+    totalRows: 0,
+    startedTs: null,
+    intervalMs: settings.sensorLogIntervalMs,
+    sensorCount: 0,
+    error: null,
+  } as SensorLogStatus,
+  lastRowTs: 0,
+  sinceFlush: 0,
+};
+
+function emitSensorLog(): void {
+  emit(EVENTS.sensorLog, { ...sensorLog.status });
+}
+
+/** Default column set: every sensor that is not static, not defaultHidden and not user-hidden. */
+function defaultLogIds(): string[] {
+  const tree = sensorsState.tree;
+  if (!tree) return [];
+  const hidden = new Set(settings.hiddenSensors);
+  return tree.hardware.flatMap((h) => h.sensors.filter((s) => !s.static && !s.defaultHidden && !hidden.has(s.id)).map((s) => s.id));
+}
+
+function startLog(opts?: { intervalMs?: number; ids?: string[] | null }): SensorLogStatus {
+  if (sensorLog.status.active) throw new Error("A sensor log is already running");
+  const interval = opts?.intervalMs ?? settings.sensorLogIntervalMs;
+  if (!SENSOR_LOG_INTERVALS_MS.includes(interval)) throw new Error("Unsupported log interval");
+  const tree = agentRunning && !restarting ? sensorsState.tree : null;
+  if (!tree) throw new Error("Sensor data is not available yet");
+  let ids: string[];
+  if (opts?.ids == null) ids = defaultLogIds();
+  else {
+    const known = new Set(tree.hardware.flatMap((h) => h.sensors.map((s) => s.id)));
+    ids = opts.ids.filter((id) => known.has(id)).slice(0, 500);
+  }
+  if (ids.length === 0) throw new Error("No sensors to log");
+  if (opts?.intervalMs != null) {
+    settings = { ...settings, sensorLogIntervalMs: interval };
+    persistSettings(settings);
+  }
+  sensorLog.status = {
+    active: true,
+    path: `${LOG_FOLDER}\\nexum-${fileStamp()}.csv`,
+    folder: LOG_FOLDER,
+    rows: 0,
+    totalRows: 0,
+    startedTs: Date.now(),
+    intervalMs: interval,
+    sensorCount: ids.length,
+    error: null,
+  };
+  sensorLog.lastRowTs = 0;
+  sensorLog.sinceFlush = 0;
+  emitSensorLog();
+  return { ...sensorLog.status };
+}
+
+function stopLog(): SensorLogStatus {
+  if (sensorLog.status.active) {
+    sensorLog.status = { ...sensorLog.status, active: false };
+    emitSensorLog();
+  }
+  return { ...sensorLog.status };
+}
+
+/** One accepted sensor-values packet (Rust samples the stream it forwards). */
+function sensorLogOnPacket(ts: number): void {
+  const st = sensorLog.status;
+  if (!st.active) return;
+  if (sensorLog.lastRowTs !== 0 && ts - sensorLog.lastRowTs < st.intervalMs - 250) return;
+  sensorLog.lastRowTs = ts;
+  sensorLog.status = { ...st, rows: st.rows + 1, totalRows: st.totalRows + 1 };
+  if (++sensorLog.sinceFlush >= 10) {
+    sensorLog.sinceFlush = 0;
+    emitSensorLog(); // event after every flush (every 10 rows)
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* [NEW 1.1] Alert engine — mirror of Rust alerts.rs (CONTRACT §2.10)  */
+/* ------------------------------------------------------------------ */
+
+const RULE_DRIVE_CRIT = "Critical when a drive reports a critical warning, spare below threshold, read-only, or ≤ 10% life left";
+const RULE_DRIVE_WARN =
+  "Attention when a drive has ≤ 50% life left, reallocated, pending or uncorrectable sectors, a temperature warning, or a Windows health warning";
+
+const DRIVE_SHORT_TEXT: Record<string, string> = {
+  Failing: "1 drive failing",
+  "Replace soon": "1 drive: replace soon",
+  Worn: "1 drive worn",
+  "Check sectors": "1 drive: check sectors",
+  Overheating: "1 drive overheating",
+  "Windows warning": "1 drive: Windows warning",
+};
+
+const alertsState = {
+  snapshot: {
+    ready: false,
+    evaluatedTs: null,
+    alerts: [],
+    rules: [],
+    cpuLimit: { model: null, limitC: CPU_DEFAULT_LIMIT_C, warnC: CPU_DEFAULT_LIMIT_C - 5, source: "default" },
+  } as HealthAlertsSnapshot,
+  signals: new Map<string, SustainState>(),
+  lastKey: "",
+};
+
+/** Per-model limit (§2.10.2): user override > AMD table > 90 °C default. */
+function cpuLimitFor(cpuName: string | null | undefined): CpuLimitInfo {
+  const m = /Ryzen\s+\d\s+(PRO\s+)?(\d{4}[A-Z0-9]*)/i.exec(cpuName ?? "");
+  const model = m ? m[2].toUpperCase() : null;
+  const user = settings.alerts.cpuTempC;
+  if (user != null) return { model, limitC: user, warnC: user - 5, source: "user" };
+  const table = model != null ? CPU_TJMAX_TABLE[model] : undefined;
+  if (table != null) return { model, limitC: table, warnC: table - 5, source: "table" };
+  return { model, limitC: CPU_DEFAULT_LIMIT_C, warnC: CPU_DEFAULT_LIMIT_C - 5, source: "default" };
+}
+
+function fmtAlertTemp(c: number): string {
+  return settings.tempUnit === "F" ? `${Math.round((c * 9) / 5 + 32)} °F` : `${Math.round(c)} °C`;
+}
+
+function alertRules(limit: CpuLimitInfo): string[] {
+  const a = settings.alerts;
+  const S = a.sustainSec;
+  const hsCrit = a.gpuHotspotC ?? GPU_HOTSPOT_CRIT_DEFAULT_C;
+  const mjCrit = a.gpuMemJunctionC ?? GPU_MEM_JUNCTION_CRIT_DEFAULT_C;
+  const t = fmtAlertTemp;
+  return [
+    RULE_DRIVE_CRIT,
+    RULE_DRIVE_WARN,
+    `Attention when the CPU stays at or above ${t(limit.warnC)} for ${S} s; critical at or above ${t(limit.limitC)}`,
+    `Attention when a GPU hot spot stays at or above ${t(hsCrit - 10)} (edge ${t(GPU_EDGE_WARN_C)}) for ${S} s; critical at or above ${t(hsCrit)} (edge ${t(GPU_EDGE_CRIT_C)})`,
+    `Attention when GPU memory stays at or above ${t(mjCrit - 10)} for ${S} s; critical at or above ${t(mjCrit)}`,
+    `Attention when a drive stays at or above its warning temperature (${t(70)} if not reported) for ${S} s; critical at its critical temperature (${t(80)})`,
+    `Attention when a fixed drive has less than ${a.freeSpacePct}% free space; critical below ${Math.max(1, Math.floor(a.freeSpacePct / 2))}%`,
+  ];
+}
+
+/** LHM sensor id from the cached tree (first temperature sensor of `hwId` named one of `names`). */
+function treeSensorId(match: (h: HardwareNode) => boolean, names: string[] | null): string | null {
+  const tree = sensorsState.tree;
+  if (!tree) return null;
+  for (const h of tree.hardware) {
+    if (!match(h)) continue;
+    const temps = h.sensors.filter((s) => s.kind === "temperature");
+    if (!names) return temps[0]?.id ?? null;
+    for (const n of names) {
+      const s = temps.find((x) => x.name === n);
+      if (s) return s.id;
+    }
+  }
+  return null;
+}
+
+const ALERT_RULE_ORDER = (id: string) =>
+  id.startsWith("drive-temp:") ? 5 : id.startsWith("drive:") ? 1 : id === "cpu-temp" ? 2 : id.startsWith("gpu-mem-temp:") ? 4 : id.startsWith("gpu-temp:") ? 3 : 6;
+
+function signal(id: string): SustainState {
+  let s = alertsState.signals.get(id);
+  if (!s) {
+    s = newSustainState();
+    alertsState.signals.set(id, s);
+  }
+  return s;
+}
+
+/** Evaluate one telemetry packet (Rust: every packet, also while the window is hidden). */
+function evaluateAlerts(pkt: TelemetryPacket | null): void {
+  const a = settings.alerts;
+  const S = a.sustainSec;
+  const limit = cpuLimitFor(pkt?.cpu?.name ?? CPU_TELEMETRY_NAME);
+  const out: HealthAlert[] = [];
+  const ts = pkt?.ts ?? Date.now();
+  const physical = OWNER ? OWNER_PHYSICAL_DISKS : DEFAULT_PHYSICAL_DISKS;
+  const up = agentRunning && !restarting && pkt != null;
+  const base = (id: string, severity: "warn" | "crit", source: HealthAlert["source"], sinceTs: number) => ({
+    id,
+    severity,
+    source,
+    dismissKey: `${id}:${severity}`,
+    sinceTs,
+  });
+
+  if (up && pkt) {
+    const joined = joinDisks(physical, pkt.disks);
+    const nameOf = (t: DiskTelemetry) => driveDisplayName(joined.find((j) => j.tele?.id === t.id)?.disk ?? null, t);
+
+    // 1. Drive health (no sustain)
+    for (const t of pkt.disks) {
+      const st = t.health?.state;
+      if (st !== "attention" && st !== "replace" && st !== "failing") continue;
+      const crit = st !== "attention";
+      const id = `drive:${t.id}`;
+      const sig = signal(id);
+      const sev = crit ? "crit" : "warn";
+      if (sig.level !== sev) {
+        sig.level = sev;
+        sig.sinceTs = ts;
+      }
+      out.push({
+        ...base(id, sev, "drive", sig.sinceTs),
+        dismissKey: `${id}:${st}`,
+        title: `${nameOf(t)} — ${t.health.label}`,
+        detail: driveDetailSentence(t),
+        short: DRIVE_SHORT_TEXT[t.health.label] ?? `1 drive: ${t.health.label.toLowerCase()}`,
+        group: `drive:${t.health.label}`,
+        rule: crit ? RULE_DRIVE_CRIT : RULE_DRIVE_WARN,
+        value: t.healthPct,
+        threshold: crit ? 10 : 50,
+        subjectId: t.id,
+        sensorId: null,
+      });
+    }
+    // A drive that recovered (or vanished) starts from scratch next time.
+    for (const k of [...alertsState.signals.keys()]) {
+      if (k.startsWith("drive:") && !out.some((x) => x.id === k)) alertsState.signals.delete(k);
+    }
+
+    // 2. CPU temperature (sustained)
+    {
+      const v = pkt.cpu.packageTempC;
+      const lvl = evaluateSustained(signal("cpu-temp"), ts, v, limit.warnC, limit.limitC, S);
+      if (lvl && v != null) {
+        const thr = lvl === "crit" ? limit.limitC : limit.warnC;
+        const src = limit.source === "table" ? "AMD specification" : limit.source === "user" ? "your setting" : "default, this CPU model is not in Nexum's table";
+        out.push({
+          ...base("cpu-temp", lvl, "cpu", signal("cpu-temp").sinceTs),
+          title: `CPU at ${fmtAlertTemp(v)}`,
+          detail: `Above ${fmtAlertTemp(thr)} for ${S} s. Limit for this CPU: ${fmtAlertTemp(limit.limitC)} (${src}).`,
+          short: "CPU hot",
+          group: "cpu-temp",
+          rule: alertRules(limit)[2],
+          value: v,
+          threshold: thr,
+          subjectId: null,
+          sensorId: treeSensorId((h) => h.kind === "cpu", ["Core (Tctl/Tdie)", "CPU Package", "Core (Tctl)", "Core (Tdie)", "Tctl/Tdie", "Package"]),
+        });
+      }
+    }
+
+    // 3–4. GPU hot spot / edge and memory junction (sustained)
+    pkt.gpus.forEach((g, i) => {
+      const hwId = i === 0 ? RIG.dgpuHwId : IGPU_HW_ID;
+      const hot = g.hotspotTempC != null;
+      const hsCrit = a.gpuHotspotC ?? GPU_HOTSPOT_CRIT_DEFAULT_C;
+      const critAt = hot ? hsCrit : GPU_EDGE_CRIT_C;
+      const warnAt = hot ? hsCrit - 10 : GPU_EDGE_WARN_C;
+      const v = hot ? g.hotspotTempC : g.tempC;
+      const id = `gpu-temp:${i}`;
+      const lvl = evaluateSustained(signal(id), ts, v, warnAt, critAt, S);
+      if (lvl && v != null) {
+        const thr = lvl === "crit" ? critAt : warnAt;
+        out.push({
+          ...base(id, lvl, "gpu", signal(id).sinceTs),
+          title: `${g.name} at ${fmtAlertTemp(v)}`,
+          detail: hot ? `Hot spot above ${fmtAlertTemp(thr)} for ${S} s.` : `Edge temperature above ${fmtAlertTemp(thr)} for ${S} s.`,
+          short: "GPU hot",
+          group: "gpu-temp",
+          rule: alertRules(limit)[3],
+          value: v,
+          threshold: thr,
+          subjectId: String(i),
+          sensorId: treeSensorId((h) => h.id === hwId, hot ? ["GPU Hot Spot"] : ["GPU Core"]),
+        });
+      }
+      const mj = g.memJunctionTempC;
+      const mjCrit = a.gpuMemJunctionC ?? GPU_MEM_JUNCTION_CRIT_DEFAULT_C;
+      const mid = `gpu-mem-temp:${i}`;
+      const mlvl = evaluateSustained(signal(mid), ts, mj, mjCrit - 10, mjCrit, S);
+      if (mlvl && mj != null) {
+        const thr = mlvl === "crit" ? mjCrit : mjCrit - 10;
+        out.push({
+          ...base(mid, mlvl, "gpu", signal(mid).sinceTs),
+          title: `${g.name} memory at ${fmtAlertTemp(mj)}`,
+          detail: `Memory junction above ${fmtAlertTemp(thr)} for ${S} s.`,
+          short: "GPU memory hot",
+          group: "gpu-mem-temp",
+          rule: alertRules(limit)[4],
+          value: mj,
+          threshold: thr,
+          subjectId: String(i),
+          sensorId: treeSensorId((h) => h.id === hwId, ["GPU Memory Junction", "GPU Memory"]),
+        });
+      }
+    });
+
+    // 5. Drive temperatures (sustained)
+    for (const t of pkt.disks) {
+      const warnAt = t.warningTempC ?? 70;
+      const critAt = t.criticalTempC ?? 80;
+      const id = `drive-temp:${t.id}`;
+      const lvl = evaluateSustained(signal(id), ts, t.tempC, warnAt, critAt, S);
+      if (!lvl || t.tempC == null) continue;
+      const thr = lvl === "crit" ? critAt : warnAt;
+      out.push({
+        ...base(id, lvl, "drive", signal(id).sinceTs),
+        title: `${nameOf(t)} at ${fmtAlertTemp(t.tempC)}`,
+        detail: `Above ${fmtAlertTemp(thr)} for ${S} s.`,
+        short: "Drive hot",
+        group: "drive-temp",
+        rule: alertRules(limit)[5],
+        value: t.tempC,
+        threshold: thr,
+        subjectId: t.id,
+        sensorId: treeSensorId((h) => h.id === t.id, null),
+      });
+    }
+  } else {
+    // Agent down or stale: every non-space alert and its samples are cleared.
+    for (const k of [...alertsState.signals.keys()]) if (!k.startsWith("space:")) alertsState.signals.delete(k);
+  }
+
+  // 6. Free space (no sustain; also while the agent is down)
+  const warnPct = a.freeSpacePct;
+  const critPct = Math.max(1, Math.floor(warnPct / 2));
+  for (const v of volumes()) {
+    if (v.driveType !== "Fixed" || !(v.totalBytes > 0)) continue;
+    const pct = (v.freeBytes / v.totalBytes) * 100;
+    const id = `space:${v.letter}`;
+    if (!(pct < warnPct)) {
+      alertsState.signals.delete(id);
+      continue;
+    }
+    const sev = pct < critPct ? "crit" : "warn";
+    const sig = signal(id);
+    if (sig.level !== sev) {
+      sig.level = sev;
+      sig.sinceTs = ts;
+    }
+    out.push({
+      ...base(id, sev, "space", sig.sinceTs),
+      title: `${v.letter} has ${fmtBytes(v.freeBytes)} free (${Math.round(pct)}%)`,
+      detail: `Below ${sev === "crit" ? critPct : warnPct}% free.`,
+      short: "Low disk space",
+      group: "space",
+      rule: alertRules(limit)[6],
+      value: r1(pct),
+      threshold: sev === "crit" ? critPct : warnPct,
+      subjectId: v.letter,
+      sensorId: null,
+    });
+  }
+
+  // ?alerts=hot: demo conditions on top of the simulation.
+  if (ALERTS_HOT && up && pkt) {
+    if (!out.some((x) => x.id === "cpu-temp")) {
+      const v = Math.max(pkt.cpu.packageTempC ?? limit.limitC, limit.limitC + 1);
+      out.push({
+        ...base("cpu-temp", "crit", "cpu", alertsState.snapshot.alerts.find((x) => x.id === "cpu-temp")?.sinceTs ?? ts),
+        title: `CPU at ${fmtAlertTemp(v)}`,
+        detail: `Above ${fmtAlertTemp(limit.limitC)} for ${S} s. Limit for this CPU: ${fmtAlertTemp(limit.limitC)} (${limit.source === "table" ? "AMD specification" : limit.source === "user" ? "your setting" : "default, this CPU model is not in Nexum's table"}).`,
+        short: "CPU hot",
+        group: "cpu-temp",
+        rule: alertRules(limit)[2],
+        value: v,
+        threshold: limit.limitC,
+        subjectId: null,
+        sensorId: treeSensorId((h) => h.kind === "cpu", ["Core (Tctl/Tdie)", "CPU Package"]),
+      });
+    }
+    const g = pkt.gpus[0];
+    if (g && !out.some((x) => x.id === "gpu-temp:0")) {
+      const crit = a.gpuHotspotC ?? GPU_HOTSPOT_CRIT_DEFAULT_C;
+      const v = Math.max(g.hotspotTempC ?? crit - 8, crit - 8);
+      out.push({
+        ...base("gpu-temp:0", "warn", "gpu", alertsState.snapshot.alerts.find((x) => x.id === "gpu-temp:0")?.sinceTs ?? ts),
+        title: `${g.name} at ${fmtAlertTemp(v)}`,
+        detail: `Hot spot above ${fmtAlertTemp(crit - 10)} for ${S} s.`,
+        short: "GPU hot",
+        group: "gpu-temp",
+        rule: alertRules(limit)[3],
+        value: v,
+        threshold: crit - 10,
+        subjectId: "0",
+        sensorId: treeSensorId((h) => h.id === RIG.dgpuHwId, ["GPU Hot Spot"]),
+      });
+    }
+  }
+
+  out.sort(
+    (x, y) =>
+      (x.severity === "crit" ? 0 : 1) - (y.severity === "crit" ? 0 : 1) ||
+      ALERT_RULE_ORDER(x.id) - ALERT_RULE_ORDER(y.id) ||
+      (x.subjectId ?? "").localeCompare(y.subjectId ?? ""),
+  );
+  const snapshot: HealthAlertsSnapshot = {
+    ready: up,
+    evaluatedTs: up ? ts : alertsState.snapshot.evaluatedTs,
+    alerts: out,
+    rules: alertRules(limit),
+    cpuLimit: limit,
+  };
+  alertsState.snapshot = snapshot;
+  const key = JSON.stringify({ r: snapshot.ready, a: snapshot.alerts, c: snapshot.cpuLimit, u: snapshot.rules });
+  if (key !== alertsState.lastKey) {
+    alertsState.lastKey = key;
+    emit(EVENTS.healthAlerts, snapshot);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* [NEW 1.1] Drive wear ledger (CONTRACT §2.11)                        */
+/* ------------------------------------------------------------------ */
+
+interface LedgerPlan {
+  serial: string;
+  days: number;
+  life: [number, number] | null;
+  written: [number, number] | null;
+  poh: number;
+}
+
+/** Daily history ending today; life steps are integers like the drive reports them. */
+function ledgerPoints(p: LedgerPlan): DriveHistoryPoint[] {
+  const out: DriveHistoryPoint[] = [];
+  const today = Date.now();
+  for (let i = p.days - 1; i >= 0; i--) {
+    const k = p.days > 1 ? (p.days - 1 - i) / (p.days - 1) : 1;
+    out.push({
+      date: isoDate(today - i * DAY_MS),
+      healthPct: p.life ? Math.round(p.life[0] + (p.life[1] - p.life[0]) * k) : null,
+      dataWrittenTb: p.written ? r2(p.written[0] + (p.written[1] - p.written[0]) * k + (i > 0 ? gauss() * 0.02 : 0)) : null,
+      powerOnHours: Math.round(p.poh - i * 13.6),
+    });
+  }
+  return out;
+}
+
+const LEDGER_PLANS: LedgerPlan[] = OWNER
+  ? [
+      // The worn system NVMe: 47% → 44% over 120 days, ~0.9 TB written per month.
+      { serial: "20190A1B2C3D", days: 120, life: [47, 44], written: [84.7 - (0.9 * 120) / 30.4375, 84.7], poh: 20188 },
+      // A drive whose ledger only started recently.
+      { serial: "2104_E1A2_B3C4.", days: 3, life: [95, 95], written: [17.8, 17.9], poh: 15958 },
+    ]
+  : [
+      { serial: "S73WNJ0W612345A", days: 120, life: [98, 98], written: [18.42 - (0.45 * 120) / 30.4375, 18.42], poh: 4210 },
+      { serial: "23125L801234", days: 3, life: [100, 100], written: [6.1, 6.18], poh: 2655 },
+      { serial: "ZFN0A1B2", days: 30, life: null, written: null, poh: 11826 },
+    ];
+
+const LEDGER = new Map<string, DriveHistoryPoint[]>(
+  LEDGER_PLANS.map((p) => [normSerial(p.serial) ?? p.serial, ledgerPoints(p)]),
+);
+
+function driveHistory(serial: string): DriveHistory {
+  const points = LEDGER.get(normSerial(serial) ?? "") ?? [];
+  return { serial, points: points.map((p) => ({ ...p })), forecast: computeForecast(points, isoDate(Date.now())) };
+}
+
+/* ------------------------------------------------------------------ */
+/* [NEW 1.1] GPU tuning, read-only (CONTRACT §1.7)                     */
+/* ------------------------------------------------------------------ */
+
+const TUNING_UNSUPPORTED_MESSAGE = {
+  notElevated: "GPU tuning data needs administrator rights.",
+  noAmdGpu: "No AMD Radeon GPU was found.",
+} as const;
+
+function tuningState(): TuningState {
+  const common = { type: "tuningState" as const, ts: Date.now(), gpuIndex: 0, backend: "adl-od8" as const };
+  const reason = ADMIN0 ? "notElevated" : !OWNER || GPU_PARAM === "nvidia" ? "noAmdGpu" : null;
+  if (reason) {
+    return {
+      ...common,
+      adapterName: null,
+      supported: false,
+      reason,
+      message: TUNING_UNSUPPORTED_MESSAGE[reason],
+      odVersion: null,
+      caps: { powerLimit: false, autoUndervolt: false, fanCurve: false, zeroRpm: false, voltageOffset: false, gfxClockMax: false, memClockMax: false },
+      ranges: { powerPct: null, voltageOffsetMv: null, gfxClockMaxMhz: null, memClockMaxMhz: null, fanCurveTempC: null, fanCurvePct: null },
+      current: { powerPct: null, autoUndervolt: null, zeroRpm: null, voltageOffsetMv: null, gfxClockMaxMhz: null, memClockMaxMhz: null, fanCurve: null },
+      isFactory: null,
+      mode: "unknown",
+      powerMode: null,
+      vpuRecoveryCount: null,
+    };
+  }
+  // RX 9070 XT-like OD8 table (RDNA4), factory settings.
+  return {
+    ...common,
+    adapterName: DGPU_NAME,
+    supported: true,
+    reason: null,
+    message: "Read-only. Nexum does not change GPU settings in this version.",
+    odVersion: 8,
+    caps: { powerLimit: true, autoUndervolt: true, fanCurve: true, zeroRpm: true, voltageOffset: true, gfxClockMax: true, memClockMax: true },
+    ranges: {
+      powerPct: { min: -30, max: 10, step: 1, default: 0 },
+      voltageOffsetMv: { min: -200, max: 0, step: 1, default: 0 },
+      // As read from an RX 9070 XT (Navi 48): OD8_GFXCLK_FMAX is an offset there, not an absolute clock.
+      gfxClockMaxMhz: { min: -500, max: 1000, step: 1, default: 0 },
+      memClockMaxMhz: { min: 2518, max: 3000, step: 1, default: 2518 },
+      fanCurveTempC: { min: 25, max: 100, step: 1, default: null },
+      fanCurvePct: { min: 0, max: 100, step: 1, default: null },
+    },
+    current: {
+      powerPct: 0,
+      autoUndervolt: false,
+      zeroRpm: true,
+      voltageOffsetMv: 0,
+      gfxClockMaxMhz: 0,
+      memClockMaxMhz: 2518,
+      fanCurve: [
+        { tempC: 40, pct: 20 },
+        { tempC: 55, pct: 30 },
+        { tempC: 70, pct: 45 },
+        { tempC: 85, pct: 70 },
+        { tempC: 95, pct: 100 },
+      ],
+    },
+    isFactory: true,
+    mode: "factory",
+    powerMode: null,
+    vpuRecoveryCount: 0,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* [NEW 1.1] Cleaner extras: Recycle Bin age + drill-down (§3.2, §3.3) */
+/* ------------------------------------------------------------------ */
+
+interface RecycleItem {
+  path: string;
+  bytes: number;
+  deletedTs: number;
+  folder: boolean;
+}
+
+/** Deterministic Recycle Bin content (318 items, ~1.21 GB), ages from minutes to a year. */
+const recycleItems: RecycleItem[] = (() => {
+  const rnd = mulberry32(0x5ec1c1e);
+  const kinds = [
+    (n: number) => ({ path: `C:\\Users\\User\\Downloads\\setup-${1000 + n}.exe`, folder: false, w: 6 }),
+    (n: number) => ({ path: `C:\\Users\\User\\Documents\\draft-${n}.docx`, folder: false, w: 0.4 }),
+    (n: number) => ({ path: `C:\\Users\\User\\Pictures\\IMG_${2000 + n}.jpg`, folder: false, w: 1 }),
+    (n: number) => ({ path: `C:\\Users\\User\\Videos\\clip-${n}.mp4`, folder: false, w: 14 }),
+    (n: number) => ({ path: `C:\\Users\\User\\Downloads\\archive-${n}`, folder: true, w: 9 }),
+    (n: number) => ({ path: `C:\\Users\\User\\Desktop\\notes-${n}.txt`, folder: false, w: 0.02 }),
+  ];
+  const list: RecycleItem[] = [];
+  for (let i = 0; i < 318; i++) {
+    const k = kinds[Math.floor(rnd() * kinds.length)](i);
+    const ageDays = rnd() < 0.4 ? rnd() * 14 : rnd() < 0.55 ? 14 + rnd() * 16 : rnd() < 0.6 ? 30 + rnd() * 30 : 60 + rnd() * 300;
+    list.push({ path: k.path, folder: k.folder, bytes: k.w * Math.exp(rnd() * 3), deletedTs: Math.round(Date.now() - ageDays * DAY_MS) });
+  }
+  const total = list.reduce((s, x) => s + x.bytes, 0);
+  const target = 1.21 * GIB;
+  for (const x of list) x.bytes = Math.max(512, Math.round((x.bytes / total) * target));
+  return list;
+})();
+
+/** The age actually used: the argument when given, else Settings.recycleMinAgeDays. */
+const recycleAge = (arg: number | null | undefined) => (arg === undefined ? settings.recycleMinAgeDays : arg);
+
+function recycleQualifying(age: number | null): RecycleItem[] {
+  if (age == null) return recycleItems;
+  const cutoff = Date.now() - age * DAY_MS;
+  return recycleItems.filter((x) => x.deletedTs <= cutoff);
+}
+
+const dayWord = (n: number) => (n === 1 ? "1 day" : `${n} days`);
+
+const DO_CACHE_PATH = "C:\\Windows\\ServiceProfiles\\NetworkService\\AppData\\Local\\Microsoft\\Windows\\DeliveryOptimization\\Cache";
+
+/** Plausible file names per category for the top-50 drill-down. */
+function detailPath(id: TrashCategoryId, i: number, rnd: () => number): string {
+  const hex = (len: number) => Array.from({ length: len }, () => Math.floor(rnd() * 16).toString(16)).join("");
+  switch (id) {
+    case "temp":
+      return [
+        `C:\\Users\\User\\AppData\\Local\\Temp\\${hex(8)}.tmp`,
+        `C:\\Users\\User\\AppData\\Local\\Temp\\setup_${hex(6)}.log`,
+        `C:\\Users\\User\\AppData\\Local\\Temp\\${hex(8)}-${hex(4)}\\installer.msi`,
+        `C:\\Windows\\Temp\\MpCmdRun-${hex(4)}.log`,
+      ][i % 4];
+    case "wu-cache":
+      return `C:\\Windows\\SoftwareDistribution\\Download\\${hex(32)}\\windows11.0-kb50${(i * 37) % 100}${hex(2)}-x64.${i % 3 === 0 ? "psf" : "cab"}`;
+    case "logs":
+      return i % 3 === 0
+        ? `C:\\Windows\\Logs\\CBS\\CbsPersist_2025${String(1 + (i % 12)).padStart(2, "0")}${String(1 + (i % 27)).padStart(2, "0")}${hex(6)}.log`
+        : `C:\\ProgramData\\Microsoft\\Windows\\WER\\ReportArchive\\AppCrash_${["Game.exe", "explorer.exe", "Launcher.exe"][i % 3]}_${hex(12)}\\Report.wer`;
+    case "dumps":
+      return i % 2 === 0
+        ? `C:\\Windows\\Minidump\\2025${String(1 + (i % 9)).padStart(2, "0")}${String(10 + i).padStart(2, "0")}-01.dmp`
+        : `C:\\Users\\User\\AppData\\Local\\CrashDumps\\Game.exe.${10000 + i}.dmp`;
+    case "memory-dump":
+      return "C:\\Windows\\MEMORY.DMP";
+    case "shader":
+      return OWNER
+        ? `C:\\Users\\User\\AppData\\Local\\AMD\\${["DxCache", "DxcCache", "VkCache"][i % 3]}\\${hex(16)}.parc`
+        : `C:\\Users\\User\\AppData\\Local\\${["D3DSCache", "NVIDIA\\DXCache", "NVIDIA\\GLCache"][i % 3]}\\${hex(16)}.${i % 2 ? "toc" : "bin"}`;
+    case "recycle":
+      return "";
+    case "browser":
+    default:
+      return [
+        `C:\\Users\\User\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Cache\\Cache_Data\\f_${hex(6)}`,
+        `C:\\Users\\User\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default\\Code Cache\\js\\${hex(16)}_0`,
+        `C:\\Users\\User\\AppData\\Local\\Mozilla\\Firefox\\Profiles\\x1y2z3.default-release\\cache2\\entries\\${hex(40).toUpperCase()}`,
+        `C:\\Users\\User\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\GPUCache\\data_${i % 4}`,
+      ][i % 4];
+  }
+}
+
+/** Top items of a category: what a purge would delete now (age guards and skips already applied). */
+function trashDetails(def: CacheDef, limit: number, age: number | null): TrashDetailItem[] {
+  if (def.id === "recycle") {
+    return recycleQualifying(age)
+      .map((x) => ({ path: x.path, bytes: x.bytes, modifiedTs: x.deletedTs, kind: x.folder ? ("folder" as const) : ("file" as const) }))
+      .sort((p, q) => q.bytes - p.bytes || p.path.localeCompare(q.path))
+      .slice(0, limit);
+  }
+  const { bytes, files } = cleanable(def);
+  const rnd = mulberry32([...def.id].reduce((s, c) => s * 31 + c.charCodeAt(0), 7) >>> 0);
+  const items: TrashDetailItem[] = [];
+  const minAgeDays = def.id === "dumps" || def.id === "logs" ? 31 : 1.05;
+  let fileBytes = bytes;
+  // Windows Update: the Delivery Optimization cache is one group row (deleted by Microsoft's cmdlet).
+  if (def.id === "wu-cache") {
+    const doBytes = Math.round(bytes * (OWNER ? 1 : 0.35));
+    fileBytes = bytes - doBytes;
+    items.push({ path: DO_CACHE_PATH, bytes: doBytes, modifiedTs: null, kind: "group" });
+  }
+  // Owner rig: an update is pending, so the SoftwareDistribution download folder is skipped entirely.
+  const fileCount = def.id === "wu-cache" && OWNER ? 0 : def.id === "memory-dump" ? 1 : Math.min(files, 400);
+  if (fileCount > 0 && fileBytes > 0) {
+    const weights = Array.from({ length: fileCount }, (_, i) => Math.pow(i + 1, -0.85) * (0.6 + rnd() * 0.8));
+    const sum = weights.reduce((s, w) => s + w, 0);
+    for (let i = 0; i < Math.min(fileCount, limit); i++) {
+      items.push({
+        path: detailPath(def.id, i, rnd),
+        bytes: Math.max(1, Math.round((weights[i] / sum) * fileBytes)),
+        modifiedTs: def.id === "memory-dump" ? Date.parse(`${MEMORY_DUMP_DATE}T09:14:00`) : Math.round(Date.now() - (minAgeDays + rnd() * 120) * DAY_MS),
+        kind: "file",
+      });
+    }
+  }
+  return items.sort((p, q) => q.bytes - p.bytes || p.path.localeCompare(q.path)).slice(0, limit);
+}
+
+/* ------------------------------------------------------------------ */
+/* [NEW 1.1] Per-packet hooks and agent lifecycle                      */
+/* ------------------------------------------------------------------ */
+
+/** Rust-side work per live telemetry packet: CSV rows and the alert engine. */
+function onLivePacketV11(pkt: TelemetryPacket): void {
+  if (sensorsState.tree) sensorLogOnPacket(pkt.ts);
+  evaluateAlerts(pkt);
+}
+
+/** The agent went away (restart): Rust clears frame caches and non-space alerts. */
+function agentDownV11(): void {
+  framesAgentDown();
+  evaluateAlerts(null);
+}
+
+let traySensors: string[] = [];
 
 /* ------------------------------------------------------------------ */
 /* Public mock backend (mirrors `api` in ./api.ts)                     */
@@ -2546,10 +3811,11 @@ export const mockBackend = {
     return (OWNER ? OWNER_PHYSICAL_DISKS : DEFAULT_PHYSICAL_DISKS).map((d) => ({ ...d, volumes: [...d.volumes] }));
   },
 
-  async scanTrash(includeBrowser: boolean): Promise<TrashScan> {
+  async scanTrash(includeBrowser: boolean, recycleMinAgeDays?: number | null): Promise<TrashScan> {
     const started = performance.now();
     await sleep(rand(850, 1400));
-    const categories = CACHE_DEFS.filter((d) => d.id !== "browser" || includeBrowser).map((d) => toCategory(d, includeBrowser));
+    const age = recycleAge(recycleMinAgeDays);
+    const categories = CACHE_DEFS.filter((d) => d.id !== "browser" || includeBrowser).map((d) => toCategory(d, includeBrowser, age));
     return {
       categories,
       totalBytes: categories.reduce((s, c) => (c.available ? s + c.bytes : s), 0),
@@ -2558,8 +3824,9 @@ export const mockBackend = {
     };
   },
 
-  async purgeTrash(categories: TrashCategoryId[]): Promise<PurgeResult> {
+  async purgeTrash(categories: TrashCategoryId[], recycleMinAgeDays?: number | null): Promise<PurgeResult> {
     if (purgeRunning) throw new Error("A cleanup is already in progress");
+    const age = recycleAge(recycleMinAgeDays);
     const known = new Set(CACHE_DEFS.map((d) => d.id));
     const unknown = categories.find((c) => !known.has(c));
     if (unknown) throw new Error(`Unknown category: ${unknown}`);
@@ -2588,12 +3855,18 @@ export const mockBackend = {
           emit("purge-progress", progress());
           continue;
         }
-        const { bytes, files } = cleanable(def);
+        const { bytes, files } = cleanable(def, age);
         const ratio = def.id === "recycle" || def.id === "memory-dump" ? 1 : rand(0.972, 0.994);
         const freedHere = Math.round(bytes * ratio);
         const del = Math.round(files * ratio);
         const sk = files - del + (def.skipped ? Math.round(def.files * def.skipped.fraction) : 0);
-        lastCleanAt[def.id] = Date.now();
+        if (def.id === "recycle") {
+          // Only the qualifying items leave the bin; newer ones stay (§3.2).
+          const gone = new Set(recycleQualifying(age));
+          for (let i = recycleItems.length - 1; i >= 0; i--) if (gone.has(recycleItems[i])) recycleItems.splice(i, 1);
+        } else {
+          lastCleanAt[def.id] = Date.now();
+        }
         freed += freedHere;
         deleted += del;
         skipped += sk;
@@ -2709,9 +3982,17 @@ export const mockBackend = {
 
   async saveSettings(next: Settings): Promise<Settings> {
     await sleep(rand(120, 260));
+    const prev = settings;
     settings = sanitizeSettings(next);
     persistSettings(settings);
     if (settings.pollIntervalMs !== sim.intervalMs) applyPollInterval(settings.pollIntervalMs);
+    // [NEW 1.1] Same effect as the dedicated commands (§2.13), and alerts re-evaluate at once (§2.10).
+    if (settings.fpsCaptureEnabled !== prev.fpsCaptureEnabled) applyFrameCaptureSetting(settings.fpsCaptureEnabled);
+    if (settings.fpsWindowSec !== prev.fpsWindowSec) ack("frameWindow", true, `Window: ${settings.fpsWindowSec} s`);
+    if (settings.fpsExcludes.join("\n") !== prev.fpsExcludes.join("\n")) ack("frameExclude", true, `Excluding ${settings.fpsExcludes.length} apps`);
+    if (JSON.stringify(settings.alerts) !== JSON.stringify(prev.alerts) || settings.tempUnit !== prev.tempUnit) {
+      evaluateAlerts(agentRunning && !restarting ? (lastFrame?.pkt ?? null) : null);
+    }
     return { ...settings };
   },
 
@@ -2729,6 +4010,7 @@ export const mockBackend = {
     if (restarting) return;
     restarting = true;
     stopTimer();
+    agentDownV11();
     emitStatus();
     await sleep(400);
     setTimeout(() => {
@@ -2815,6 +4097,169 @@ export const mockBackend = {
   async openReliabilityMonitor(): Promise<void> {
     await sleep(30);
     console.info("[nexum mock] open_reliability_monitor → perfmon.exe /rel (desktop app only)");
+  },
+
+  /* ── [NEW 1.1] Cleaner drill-down (§3.3) ── */
+
+  async scanTrashDetails(categoryId: TrashCategoryId, limit: number, recycleMinAgeDays?: number | null): Promise<TrashDetailItem[]> {
+    await sleep(rand(250, 600));
+    const def = CACHE_DEFS.find((d) => d.id === categoryId);
+    if (!def) throw new Error("Unknown category");
+    if (!available(def)) throw new Error(NEEDS_ADMIN_NOTE);
+    const n = Math.round(clampN(Number.isFinite(limit) ? limit : TRASH_DETAILS_LIMIT, 1, TRASH_DETAILS_LIMIT));
+    return trashDetails(def, n, recycleAge(recycleMinAgeDays));
+  },
+
+  /* ── [NEW 1.1] Frame capture (§2.13) ── */
+
+  async getFrameState(): Promise<FrameState> {
+    await sleep(20);
+    return {
+      session: frames.session ? { ...frames.session } : null,
+      target: frames.target ? { ...frames.target } : null,
+      stats: frames.stats ? { ...frames.stats, frametimes: [] } : null,
+    };
+  },
+
+  async setFrameCapture(enabled: boolean): Promise<Settings> {
+    await sleep(rand(60, 140));
+    const changed = settings.fpsCaptureEnabled !== !!enabled;
+    settings = { ...settings, fpsCaptureEnabled: !!enabled };
+    persistSettings(settings);
+    if (changed || (enabled && frames.session?.state !== "running" && frames.session?.state !== "starting")) {
+      applyFrameCaptureSetting(!!enabled);
+    }
+    return { ...settings };
+  },
+
+  async setFrameTarget(pid: number | null): Promise<void> {
+    await sleep(rand(40, 120));
+    if (!agentRunning || restarting) throw new Error("Hardware agent is not running");
+    if (pid == null) {
+      frames.manualPid = null;
+      evaluateFrameTarget(performance.now());
+      ack("frameTarget", true, "Automatic target", 0);
+      return;
+    }
+    const app = frameCaptureRunning() ? presenting(performance.now()).find((a) => a.pid === pid) : undefined;
+    if (!app) {
+      ack("frameTarget", false, "That app is not presenting frames.", 0);
+      throw new Error("That app is not presenting frames.");
+    }
+    frames.manualPid = pid;
+    evaluateFrameTarget(performance.now());
+    ack("frameTarget", true, `Target: ${app.process}`, 0);
+  },
+
+  async setFrameWindow(sec: number): Promise<Settings> {
+    await sleep(rand(60, 140));
+    const v = Math.round(clampN(Number.isFinite(sec) ? sec : 30, 5, 120));
+    settings = { ...settings, fpsWindowSec: v };
+    persistSettings(settings);
+    if (agentRunning && !restarting) ack("frameWindow", true, `Window: ${v} s`);
+    return { ...settings };
+  },
+
+  async setFrameExcludes(names: string[]): Promise<Settings> {
+    await sleep(rand(60, 140));
+    settings = { ...settings, fpsExcludes: sanitizeExcludeList(names) };
+    persistSettings(settings);
+    if (agentRunning && !restarting) {
+      ack("frameExclude", true, `Excluding ${settings.fpsExcludes.length} apps`);
+      // The target rule runs at once when the current target became excluded.
+      if (frameCaptureRunning()) {
+        const now = performance.now();
+        generateFrames(now);
+        evaluateFrameTarget(now);
+      }
+    }
+    return { ...settings };
+  },
+
+  async listPresentingProcesses(): Promise<PresentingProcess[]> {
+    await sleep(rand(80, 200));
+    if (!agentRunning || restarting) throw new Error("Hardware agent is not running");
+    return presentingList();
+  },
+
+  /* ── [NEW 1.1] CSV sensor log (§2.9) ── */
+
+  async startSensorLog(opts?: { intervalMs?: number; ids?: string[] | null }): Promise<SensorLogStatus> {
+    await sleep(rand(60, 140));
+    return startLog(opts);
+  },
+
+  async stopSensorLog(): Promise<SensorLogStatus> {
+    await sleep(rand(40, 100));
+    return stopLog();
+  },
+
+  async getSensorLogStatus(): Promise<SensorLogStatus> {
+    await sleep(20);
+    return { ...sensorLog.status, intervalMs: sensorLog.status.active ? sensorLog.status.intervalMs : settings.sensorLogIntervalMs };
+  },
+
+  /* ── [NEW 1.1] Alerts, notifications, tray (§2.10) ── */
+
+  async getHealthAlerts(): Promise<HealthAlertsSnapshot> {
+    await sleep(30);
+    return { ...alertsState.snapshot, alerts: alertsState.snapshot.alerts.map((a) => ({ ...a })) };
+  },
+
+  async dismissAlert(dismissKey: string): Promise<Settings> {
+    await sleep(rand(60, 140));
+    const list = settings.dismissedAlerts.filter((k) => k !== dismissKey);
+    list.push(dismissKey);
+    settings = { ...settings, dismissedAlerts: list.slice(-200) };
+    persistSettings(settings);
+    return { ...settings };
+  },
+
+  async setTraySensors(ids: string[]): Promise<void> {
+    traySensors = ids.slice(0, 4);
+    console.debug("[nexum mock] tray sensors:", traySensors);
+  },
+
+  /* ── [NEW 1.1] Drive wear ledger (§2.11) ── */
+
+  async getDriveHistory(serial: string): Promise<DriveHistory> {
+    await sleep(rand(80, 200));
+    return driveHistory(serial);
+  },
+
+  /* ── [NEW 1.1] Save report (§2.12) ── */
+
+  async saveReport(format: ReportFormat): Promise<string> {
+    await sleep(rand(300, 700));
+    if (format !== "txt" && format !== "html") throw new Error("Unsupported report format");
+    const path = `C:\\Users\\User\\Documents\\Nexum\\Reports\\nexum-report-${fileStamp()}.${format}`;
+    console.info(`[nexum mock] save_report → ${path} (written by the desktop app only)`);
+    return path;
+  },
+
+  /* ── [NEW 1.1] GPU tuning, read-only (§2.14) ── */
+
+  async getTuningState(refresh = false): Promise<TuningState | null> {
+    await sleep(refresh ? rand(150, 400) : 30);
+    if (!agentRunning || restarting) return null;
+    const s = tuningState();
+    if (refresh) emit(EVENTS.tuningState, s);
+    return s;
+  },
+
+  async runTuningProbe(write: boolean): Promise<TuningProbeSummary> {
+    if (write) throw new Error("The write probe is not available in this version.");
+    await sleep(rand(900, 1500));
+    if (!agentRunning || restarting) throw new Error("Hardware agent is not running");
+    const s = tuningState();
+    emit(EVENTS.tuningState, s);
+    return {
+      ranTs: Date.now(),
+      write: false,
+      ok: s.supported,
+      message: s.supported ? "Read-only probe finished." : s.message,
+      path: `C:\\Users\\User\\AppData\\Local\\Nexum\\tuning-probe-${fileStamp()}.json`,
+    };
   },
 };
 

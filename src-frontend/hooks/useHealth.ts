@@ -2,6 +2,7 @@ import { createContext, createElement, useContext, useMemo, type ReactNode } fro
 import { deriveHealth } from "../lib/status";
 import type { SystemHealth } from "../types";
 import { useFanFailsafe } from "./useFanFailsafe";
+import { useHealthAlerts } from "./useHealthAlerts";
 import { useNow } from "./useNow";
 import { useSettings } from "./useSettings";
 import { useSystemInfo } from "./useSystemInfo";
@@ -13,6 +14,7 @@ function useDerivedHealth(): SystemHealth {
   const { latest, history, agent } = useTelemetry();
   const { volumes, disks } = useSystemInfo();
   const { state: failsafe } = useFanFailsafe();
+  const { snapshot: alerts } = useHealthAlerts();
   const { settings } = useSettings();
   const now = useNow(1000);
   return useMemo(
@@ -26,14 +28,16 @@ function useDerivedHealth(): SystemHealth {
         failsafe,
         pollIntervalMs: settings.pollIntervalMs,
         now,
+        alerts,
       }),
-    [agent, latest, history, volumes, disks, failsafe, settings.pollIntervalMs, now],
+    [agent, latest, history, volumes, disks, failsafe, settings.pollIntervalMs, now, alerts],
   );
 }
 
 /**
  * Computes SystemHealth once per second for the whole app, so the header pill, the Dashboard
- * Health alerts card and its banners always agree (single source, CONTRACT §5).
+ * Health alerts card and its banners always agree (single source, CONTRACT §5). [CHANGED 1.1]
+ * Drive, temperature and space conditions come from Rust's alert engine (useHealthAlerts).
  */
 export function HealthProvider({ children }: { children: ReactNode }) {
   const health = useDerivedHealth();

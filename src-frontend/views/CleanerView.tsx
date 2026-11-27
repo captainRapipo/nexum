@@ -50,6 +50,7 @@ const RULES = [
   "Windows Update downloads are skipped while an update is waiting to install or restart.",
   "Delivery Optimization is cleared only through Windows' own cmdlet.",
   "Browser and Discord caches are skipped while that app is open.",
+  "Recycle Bin: with an age set, only items deleted longer ago than that are removed, and only from your own bin.",
   "Every cleanup writes a log of each file it deleted or skipped.",
 ];
 
@@ -69,6 +70,12 @@ export default function CleanerView() {
   const scanner = useTrashScan();
   const { rescan } = scanner;
   const includeBrowser = settings.includeBrowserCaches;
+  // Recycle Bin age filter (CONTRACT §3.2): passed explicitly to every scan, and the purge reuses the value
+  // the shown estimate was measured with (scanner.scannedRecycleAge).
+  const recycleAge = settings.recycleMinAgeDays;
+  const recycleAgeRef = useRef(recycleAge);
+  recycleAgeRef.current = recycleAge;
+  const [savingAge, setSavingAge] = useState(false);
   const forced = useMemo(() => ({ browser: includeBrowser }), [includeBrowser]);
   const selection = useCategorySelection(scanner.scan, forced);
 
@@ -83,16 +90,17 @@ export default function CleanerView() {
     if (engine.running) setSummaryRun(engine.runId);
   }, [engine.running, engine.runId]);
 
-  // Measure on mount and whenever the browser-cache setting flips.
+  // Measure on mount and whenever the browser-cache setting or the Recycle Bin age filter changes
+  // (here, in Settings, or when the saved settings finish loading).
   useEffect(() => {
-    void rescan(includeBrowser);
-  }, [includeBrowser, rescan]);
+    if (!getPurgeState().running) void rescan(includeBrowser, recycleAge);
+  }, [includeBrowser, recycleAge, rescan]);
 
   // F5 while on the Cleaner re-measures (CONTRACT §4.6), unless a cleanup is running.
   useEffect(
     () =>
       onRescanRequest("cleaner", () => {
-        if (!getPurgeState().running) void rescan(includeBrowser);
+        if (!getPurgeState().running) void rescan(includeBrowser, recycleAgeRef.current);
       }),
     [includeBrowser, rescan],
   );
@@ -102,7 +110,7 @@ export default function CleanerView() {
   useEffect(() => {
     if (engine.lastRunId !== null && engine.lastRunId !== lastSeenRun.current && !engine.running) {
       lastSeenRun.current = engine.lastRunId;
-      void rescan(includeBrowser);
+      void rescan(includeBrowser, recycleAgeRef.current);
     }
   }, [engine.lastRunId, engine.running, includeBrowser, rescan]);
 
@@ -126,6 +134,18 @@ export default function CleanerView() {
     [selection, update],
   );
 
+  // The optimistic settings update re-measures through the effect above with the new value.
+  const onRecycleAge = useCallback(
+    (days: number | null) => {
+      if (days === recycleAgeRef.current) return;
+      setSavingAge(true);
+      update({ recycleMinAgeDays: days })
+        .catch((e: unknown) => toast(`Could not save setting: ${errMsg(e)}`, "crit"))
+        .finally(() => setSavingAge(false));
+    },
+    [update],
+  );
+
   const openReliability = useCallback(() => {
     api.openReliabilityMonitor().catch((e: unknown) => toast(`Could not open Reliability Monitor: ${errMsg(e)}`, "crit"));
   }, []);
@@ -140,11 +160,11 @@ export default function CleanerView() {
     if (getPurgeState().running) return;
     const runId = getPurgeState().runId + 1;
     setSummaryRun(runId);
-    startPurge(selectedCats, "Cleaner").catch((e: unknown) => {
+    startPurge(selectedCats, "Cleaner", scanner.scannedRecycleAge).catch((e: unknown) => {
       // A run that started reports its own failure; only errors raised before the run began need surfacing.
       if (getPurgeState().lastRunId !== runId && !getPurgeState().running) toast(`Cleanup failed: ${errMsg(e)}`, "crit");
     });
-  }, [selectedCats]);
+  }, [selectedCats, scanner.scannedRecycleAge]);
 
   const onCleanClick = () => {
     if (nothingSelected || engine.running) return;
@@ -176,7 +196,7 @@ export default function CleanerView() {
           variant="ghost"
           size="sm"
           icon={<RefreshCw size={14} className={scanner.phase === "scanning" ? "animate-spin" : undefined} />}
-          onClick={() => void rescan(includeBrowser)}
+          onClick={() => void rescan(includeBrowser, recycleAgeRef.current)}
           disabled={scanner.phase === "scanning" || engine.running}
           title="Measure again (F5)"
         >
@@ -254,7 +274,7 @@ export default function CleanerView() {
               {scanner.phase === "error" && (
                 <div className="flex items-center justify-between gap-3 rounded-lg border border-crit/40 bg-crit/[0.07] px-3 py-2.5 text-[12.5px] text-rose-300">
                   <span>Measuring failed: {scanner.error}</span>
-                  <Button variant="danger" size="sm" onClick={() => void rescan(includeBrowser)}>
+                  <Button variant="danger" size="sm" onClick={() => void rescan(includeBrowser, recycleAgeRef.current)}>
                     Retry
                   </Button>
                 </div>
@@ -272,6 +292,15 @@ export default function CleanerView() {
                     disabled={scanner.phase === "scanning"}
                     onOpenReliabilityMonitor={openReliability}
                     extraNotes={{ browser: "Same switch as Settings › Include browser caches" }}
+                    recycleAge={{
+                      value: recycleAge,
+                      onChange: onRecycleAge,
+                      disabled: savingAge || scanner.phase === "scanning" || engine.running,
+                    }}
+                    details={{
+                      recycleMinAgeDays: scanner.scannedRecycleAge === undefined ? recycleAge : scanner.scannedRecycleAge,
+                      scanStamp: scanner.scanStamp,
+                    }}
                   />
                 </div>
               )}

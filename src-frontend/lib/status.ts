@@ -1,8 +1,12 @@
 // One function per domain produces label AND tone together (ROADMAP §6.1, CONTRACT §4.5 lib/status.ts),
-// plus the frontend health derivation (MF-6, CONTRACT §5). v1.1 moves deriveHealth to Rust.
+// plus the frontend health derivation (MF-6, CONTRACT §5). [CHANGED 1.1] Drive, temperature and
+// free-space conditions are evaluated by Rust (alerts.rs) and arrive as a HealthAlertsSnapshot; this
+// file keeps only the frontend-owned rules (fan fail-safe, agent offline, fan override, limited mode,
+// drive health unknown) and merges the two (CONTRACT §5.0).
 
 import { AlertTriangle, CheckCircle2, Lock, OctagonAlert, type LucideIcon } from "lucide-react";
 import {
+  DEFAULT_ALERT_SETTINGS,
   HEALTH_THRESHOLDS as T,
   type AgentStatus,
   type DiskTelemetry,
@@ -10,10 +14,12 @@ import {
   type FanFailsafeState,
   type FeatureNeed,
   type HealthAction,
+  type HealthAlertsSnapshot,
   type HealthCondition,
   type HealthSeverity,
   type HealthSource,
   type PhysicalDisk,
+  type Settings,
   type SystemHealth,
   type SystemHealthLevel,
   type TelemetryPacket,
@@ -22,9 +28,10 @@ import {
 } from "../types";
 import type { StatusTone } from "../components/ui/tones";
 import { api, PAWNIO_URL } from "./api";
+import { alertToCondition } from "./alerts";
 import { driveDisplayName, joinDisks } from "./disks";
 import { requestNavigate } from "./nav";
-import { fmtBytes, fmtCount } from "./format";
+import { fmtCount } from "./format";
 
 /* ------------------------------------------------------------------ */
 /* Per-domain label + tone                                             */
@@ -63,9 +70,20 @@ export function alertState(sev: HealthSeverity): StatusTone {
   return sev === "crit" ? "crit" : sev === "warn" ? "warn" : "info";
 }
 
-/** Pill tone for an overall health level (CONTRACT §5.3). */
+/** Pill tone for an overall health level (CONTRACT §5.3). [CHANGED 1.1] "checking" → unknown. */
 export function healthLevelTone(level: SystemHealthLevel): StatusTone {
-  return level === "critical" ? "crit" : level === "attention" ? "warn" : level === "partial" ? "unknown" : "ok";
+  switch (level) {
+    case "critical":
+      return "crit";
+    case "attention":
+      return "warn";
+    case "partial":
+    case "checking":
+      return "unknown";
+    case "optimal":
+    default:
+      return "ok";
+  }
 }
 
 /** Why a value is null, for <Unavailable reason=…/> (CONTRACT §4.5). */
@@ -101,57 +119,55 @@ export const FEATURE_NEEDS = {
 export type FeatureKey = keyof typeof FEATURE_NEEDS;
 
 /* ------------------------------------------------------------------ */
+/* Free-space thresholds (CONTRACT §5.0) [NEW 1.1]                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Low-space colours for StorageGauge / VolumeList, from the same setting Rust's `space` rule uses:
+ * warn below `freeSpacePct`, critical below `max(1, floor(freeSpacePct / 2))`.
+ */
+export function spaceThresholds(s: Pick<Settings, "alerts"> | null | undefined): { warnPct: number; critPct: number } {
+  const raw = s?.alerts?.freeSpacePct;
+  const warnPct =
+    typeof raw === "number" && Number.isFinite(raw) ? Math.round(Math.min(50, Math.max(1, raw))) : DEFAULT_ALERT_SETTINGS.freeSpacePct;
+  return { warnPct, critPct: Math.max(1, Math.floor(warnPct / 2)) };
+}
+
+/* ------------------------------------------------------------------ */
 /* deriveHealth (CONTRACT §5)                                          */
 /* ------------------------------------------------------------------ */
 
 export interface DeriveHealthInput {
   agent: AgentStatus | null;
   latest: TelemetryPacket | null;
+  /** Kept for API stability; the frontend rules no longer need history (rules 5–8 moved to Rust). */
   history: readonly TelemetryPacket[];
   volumes: readonly Volume[];
   physical: readonly PhysicalDisk[];
   failsafe: FanFailsafeState;
   pollIntervalMs: number;
   now: number;
+  /** [NEW 1.1] Rust alert engine snapshot (drive, cpu-temp, gpu-temp, gpu-mem-temp, drive-temp, space). */
+  alerts: HealthAlertsSnapshot;
 }
 
-/** Rule texts, in evaluation order (shown on the pill hover and in the empty Health alerts card). */
+/** Frontend-owned rule texts (shown on the pill hover and in the empty Health alerts card). */
 export const HEALTH_RULES = {
   failsafe: "Critical while Nexum's fan control was interrupted and fans may not be under BIOS control",
   offline: "Attention when the hardware agent sends no data for 5 seconds (or 3 poll intervals)",
   fanOverride: "Attention while fans are held at 100% because the CPU or GPU reached its limit or a temperature sensor stopped reporting",
-  driveCrit: "Critical when a drive reports a critical warning, spare below threshold, read-only, or ≤ 10% life left",
-  driveWarn: "Attention when a drive has ≤ 50% life left, reallocated, pending or uncorrectable sectors, a temperature warning, or a Windows health warning",
-  cpuTemp: `Attention when the CPU stays at or above ${T.cpuWarnC} °C for 10 s; critical at ${T.cpuCritC} °C`,
-  gpuTemp: `Attention when a GPU hot spot stays at or above ${T.gpuHotspotWarnC} °C (edge ${T.gpuEdgeWarnC} °C) for 10 s; critical at ${T.gpuHotspotCritC} °C (edge ${T.gpuEdgeCritC} °C)`,
-  driveTemp: `Attention when a drive stays at or above its warning temperature (${T.driveWarnFallbackC} °C if not reported) for 10 s; critical at its critical temperature (${T.driveCritFallbackC} °C)`,
-  space: `Attention when a fixed drive has less than ${T.freeSpaceWarnPct}% free space; critical below ${T.freeSpaceCritPct}%`,
   limited: "Partial sensors while Nexum runs without administrator rights or without the PawnIO driver",
   driveUnknown: "Partial sensors while a drive does not report wear data",
 } as const;
 
+/** Frontend rule texts in rule order (1, 2, 3, 9, 10). Rust's seven texts follow them (alerts.rules). */
 export const HEALTH_RULE_LIST: readonly string[] = [
   HEALTH_RULES.failsafe,
   HEALTH_RULES.offline,
   HEALTH_RULES.fanOverride,
-  HEALTH_RULES.driveCrit,
-  HEALTH_RULES.driveWarn,
-  HEALTH_RULES.cpuTemp,
-  HEALTH_RULES.gpuTemp,
-  HEALTH_RULES.driveTemp,
-  HEALTH_RULES.space,
   HEALTH_RULES.limited,
   HEALTH_RULES.driveUnknown,
 ];
-
-const DRIVE_SHORT: Record<string, string> = {
-  Failing: "1 drive failing",
-  "Replace soon": "1 drive: replace soon",
-  Worn: "1 drive worn",
-  "Check sectors": "1 drive: check sectors",
-  Overheating: "1 drive overheating",
-  "Windows warning": "1 drive: Windows warning",
-};
 
 const DRIVE_ADVICE: Record<string, string> = {
   Worn: "Copy important files and plan a replacement.",
@@ -163,13 +179,15 @@ const DRIVE_ADVICE: Record<string, string> = {
 };
 
 const isNum = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
-const round = (v: number) => Math.round(v);
 
-/** `<life>% life left (<percentageUsed>% of rated endurance used, <h> h). <advice>` (CONTRACT §5.2). */
+/**
+ * `<life>% life left (<percentageUsed>% of rated endurance used, <h> h). <advice>` (CONTRACT §5.2).
+ * Rust produces the alert detail now; kept for the mock and for views that describe a drive.
+ */
 export function driveDetailSentence(t: DiskTelemetry): string {
-  const head = isNum(t.healthPct) ? `${round(t.healthPct)}% life left` : "";
+  const head = isNum(t.healthPct) ? `${Math.round(t.healthPct)}% life left` : "";
   const paren: string[] = [];
-  if (isNum(t.percentageUsed)) paren.push(`${round(t.percentageUsed)}% of rated endurance used`);
+  if (isNum(t.percentageUsed)) paren.push(`${Math.round(t.percentageUsed)}% of rated endurance used`);
   if (isNum(t.powerOnHours)) paren.push(`${fmtCount(t.powerOnHours)} h`);
   let first = "";
   if (head && paren.length) first = `${head} (${paren.join(", ")}). `;
@@ -182,30 +200,23 @@ export function driveDetailSentence(t: DiskTelemetry): string {
   return `${first}${advice}`.trim();
 }
 
-/**
- * Sustained rule: samples with ts ≥ now − 10 s number ≥ 3, all non-null, and their minimum ≥ threshold.
- * Returns that minimum (or null when not sustained).
- */
-function sustainedMin(samples: ReadonlyArray<number | null>, threshold: number): number | null {
-  if (samples.length < T.sustainMinSamples) return null;
-  let min = Infinity;
-  for (const v of samples) {
-    if (!isNum(v)) return null;
-    if (v < min) min = v;
-  }
-  return min >= threshold ? min : null;
-}
-
-function windowPackets(history: readonly TelemetryPacket[], now: number): TelemetryPacket[] {
-  const from = now - T.sustainWindowMs;
-  return history.filter((p) => p.ts >= from);
-}
-
 interface Draft extends HealthCondition {
+  /** v1.0 rule number (CONTRACT §5.0); gpu-mem-temp sorts right after gpu-temp. */
   order: number;
 }
 
 const SEV_RANK: Record<HealthSeverity, number> = { crit: 0, warn: 1, info: 2 };
+
+/** v1.0 rule number of a Rust alert id (display order within a severity). */
+function rustRuleOrder(id: string): number {
+  if (id.startsWith("drive-temp:")) return 7;
+  if (id.startsWith("drive:")) return 4;
+  if (id === "cpu-temp") return 5;
+  if (id.startsWith("gpu-mem-temp:")) return 6.5;
+  if (id.startsWith("gpu-temp:")) return 6;
+  if (id.startsWith("space:")) return 8;
+  return 8.5;
+}
 
 function cond(
   order: number,
@@ -221,7 +232,7 @@ const viewNav = (label: string, view: "cooling" | "sensors" | "storage", focus?:
 });
 
 export function deriveHealth(input: DeriveHealthInput): SystemHealth {
-  const { agent, latest, history, volumes, physical, failsafe, pollIntervalMs, now } = input;
+  const { agent, latest, physical, failsafe, pollIntervalMs, now, alerts } = input;
   const staleMs = Math.max(T.staleMinMs, 3 * (pollIntervalMs > 0 ? pollIntervalMs : 1000));
   // Freshness uses the newest of the status timestamp and the last packet seen by the UI
   // (agent-status is not re-emitted for every packet).
@@ -231,8 +242,6 @@ export function deriveHealth(input: DeriveHealthInput): SystemHealth {
   const out: Draft[] = [];
   const tele: DiskTelemetry[] = latest?.disks ?? [];
   const joined = joinDisks(physical, tele);
-  const nameOf = (t: DiskTelemetry) => driveDisplayName(joined.find((j) => j.tele?.id === t.id)?.disk ?? null, t);
-  const win = windowPackets(history, now);
 
   // 1. Fan fail-safe
   if (failsafe?.active) {
@@ -296,133 +305,11 @@ export function deriveHealth(input: DeriveHealthInput): SystemHealth {
     );
   }
 
-  // 4. Drive health
-  if (!offline) {
-    for (const t of tele) {
-      const st = t.health?.state;
-      if (st !== "failing" && st !== "replace" && st !== "attention") continue;
-      const crit = st === "failing" || st === "replace";
-      const label = t.health.label;
-      out.push(
-        cond(4, {
-          id: `drive:${t.id}`,
-          severity: crit ? "crit" : "warn",
-          source: "drive",
-          group: `drive:${label}`,
-          short: DRIVE_SHORT[label] ?? `1 drive: ${label.toLowerCase()}`,
-          title: `${nameOf(t)} — ${label}`,
-          detail: driveDetailSentence(t),
-          rule: crit ? HEALTH_RULES.driveCrit : HEALTH_RULES.driveWarn,
-          action: viewNav("View drive", "storage", t.id),
-          stateKey: st,
-        }),
-      );
-    }
-  }
-
-  // 5. CPU temperature (sustained)
-  {
-    const samples = win.map((p) => p.cpu?.packageTempC ?? null);
-    const crit = sustainedMin(samples, T.cpuCritC);
-    const warn = crit == null ? sustainedMin(samples, T.cpuWarnC) : null;
-    if (crit != null || warn != null) {
-      const threshold = crit != null ? T.cpuCritC : T.cpuWarnC;
-      const cur = latest?.cpu?.packageTempC ?? crit ?? warn ?? threshold;
-      out.push(
-        cond(5, {
-          id: "cpu-temp",
-          severity: crit != null ? "crit" : "warn",
-          source: "cpu",
-          group: "cpu-temp",
-          short: "CPU hot",
-          title: `CPU at ${round(cur)} °C`,
-          detail: `Above ${threshold} °C for 10 s.`,
-          rule: HEALTH_RULES.cpuTemp,
-          action: viewNav("View sensors", "sensors"),
-          stateKey: crit != null ? "crit" : "warn",
-        }),
-      );
-    }
-  }
-
-  // 6. GPU temperatures (hot spot, else edge)
-  (latest?.gpus ?? []).forEach((g, i) => {
-    const useHotspot = isNum(g.hotspotTempC);
-    const samples = win.map((p) => {
-      const pg = p.gpus?.[i];
-      if (!pg) return null;
-      return useHotspot ? pg.hotspotTempC : pg.tempC;
-    });
-    if (!useHotspot && !isNum(g.tempC)) return;
-    const critAt = useHotspot ? T.gpuHotspotCritC : T.gpuEdgeCritC;
-    const warnAt = useHotspot ? T.gpuHotspotWarnC : T.gpuEdgeWarnC;
-    const crit = sustainedMin(samples, critAt);
-    const warn = crit == null ? sustainedMin(samples, warnAt) : null;
-    if (crit == null && warn == null) return;
-    const threshold = crit != null ? critAt : warnAt;
-    const cur = (useHotspot ? g.hotspotTempC : g.tempC) ?? threshold;
-    out.push(
-      cond(6, {
-        id: `gpu-temp:${i}`,
-        severity: crit != null ? "crit" : "warn",
-        source: "gpu",
-        group: "gpu-temp",
-        short: "GPU hot",
-        title: `${g.name} at ${round(cur)} °C`,
-        detail: `Above ${threshold} °C for 10 s.`,
-        rule: HEALTH_RULES.gpuTemp,
-        action: viewNav("View sensors", "sensors"),
-        stateKey: crit != null ? "crit" : "warn",
-      }),
-    );
-  });
-
-  // 7. Drive temperatures
-  for (const t of tele) {
-    if (!isNum(t.tempC)) continue;
-    const samples = win.map((p) => p.disks?.find((d) => d.id === t.id)?.tempC ?? null);
-    const critAt = t.criticalTempC ?? T.driveCritFallbackC;
-    const warnAt = t.warningTempC ?? T.driveWarnFallbackC;
-    const crit = sustainedMin(samples, critAt);
-    const warn = crit == null ? sustainedMin(samples, warnAt) : null;
-    if (crit == null && warn == null) continue;
-    const threshold = crit != null ? critAt : warnAt;
-    out.push(
-      cond(7, {
-        id: `drive-temp:${t.id}`,
-        severity: crit != null ? "crit" : "warn",
-        source: "drive",
-        group: "drive-temp",
-        short: "Drive hot",
-        title: `${nameOf(t)} at ${round(t.tempC)} °C`,
-        detail: `Above ${threshold} °C for 10 s.`,
-        rule: HEALTH_RULES.driveTemp,
-        action: viewNav("View drive", "storage", t.id),
-        stateKey: crit != null ? "crit" : "warn",
-      }),
-    );
-  }
-
-  // 8. Free space
-  for (const v of volumes) {
-    if (v.driveType !== "Fixed" || !(v.totalBytes > 0)) continue;
-    const pct = (v.freeBytes / v.totalBytes) * 100;
-    if (!(pct < T.freeSpaceWarnPct)) continue;
-    const crit = pct < T.freeSpaceCritPct;
-    out.push(
-      cond(8, {
-        id: `space:${v.letter}`,
-        severity: crit ? "crit" : "warn",
-        source: "space",
-        group: "space",
-        short: "Low disk space",
-        title: `${v.letter} has ${fmtBytes(v.freeBytes)} free (${pct.toFixed(1)}%)`,
-        detail: `Below ${crit ? T.freeSpaceCritPct : T.freeSpaceWarnPct}% free.`,
-        rule: HEALTH_RULES.space,
-        action: viewNav("View storage", "storage"),
-        stateKey: crit ? "crit" : "warn",
-      }),
-    );
+  // 4–8. Rust-evaluated alerts (CONTRACT §5.0). While offline only `space:*` stays (Rust clears the
+  // rest too; this covers the gap before its snapshot arrives).
+  for (const a of alerts?.alerts ?? []) {
+    if (offline && a.source !== "space") continue;
+    out.push({ ...alertToCondition(a), order: rustRuleOrder(a.id) });
   }
 
   // 9. Limited mode. ROADMAP MF-6: Optimal needs an *elevated* agent, so a non-elevated agent counts as
@@ -492,7 +379,7 @@ export function deriveHealth(input: DeriveHealthInput): SystemHealth {
     }
   }
 
-  // Sort: severity, then rule order (stable within a rule).
+  // Sort: severity, then v1.0 rule number, then insertion order (= the order Rust sent).
   const conditions = out
     .map((c, i) => ({ c, i }))
     .sort((a, b) => SEV_RANK[a.c.severity] - SEV_RANK[b.c.severity] || a.c.order - b.c.order || a.i - b.i)
@@ -500,6 +387,13 @@ export function deriveHealth(input: DeriveHealthInput): SystemHealth {
       const { order: _order, ...rest } = c;
       return rest as HealthCondition;
     });
+
+  const rules = [...HEALTH_RULE_LIST, ...(alerts?.rules ?? [])];
+
+  // Checking (CONTRACT §5.0): never "Optimal" before Rust has evaluated once.
+  if (conditions.length === 0 && !offline && !alerts?.ready) {
+    return { level: "checking", label: "Checking", summary: null, conditions, rules };
+  }
 
   const level: SystemHealthLevel = conditions.some((c) => c.severity === "crit")
     ? "critical"
@@ -511,11 +405,11 @@ export function deriveHealth(input: DeriveHealthInput): SystemHealth {
   const label =
     level === "critical" ? "Critical" : level === "attention" ? "Attention" : level === "partial" ? "Partial sensors" : "Optimal";
 
-  return { level, label, summary: summarize(level, label, conditions), conditions, rules: [...HEALTH_RULE_LIST] };
+  return { level, label, summary: summarize(level, label, conditions), conditions, rules };
 }
 
 function summarize(level: SystemHealthLevel, label: string, conditions: HealthCondition[]): string | null {
-  if (level === "optimal" || conditions.length === 0) return null;
+  if (level === "optimal" || level === "checking" || conditions.length === 0) return null;
   const topSev = conditions[0].severity;
   const top = conditions.filter((c) => c.severity === topSev);
   const groups = new Map<string, HealthCondition[]>();

@@ -1,5 +1,4 @@
 import type { ReactNode } from "react";
-import { Lock } from "lucide-react";
 import { cn } from "../../lib/format";
 import GlassCard from "../layout/GlassCard";
 import { DottedLeaderRow } from "../ui/DottedLeaderRow";
@@ -7,14 +6,13 @@ import { Unavailable } from "../ui/Unavailable";
 import type { IconLike } from "../ui/icon";
 import type { SpecRow, SpecValue } from "./specModel";
 
-/** Renders one spec value: text, <Unavailable> or the v1.0 "not in this version" lock. */
+/** Renders one spec value: text, <Unavailable>, or a muted em dash with a short reason. */
 export function SpecValueView({ value }: { value: SpecValue }) {
   if (value.kind === "unavailable") return <Unavailable reason={value.reason} />;
-  if (value.kind === "locked") {
+  if (value.kind === "muted") {
     return (
       <span className="inline-flex items-center gap-1.5 whitespace-nowrap font-sans text-slate-500" title={value.hint}>
         <span aria-hidden="true">—</span>
-        <Lock size={11} strokeWidth={2} aria-hidden="true" />
         <span className="text-[11px] tracking-normal">{value.text}</span>
       </span>
     );

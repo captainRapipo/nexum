@@ -1,8 +1,47 @@
-import { Archive, Bug, Cpu, ExternalLink, FileWarning, Folder, Globe, Info, Lock, RefreshCcw, Trash2 } from "lucide-react";
-import type { TrashCategory, TrashCategoryId } from "../../types";
-import { Toggle } from "../ui";
+import { useState } from "react";
+import {
+  Archive,
+  Bug,
+  ChevronRight,
+  Cpu,
+  ExternalLink,
+  FileWarning,
+  Folder,
+  Globe,
+  Info,
+  Lock,
+  RefreshCcw,
+  Trash2,
+} from "lucide-react";
+import { RECYCLE_AGE_OPTIONS, type TrashCategory, type TrashCategoryId } from "../../types";
+import { Segmented, Toggle } from "../ui";
 import { cn } from "../../lib/format";
 import { fmtIn, listUnit, type ByteUnit } from "./cleanerCopy";
+import CategoryDetails from "./CategoryDetails";
+
+/** Segmented has no null value; 0 stands for "All" (null) in the control only. */
+const RECYCLE_AGE_SEGMENTS = RECYCLE_AGE_OPTIONS.map((d) => ({
+  value: d ?? 0,
+  label: d == null ? "All" : d === 1 ? "1 day" : `${d} days`,
+  title:
+    d == null
+      ? "Everything in the Recycle Bin"
+      : `Only items that have been in the Recycle Bin for more than ${d === 1 ? "1 day" : `${d} days`}`,
+}));
+
+export interface RecycleAgeControl {
+  /** Settings.recycleMinAgeDays (null = every item). */
+  value: number | null;
+  onChange: (days: number | null) => void;
+  disabled?: boolean;
+}
+
+export interface CategoryDetailsControl {
+  /** The age filter the list was measured with (passed to scan_trash_details). */
+  recycleMinAgeDays: number | null;
+  /** Changes on every re-measure so open lists refresh with it. */
+  scanStamp: number;
+}
 
 const ICONS: Record<TrashCategoryId, typeof Folder> = {
   temp: Folder,
@@ -28,6 +67,10 @@ export interface CategoryListProps {
   extraNotes?: Partial<Record<TrashCategoryId, string>>;
   /** Shown next to the crash-dump categories: opens Windows Reliability Monitor. */
   onOpenReliabilityMonitor?: () => void;
+  /** [1.1] Recycle Bin age filter control, rendered in the Recycle Bin row (Cleaner page only). */
+  recycleAge?: RecycleAgeControl;
+  /** [1.1] Enables the per-category "Show files" drill-down (Cleaner page only). */
+  details?: CategoryDetailsControl;
 }
 
 function Badge({ children, title }: { children: string; title?: string }) {
@@ -51,8 +94,18 @@ export default function CategoryList({
   unit: unitProp,
   extraNotes,
   onOpenReliabilityMonitor,
+  recycleAge,
+  details,
 }: CategoryListProps) {
   const unit = unitProp ?? listUnit(categories);
+  const [openIds, setOpenIds] = useState<ReadonlySet<TrashCategoryId>>(() => new Set());
+  const toggleOpen = (id: TrashCategoryId) =>
+    setOpenIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   const maxBytes = Math.max(1, ...categories.map((c) => (c.available === false ? 0 : c.bytes || 0)));
 
   return (
@@ -64,6 +117,9 @@ export default function CategoryList({
         const share = available ? ((c.bytes || 0) / maxBytes) * 100 : 0;
         const isDump = c.id === "dumps" || c.id === "memory-dump";
         const extra = extraNotes?.[c.id];
+        const canDrill = !!details && available && ((c.files || 0) > 0 || (c.bytes || 0) > 0);
+        const open = canDrill && openIds.has(c.id);
+        const detailsId = `nx-clean-details-${c.id}`;
 
         return (
           <li
@@ -75,7 +131,8 @@ export default function CategoryList({
               !available && "opacity-75",
             )}
           >
-            {available && (
+            {/* Share-of-total bar; hidden while the file list is open so it does not run behind it. */}
+            {available && !open && (
               <span
                 aria-hidden
                 className={cn("absolute inset-y-0 left-0 transition-[width] duration-500", on ? "bg-teal/[0.06]" : "bg-white/[0.02]")}
@@ -128,6 +185,37 @@ export default function CategoryList({
                     Open Reliability Monitor
                   </button>
                 )}
+                {c.id === "recycle" && recycleAge && !compact && (
+                  <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                    <span className="text-[11px] text-slate-400" id="nx-recycle-age-label">
+                      Items older than
+                    </span>
+                    <Segmented
+                      value={recycleAge.value ?? 0}
+                      options={RECYCLE_AGE_SEGMENTS}
+                      onChange={(v) => recycleAge.onChange(v === 0 ? null : v)}
+                      size="sm"
+                      ariaLabel="Recycle Bin: only items older than"
+                      disabled={recycleAge.disabled || !available}
+                    />
+                  </div>
+                )}
+                {canDrill && (
+                  <button
+                    type="button"
+                    onClick={() => toggleOpen(c.id)}
+                    aria-expanded={open}
+                    aria-controls={detailsId}
+                    className="mt-1 inline-flex items-center gap-1 text-[11px] text-silver transition hover:text-ink"
+                  >
+                    <ChevronRight
+                      size={12}
+                      aria-hidden="true"
+                      className={cn("transition-transform duration-150", open && "rotate-90")}
+                    />
+                    {open ? "Hide files" : "Show files"}
+                  </button>
+                )}
               </div>
 
               <div className="shrink-0 text-right">
@@ -151,6 +239,15 @@ export default function CategoryList({
                 />
               </div>
             </div>
+            {open && details && (
+              <div id={detailsId} className="relative mt-2 border-t border-line pt-1.5 pl-12">
+                <CategoryDetails
+                  categoryId={c.id}
+                  recycleMinAgeDays={details.recycleMinAgeDays}
+                  scanStamp={details.scanStamp}
+                />
+              </div>
+            )}
           </li>
         );
       })}

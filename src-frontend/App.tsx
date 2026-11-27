@@ -22,6 +22,8 @@ import { TelemetryProvider } from "./hooks/useTelemetryStream";
 import { SensorsProvider, useSensorsActions } from "./hooks/useSensors";
 import { SystemSpecProvider, useSystemSpecRefresh } from "./hooks/useSystemSpec";
 import { HealthProvider } from "./hooks/useHealth";
+import { FramesProvider } from "./hooks/useFrames";
+import { TraySensorSync } from "./hooks/useTraySensorSync";
 import { TopBar } from "./components/layout/TopBar";
 import { HeaderStrip } from "./components/layout/HeaderStrip";
 import { StatusFooter } from "./components/layout/StatusFooter";
@@ -54,6 +56,7 @@ const viewLoaders: Record<ViewId, () => Promise<unknown>> = {
   storage: () => import("./views/StorageView"),
   cooling: () => import("./views/CoolingView"),
   drivers: () => import("./views/DriversView"),
+  gaming: () => import("./views/GamingView"),
   cleaner: () => import("./views/CleanerView"),
 };
 
@@ -64,6 +67,7 @@ const VIEWS: Record<ViewId, ComponentType<object>> = {
   storage: lazyModule(viewLoaders.storage, "StorageView"),
   cooling: lazyModule(viewLoaders.cooling, "CoolingView"),
   drivers: lazyModule(viewLoaders.drivers, "DriversView"),
+  gaming: lazyModule(viewLoaders.gaming, "GamingView"),
   cleaner: lazyModule(viewLoaders.cleaner, "CleanerView"),
 };
 
@@ -272,8 +276,8 @@ function Shell() {
         return;
       }
 
-      // Ctrl+1..7 → VIEW_ORDER[n-1]
-      if (e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && /^[1-7]$/.test(key)) {
+      // Ctrl+1..8 → VIEW_ORDER[n-1] (Ctrl+7 Gaming, Ctrl+8 Cleaner)
+      if (e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && /^[1-8]$/.test(key)) {
         e.preventDefault();
         if (isModalOpen()) return;
         navigate(VIEW_ORDER[Number(key) - 1]);
@@ -385,6 +389,7 @@ function Shell() {
       <SettingsModal open={settingsOpen} onClose={closeSettings} />
       <PawnIoConsent />
       <ToastHost />
+      <TraySensorSync />
     </div>
   );
 }
@@ -398,7 +403,9 @@ export default function App() {
             <SensorsProvider>
               <SystemSpecProvider>
                 <HealthProvider>
-                  <Shell />
+                  <FramesProvider>
+                    <Shell />
+                  </FramesProvider>
                 </HealthProvider>
               </SystemSpecProvider>
             </SensorsProvider>

@@ -1,6 +1,6 @@
 import { createContext, createElement, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, errorMessage, subscribe } from "../lib/api";
-import type { AgentAck, AgentStatus, DiskTelemetry, DriveHealth, FanSafety, FanTelemetry, TelemetryPacket } from "../types";
+import type { AgentAck, AgentStatus, DiskTelemetry, DriveHealth, FanSafety, FanTelemetry, GpuTelemetry, TelemetryPacket } from "../types";
 
 /** Number of packets kept in the ring buffer (≈2 minutes at 1 Hz). */
 export const TELEMETRY_HISTORY = 120;
@@ -84,6 +84,11 @@ function normalizeDisk(raw: DiskTelemetry): DiskTelemetry {
   };
 }
 
+/** [NEW 1.1] A 1.0 agent omits memJunctionTempC: null, never 0. */
+function normalizeGpu(raw: GpuTelemetry): GpuTelemetry {
+  return { ...raw, memJunctionTempC: typeof raw.memJunctionTempC === "number" ? raw.memJunctionTempC : null };
+}
+
 /**
  * Defensive normalisation: the Rust core forwards sidecar JSON verbatim, so make
  * sure the array fields views iterate over always exist.
@@ -96,8 +101,8 @@ function normalizePacket(raw: unknown): TelemetryPacket | null {
     ...(p as TelemetryPacket),
     type: "telemetry",
     cpu: { ...p.cpu, loadPerCore: Array.isArray(p.cpu.loadPerCore) ? p.cpu.loadPerCore : [] },
-    gpu: p.gpu ?? null,
-    gpus: Array.isArray(p.gpus) ? p.gpus : p.gpu ? [p.gpu] : [],
+    gpu: p.gpu ? normalizeGpu(p.gpu) : null,
+    gpus: Array.isArray(p.gpus) ? p.gpus.map(normalizeGpu) : p.gpu ? [normalizeGpu(p.gpu)] : [],
     fans: Array.isArray(p.fans)
       ? p.fans.map((f) => ({ hwId: "", rpmMin: null, rpmMax: null, ...(f as Partial<FanTelemetry>) }) as FanTelemetry)
       : [],

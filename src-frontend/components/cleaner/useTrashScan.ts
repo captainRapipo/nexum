@@ -7,9 +7,16 @@ export type ScanPhase = "idle" | "scanning" | "ready" | "error";
 export interface TrashScanState {
   phase: ScanPhase;
   scan: TrashScan | null;
+  /**
+   * [1.1] Recycle Bin age filter the current `scan` was measured with (CONTRACT §3.2). A cleanup of this
+   * scan must pass exactly this value to purge_trash. `undefined` = the backend default (Settings).
+   */
+  scannedRecycleAge: number | null | undefined;
+  /** Increments on every successful scan (lets open drill-downs refresh). */
+  scanStamp: number;
   error: string | null;
   /** Start a new dry-run scan. Resolves with the scan (or null if superseded / failed). */
-  rescan: (includeBrowser: boolean) => Promise<TrashScan | null>;
+  rescan: (includeBrowser: boolean, recycleMinAgeDays?: number | null) => Promise<TrashScan | null>;
   reset: () => void;
 }
 
@@ -22,6 +29,8 @@ function errMsg(e: unknown): string {
 export function useTrashScan(): TrashScanState {
   const [phase, setPhase] = useState<ScanPhase>("idle");
   const [scan, setScan] = useState<TrashScan | null>(null);
+  const [scannedRecycleAge, setScannedRecycleAge] = useState<number | null | undefined>(undefined);
+  const [scanStamp, setScanStamp] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const seq = useRef(0);
   const mounted = useRef(true);
@@ -34,14 +43,16 @@ export function useTrashScan(): TrashScanState {
     };
   }, []);
 
-  const rescan = useCallback(async (includeBrowser: boolean) => {
+  const rescan = useCallback(async (includeBrowser: boolean, recycleMinAgeDays?: number | null) => {
     const my = ++seq.current;
     setPhase("scanning");
     setError(null);
     try {
-      const res = await api.scanTrash(includeBrowser);
+      const res = await api.scanTrash(includeBrowser, recycleMinAgeDays);
       if (!mounted.current || my !== seq.current) return null;
       setScan(res);
+      setScannedRecycleAge(recycleMinAgeDays);
+      setScanStamp((n) => n + 1);
       setPhase("ready");
       return res;
     } catch (e) {
@@ -56,10 +67,11 @@ export function useTrashScan(): TrashScanState {
     seq.current++;
     setPhase("idle");
     setScan(null);
+    setScannedRecycleAge(undefined);
     setError(null);
   }, []);
 
-  return { phase, scan, error, rescan, reset };
+  return { phase, scan, scannedRecycleAge, scanStamp, error, rescan, reset };
 }
 
 /** Every category of the scan, in backend order. */

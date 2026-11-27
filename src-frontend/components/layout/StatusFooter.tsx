@@ -42,8 +42,8 @@ export function StatusFooter({ view, onNavigate, onRescan, onQuickClean }: Statu
   const packetAge = latest ? Math.max(0, (now - latest.ts) / 1000) : null;
 
   return (
-    <footer className="relative z-10 flex h-8 shrink-0 select-none items-center gap-3 border-t border-line bg-[#05090b]/85 px-3 text-[11px] backdrop-blur-md min-[1440px]:gap-4 min-[1440px]:px-4">
-      <nav aria-label="Keyboard shortcuts" className="flex min-w-0 items-center gap-1 overflow-hidden min-[1440px]:gap-1.5">
+    <footer className="relative z-10 flex h-8 shrink-0 select-none items-center gap-2 border-t border-line bg-[#05090b]/85 px-3 text-[11px] backdrop-blur-md min-[1440px]:gap-4 min-[1440px]:px-4">
+      <nav aria-label="Keyboard shortcuts" className="flex min-w-0 items-center gap-0.5 overflow-hidden min-[1440px]:gap-1.5">
         {KEYS.map((k, i) => {
           const active = k.view != null && k.view === view;
           const onClick = () => {
@@ -54,7 +54,8 @@ export function StatusFooter({ view, onNavigate, onRescan, onQuickClean }: Statu
           return (
             <Fragment key={k.key}>
               {i > 0 && (
-                <span aria-hidden="true" className="text-slate-700">
+                // Separators only from 1440 px: with nine keys (F8 Gaming, 1.1) they do not fit at 1280.
+                <span aria-hidden="true" className="hidden text-slate-700 min-[1440px]:inline">
                   ·
                 </span>
               )}

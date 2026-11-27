@@ -1,7 +1,8 @@
 import { Disc3, HardDrive, Network, Usb } from "lucide-react";
-import { HEALTH_THRESHOLDS, type DiskTelemetry, type PhysicalDisk, type Volume } from "../../types";
+import type { DiskTelemetry, PhysicalDisk, Volume } from "../../types";
 import { SegmentedBar, STATUS_CLASS } from "../ui";
-import { driveHealthView } from "../../lib/status";
+import { driveHealthView, spaceThresholds } from "../../lib/status";
+import { useSettings } from "../../hooks/useSettings";
 import { cn, fmtBytes } from "../../lib/format";
 import { healthOf, lifeText } from "./driveHealth";
 
@@ -11,16 +12,26 @@ function usedPct(v: Volume): number {
   return Math.max(0, Math.min(100, (used / v.totalBytes) * 100));
 }
 
-/** Free-space state, the same rule the header pill uses (CONTRACT §5.2 rule 8). */
-export function spaceTone(v: Volume): "ok" | "warn" | "crit" {
+export interface SpaceThresholds {
+  warnPct: number;
+  critPct: number;
+}
+
+/**
+ * Free-space state, the same rule Rust's space alert uses (CONTRACT §2.10.3 rule 6, §5.0): thresholds from
+ * Settings.alerts.freeSpacePct via spaceThresholds(settings).
+ */
+export function spaceTone(v: Volume, th: SpaceThresholds): "ok" | "warn" | "crit" {
   if (v.driveType !== "Fixed" || !v.totalBytes) return "ok";
   const free = (v.freeBytes / v.totalBytes) * 100;
-  if (free < HEALTH_THRESHOLDS.freeSpaceCritPct) return "crit";
-  if (free < HEALTH_THRESHOLDS.freeSpaceWarnPct) return "warn";
+  if (free < th.critPct) return "crit";
+  if (free < th.warnPct) return "warn";
   return "ok";
 }
 
-const SPACE_RULE = `Attention below ${HEALTH_THRESHOLDS.freeSpaceWarnPct}% free, critical below ${HEALTH_THRESHOLDS.freeSpaceCritPct}% free (fixed volumes).`;
+export function spaceRuleText(th: SpaceThresholds): string {
+  return `Attention below ${th.warnPct}% free, critical below ${th.critPct}% free (fixed volumes).`;
+}
 
 function DriveIcon({ type }: { type: Volume["driveType"] }) {
   if (type === "Removable") return <Usb size={16} />;
@@ -39,6 +50,9 @@ export interface VolumeListProps {
 
 /** Logical volumes (C:, D:, …), each linked to the physical disk it lives on (MF-1). */
 export default function VolumeList({ volumes, joined, onOpenDrive }: VolumeListProps) {
+  const { settings } = useSettings();
+  const th = spaceThresholds(settings);
+  const spaceRule = spaceRuleText(th);
   const sorted = [...volumes].sort((a, b) => {
     if (a.isSystem !== b.isSystem) return a.isSystem ? -1 : 1;
     return a.letter.localeCompare(b.letter);
@@ -57,7 +71,7 @@ export default function VolumeList({ volumes, joined, onOpenDrive }: VolumeListP
     <div className="flex flex-col divide-y divide-line">
       {sorted.map((v) => {
         const pct = usedPct(v);
-        const tone = spaceTone(v);
+        const tone = spaceTone(v, th);
         const cls = STATUS_CLASS[tone];
         const used = v.usedBytes > 0 ? v.usedBytes : Math.max(0, v.totalBytes - v.freeBytes);
         const host = hostOf(v.letter);
@@ -91,7 +105,7 @@ export default function VolumeList({ volumes, joined, onOpenDrive }: VolumeListP
                 <span className="text-silver">
                   {fmtBytes(used)} <span className="text-muted">used</span>
                 </span>
-                <span className={tone === "ok" ? "text-ink" : cls.text} title={SPACE_RULE}>
+                <span className={tone === "ok" ? "text-ink" : cls.text} title={spaceRule}>
                   {fmtBytes(v.freeBytes)} <span className="text-muted">free</span>
                 </span>
                 <span className="text-muted">/ {fmtBytes(v.totalBytes)}</span>

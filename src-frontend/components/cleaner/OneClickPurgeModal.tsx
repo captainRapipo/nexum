@@ -52,7 +52,7 @@ export default function OneClickPurgeModal({ open, onClose, autoStart = false }:
 
   const runScan = useCallback(async () => {
     const s = settingsRef.current;
-    const res = await rescan(s.includeBrowserCaches);
+    const res = await rescan(s.includeBrowserCaches, s.recycleMinAgeDays);
     if (!res || !autoStartRef.current) return;
     // Quick path: only the default-on ids that can run in this session (CONTRACT §3.1).
     const quick = availableCategories(res).filter((c) => (DEFAULT_ON_CATEGORIES as readonly string[]).includes(c.id));
@@ -60,7 +60,7 @@ export default function OneClickPurgeModal({ open, onClose, autoStart = false }:
     if (getPurgeState().running) return;
     const runId = getPurgeState().runId + 1;
     setMyRun(runId);
-    startPurge(quick, "Quick clean").catch((e: unknown) => onStartError(runId, e, setMyRun));
+    startPurge(quick, "Quick clean", s.recycleMinAgeDays).catch((e: unknown) => onStartError(runId, e, setMyRun));
   }, [rescan]);
 
   // Fresh session every time the modal opens.
@@ -90,13 +90,13 @@ export default function OneClickPurgeModal({ open, onClose, autoStart = false }:
     if (getPurgeState().running) return; // double-click before re-render
     const runId = getPurgeState().runId + 1;
     setMyRun(runId);
-    startPurge(cats, "Clean caches").catch((e: unknown) => onStartError(runId, e, setMyRun));
-  }, [engine.running, selection.selectedCategories]);
+    startPurge(cats, "Clean caches", scanner.scannedRecycleAge).catch((e: unknown) => onStartError(runId, e, setMyRun));
+  }, [engine.running, selection.selectedCategories, scanner.scannedRecycleAge]);
 
   const scanAgain = useCallback(() => {
     setMyRun(null);
     resetOverrides();
-    void rescan(settingsRef.current.includeBrowserCaches);
+    void rescan(settingsRef.current.includeBrowserCaches, settingsRef.current.recycleMinAgeDays);
   }, [rescan, resetOverrides]);
 
   const openReliability = useCallback(() => {

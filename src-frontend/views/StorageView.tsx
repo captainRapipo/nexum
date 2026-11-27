@@ -6,6 +6,7 @@ import { useTelemetry } from "../hooks/useTelemetryStream";
 import { useSettings } from "../hooks/useSettings";
 import { joinDisks } from "../lib/disks";
 import { onFocusRequest, takePendingFocus } from "../lib/nav";
+import { spaceThresholds } from "../lib/status";
 import { fmtBytes } from "../lib/format";
 import GlassCard from "../components/layout/GlassCard";
 import { Button, Unavailable, type StatusTone } from "../components/ui";
@@ -35,6 +36,8 @@ export default function StorageView() {
   const { latest, history, agent } = useTelemetry();
   const { settings } = useSettings();
   const tempUnit = settings?.tempUnit ?? "C";
+  const freeSpacePct = settings?.alerts?.freeSpacePct;
+  const th = useMemo(() => spaceThresholds(settings), [freeSpacePct]); // eslint-disable-line react-hooks/exhaustive-deps
   const [refreshing, setRefreshing] = useState(false);
   const [drawerId, setDrawerId] = useState<string | null>(null);
 
@@ -74,11 +77,11 @@ export default function StorageView() {
       if (v.driveType === "Network" || v.driveType === "CD-ROM") continue;
       total += v.totalBytes || 0;
       free += v.freeBytes || 0;
-      if (spaceTone(v) !== "ok") low++;
+      if (spaceTone(v, th) !== "ok") low++;
     }
     const raw = physical.reduce((a, d) => a + (d.sizeBytes || 0), 0);
     return { total, free, used: Math.max(0, total - free), low, raw };
-  }, [vols, physical]);
+  }, [vols, physical, th]);
 
   const healthSummary = useMemo(() => {
     const states = entries.map((e) => (e.tele ? healthOf(e.tele) : UNMATCHED_HEALTH));

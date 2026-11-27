@@ -1,9 +1,34 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { Activity, Cpu, Eraser, ExternalLink, Info, Power, RotateCcw, Save, Settings as SettingsIcon, ShieldCheck, Thermometer } from "lucide-react";
-import type { Settings } from "../../types";
+import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
+import {
+  Activity,
+  Bell,
+  Cpu,
+  Eraser,
+  ExternalLink,
+  Gamepad2,
+  Info,
+  Power,
+  RotateCcw,
+  Save,
+  Settings as SettingsIcon,
+  ShieldCheck,
+  Thermometer,
+} from "lucide-react";
+import {
+  CPU_DEFAULT_LIMIT_C,
+  DEFAULT_ALERT_SETTINGS,
+  GPU_HOTSPOT_CRIT_DEFAULT_C,
+  GPU_MEM_JUNCTION_CRIT_DEFAULT_C,
+  RECYCLE_AGE_OPTIONS,
+  SENSOR_LOG_INTERVALS_MS,
+  type AlertSettings,
+  type CpuLimitInfo,
+  type Settings,
+} from "../../types";
 import { api, errorMessage, isTauri, PAWNIO_URL } from "../../lib/api";
-import { fmtRelative } from "../../lib/format";
+import { cn, fmtRelative } from "../../lib/format";
 import { useNow } from "../../hooks/useNow";
+import { useHealthAlerts } from "../../hooks/useHealthAlerts";
 import { useSettings } from "../../hooks/useSettings";
 import { useTelemetry } from "../../hooks/useTelemetryStream";
 import { Button } from "../ui/Button";
@@ -30,6 +55,17 @@ const UNIT_OPTIONS = [
   { value: "F" as const, label: "°F" },
 ];
 
+/** [NEW 1.1] CSV log interval (CONTRACT §2.9): 1 / 2 / 5 / 10 s. */
+const LOG_INTERVAL_OPTIONS = SENSOR_LOG_INTERVALS_MS.map((ms) => ({ value: ms, label: `${ms / 1000} s` }));
+
+/** [NEW 1.1] Recycle Bin age (CONTRACT §3.2). Segmented needs a primitive value: -1 stands for null ("All"). */
+const RECYCLE_ALL = -1;
+const RECYCLE_OPTIONS = RECYCLE_AGE_OPTIONS.map((d) => ({
+  value: d ?? RECYCLE_ALL,
+  label: d == null ? "All" : d === 1 ? "1 day" : `${d} days`,
+  title: d == null ? "Every item in the Recycle Bin" : `Only items deleted more than ${d === 1 ? "1 day" : `${d} days`} ago`,
+}));
+
 /** Fields edited in this dialog. Only these are saved, so labels / pins changed elsewhere are never overwritten. */
 const SETTING_KEYS = [
   "launchOnStartup",
@@ -40,6 +76,10 @@ const SETTING_KEYS = [
   "tempUnit",
   "startMinimized",
   "hideUnusedSensors",
+  "fpsCaptureEnabled",
+  "sensorLogIntervalMs",
+  "recycleMinAgeDays",
+  "alerts",
 ] as const satisfies ReadonlyArray<keyof Settings>;
 
 const DRIVER_CHOICE_TEXT: Record<Settings["sensorDriverChoice"], string> = {
@@ -47,6 +87,50 @@ const DRIVER_CHOICE_TEXT: Record<Settings["sensorDriverChoice"], string> = {
   pawnio: "Use PawnIO",
   none: "No kernel driver",
 };
+
+/** Frame-capture consent text (same facts as the Gaming view's opt-in card, CONTRACT §4.10.1). */
+const FPS_CONSENT =
+  "Nexum can measure frame rate and frame times with Intel PresentMon, which reads Windows performance events (ETW). Nothing is injected into games and no game files or processes are touched.";
+const FPS_JAVELIN = "Start Nexum before launching games that use EA Javelin anti-cheat: frame capture must already be running when they start.";
+const FPS_UNTESTED = "Compatibility with individual games' anti-cheat has not been tested yet. Off by default.";
+
+/** Alert threshold bounds (CONTRACT §2.2 AlertSettings). */
+const ALERT_BOUNDS = {
+  cpuTempC: { min: 60, max: 105 },
+  gpuHotspotC: { min: 70, max: 115 },
+  gpuMemJunctionC: { min: 70, max: 115 },
+  freeSpacePct: { min: 1, max: 50 },
+  sustainSec: { min: 10, max: 600 },
+} as const;
+
+function clampInt(v: number, min: number, max: number): number {
+  return Math.round(Math.min(max, Math.max(min, v)));
+}
+
+/** Same rules as Rust's sanitization: every member on its own, malformed → its default. */
+function sanitizeAlerts(a: Partial<AlertSettings> | null | undefined): AlertSettings {
+  const d = DEFAULT_ALERT_SETTINGS;
+  const num = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+  const nullable = (v: unknown, b: { min: number; max: number }) => (num(v) ? clampInt(v, b.min, b.max) : null);
+  return {
+    desktopNotifications: typeof a?.desktopNotifications === "boolean" ? a.desktopNotifications : d.desktopNotifications,
+    cpuTempC: nullable(a?.cpuTempC, ALERT_BOUNDS.cpuTempC),
+    gpuHotspotC: nullable(a?.gpuHotspotC, ALERT_BOUNDS.gpuHotspotC),
+    gpuMemJunctionC: nullable(a?.gpuMemJunctionC, ALERT_BOUNDS.gpuMemJunctionC),
+    freeSpacePct: num(a?.freeSpacePct) ? clampInt(a.freeSpacePct, 1, 50) : d.freeSpacePct,
+    sustainSec: num(a?.sustainSec) ? clampInt(a.sustainSec, 10, 600) : d.sustainSec,
+  };
+}
+
+const sameAlerts = (a: AlertSettings | undefined, b: AlertSettings | undefined) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+function cpuLimitText(info: CpuLimitInfo, override: number | null): string {
+  if (override != null) return `Your limit: ${override} °C (attention from ${override - 5} °C).`;
+  if (info.source === "table")
+    return `${info.model ? `Ryzen ${info.model}` : "This CPU"}: ${info.limitC} °C, AMD's maximum operating temperature (attention from ${info.warnC} °C).`;
+  if (info.source === "user") return `Limit for this CPU: ${info.limitC} °C (your setting).`;
+  return `This CPU model is not in Nexum's table; using a conservative ${CPU_DEFAULT_LIMIT_C} °C limit.`;
+}
 
 function Section({ icon, title, children }: { icon: ReactNode; title: string; children: ReactNode }) {
   return (
@@ -60,7 +144,7 @@ function Section({ icon, title, children }: { icon: ReactNode; title: string; ch
   );
 }
 
-function FieldRow({ label, description, children }: { label: string; description?: string; children: ReactNode }) {
+function FieldRow({ label, description, children }: { label: string; description?: ReactNode; children: ReactNode }) {
   return (
     <div className="flex items-center justify-between gap-4">
       <div className="min-w-0">
@@ -72,9 +156,78 @@ function FieldRow({ label, description, children }: { label: string; description
   );
 }
 
+interface NumberFieldProps {
+  label: string;
+  description?: ReactNode;
+  value: number | null;
+  onChange: (v: number | null) => void;
+  min: number;
+  max: number;
+  unit: string;
+  /** Nullable fields: empty input = automatic, shown as this placeholder. */
+  autoPlaceholder?: string;
+}
+
+/** Integer setting with a unit; out-of-range values are clamped when the field loses focus. */
+function NumberField({ label, description, value, onChange, min, max, unit, autoPlaceholder }: NumberFieldProps) {
+  const id = useId();
+  const [text, setText] = useState(value == null ? "" : String(value));
+  useEffect(() => setText(value == null ? "" : String(value)), [value]);
+  const nullable = autoPlaceholder != null;
+
+  const commit = (raw: string) => {
+    const t = raw.trim();
+    if (t === "") {
+      if (nullable) onChange(null);
+      else setText(value == null ? "" : String(value));
+      return;
+    }
+    const n = Number(t);
+    if (!Number.isFinite(n)) {
+      setText(value == null ? "" : String(value));
+      return;
+    }
+    const c = clampInt(n, min, max);
+    setText(String(c));
+    onChange(c);
+  };
+
+  return (
+    <div className="flex items-center justify-between gap-4">
+      <div className="min-w-0">
+        <label htmlFor={id} className="block text-[13px] text-slate-200">
+          {label}
+        </label>
+        {description && <p className="mt-0.5 text-[11.5px] leading-snug text-muted">{description}</p>}
+      </div>
+      <div className="flex shrink-0 items-center gap-1.5">
+        <input
+          id={id}
+          type="number"
+          inputMode="numeric"
+          min={min}
+          max={max}
+          step={1}
+          value={text}
+          placeholder={autoPlaceholder}
+          title={`${min} to ${max} ${unit}${nullable ? ". Leave empty for the automatic value." : ""}`}
+          onChange={(e) => setText(e.target.value)}
+          onBlur={(e) => commit(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commit((e.target as HTMLInputElement).value);
+          }}
+          className="num h-7 w-[84px] rounded-md border border-line bg-canvas-0/70 px-2 text-right text-[12.5px] text-ink outline-none transition placeholder:text-muted/70 focus:border-teal/50 focus:shadow-[0_0_0_3px_rgba(45,212,191,0.12)]"
+        />
+        <span className="w-6 text-[11.5px] text-muted">{unit}</span>
+      </div>
+    </div>
+  );
+}
+
 export function SettingsModal({ open, onClose }: SettingsModalProps) {
   const { settings, update } = useSettings();
   const { agent, latest } = useTelemetry();
+  const { snapshot: alertSnapshot } = useHealthAlerts();
   // Only tick while visible; the closed dialog stays mounted for its exit animation.
   const now = useNow(open ? 1000 : 3_600_000);
 
@@ -109,9 +262,15 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     };
   }, []);
 
-  const dirty = useMemo(() => SETTING_KEYS.some((k) => draft[k] !== settings[k]), [draft, settings]);
+  const dirty = useMemo(
+    () => SETTING_KEYS.some((k) => (k === "alerts" ? !sameAlerts(draft.alerts, settings.alerts) : draft[k] !== settings[k])),
+    [draft, settings],
+  );
 
   const set = <K extends keyof Settings>(key: K, value: Settings[K]) => setDraft((d) => ({ ...d, [key]: value }));
+  const alerts = draft.alerts ?? DEFAULT_ALERT_SETTINGS;
+  const setAlert = <K extends keyof AlertSettings>(key: K, value: AlertSettings[K]) =>
+    setDraft((d) => ({ ...d, alerts: { ...(d.alerts ?? DEFAULT_ALERT_SETTINGS), [key]: value } }));
 
   const handleSave = async () => {
     setSaving(true);
@@ -119,6 +278,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     try {
       const patch: Partial<Settings> = {};
       for (const k of SETTING_KEYS) (patch as Record<string, unknown>)[k] = draft[k];
+      patch.alerts = sanitizeAlerts(draft.alerts);
       await update(patch);
       onClose();
     } catch (err) {
@@ -160,14 +320,18 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
         ? "Not installed"
         : `PawnIO ${driver.version ?? "(version unknown)"}${agent?.limitedReasons.includes("pawnIoOutdated") ? ` · needs ${driver.minVersion} or newer` : ""}`;
 
+  const spaceCrit = Math.max(1, Math.floor((alerts.freeSpacePct ?? DEFAULT_ALERT_SETTINGS.freeSpacePct) / 2));
+  const hsCrit = alerts.gpuHotspotC ?? GPU_HOTSPOT_CRIT_DEFAULT_C;
+  const mjCrit = alerts.gpuMemJunctionC ?? GPU_MEM_JUNCTION_CRIT_DEFAULT_C;
+
   return (
     <Modal
       open={open}
       onClose={onClose}
       title="Settings"
-      subtitle="Startup, telemetry, sensors and cache cleanup preferences"
+      subtitle="Startup, telemetry, alerts, frame capture and cache cleanup preferences"
       icon={SettingsIcon}
-      size="lg"
+      size="xl"
       footer={
         <>
           <div className="min-w-0 flex-1 truncate text-[12px]">
@@ -207,7 +371,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
             />
             <Toggle
               label="Minimize to system tray"
-              description="Keep monitoring in the background when the window is closed."
+              description="Keep monitoring in the background when the window is closed. The tray tooltip shows your pinned sensors."
               checked={draft.minimizeToTray}
               onChange={(v) => set("minimizeToTray", v)}
             />
@@ -241,6 +405,122 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
               checked={draft.hideUnusedSensors}
               onChange={(v) => set("hideUnusedSensors", v)}
             />
+            <FieldRow
+              label="Sensor log interval"
+              description="One CSV row per interval, saved to Documents\Nexum\Logs. Start a log from the Sensors view or the tray menu."
+            >
+              <Segmented
+                ariaLabel="Sensor log interval"
+                size="sm"
+                value={draft.sensorLogIntervalMs}
+                options={LOG_INTERVAL_OPTIONS}
+                onChange={(v) => set("sensorLogIntervalMs", v)}
+              />
+            </FieldRow>
+          </Section>
+
+          <Section icon={<Bell size={14} aria-hidden="true" />} title="Alerts & notifications">
+            <Toggle
+              label="Windows notifications"
+              description="Notify when an alert starts or becomes critical while Nexum is in the background. At most one per alert every 30 minutes. Off by default."
+              checked={alerts.desktopNotifications}
+              onChange={(v) => setAlert("desktopNotifications", v)}
+            />
+            <NumberField
+              label="CPU temperature limit"
+              description={cpuLimitText(alertSnapshot.cpuLimit, alerts.cpuTempC)}
+              value={alerts.cpuTempC}
+              onChange={(v) => setAlert("cpuTempC", v)}
+              min={ALERT_BOUNDS.cpuTempC.min}
+              max={ALERT_BOUNDS.cpuTempC.max}
+              unit="°C"
+              autoPlaceholder={alertSnapshot.cpuLimit.source === "user" ? "Auto" : `Auto (${alertSnapshot.cpuLimit.limitC})`}
+            />
+            <NumberField
+              label="GPU hot spot, critical"
+              description={`Attention from ${hsCrit - 10} °C. Edge sensor only: attention 85 °C, critical 95 °C.`}
+              value={alerts.gpuHotspotC}
+              onChange={(v) => setAlert("gpuHotspotC", v)}
+              min={ALERT_BOUNDS.gpuHotspotC.min}
+              max={ALERT_BOUNDS.gpuHotspotC.max}
+              unit="°C"
+              autoPlaceholder={`Auto (${GPU_HOTSPOT_CRIT_DEFAULT_C})`}
+            />
+            <NumberField
+              label="GPU memory, critical"
+              description={`Memory junction temperature. Attention from ${mjCrit - 10} °C.`}
+              value={alerts.gpuMemJunctionC}
+              onChange={(v) => setAlert("gpuMemJunctionC", v)}
+              min={ALERT_BOUNDS.gpuMemJunctionC.min}
+              max={ALERT_BOUNDS.gpuMemJunctionC.max}
+              unit="°C"
+              autoPlaceholder={`Auto (${GPU_MEM_JUNCTION_CRIT_DEFAULT_C})`}
+            />
+            <NumberField
+              label="Low free space"
+              description={`Attention below this share of a fixed drive; critical below ${spaceCrit}%.`}
+              value={alerts.freeSpacePct}
+              onChange={(v) => setAlert("freeSpacePct", v ?? DEFAULT_ALERT_SETTINGS.freeSpacePct)}
+              min={ALERT_BOUNDS.freeSpacePct.min}
+              max={ALERT_BOUNDS.freeSpacePct.max}
+              unit="%"
+            />
+            <NumberField
+              label="Sustained for"
+              description="A temperature must stay at or above its threshold this long before an alert starts."
+              value={alerts.sustainSec}
+              onChange={(v) => setAlert("sustainSec", v ?? DEFAULT_ALERT_SETTINGS.sustainSec)}
+              min={ALERT_BOUNDS.sustainSec.min}
+              max={ALERT_BOUNDS.sustainSec.max}
+              unit="s"
+            />
+            <p className="text-[11.5px] leading-snug text-muted">
+              Drive wear alerts follow the drive's own health report and have no threshold to set. Temperatures here are in °C.
+            </p>
+          </Section>
+        </div>
+
+        <div className="flex flex-col gap-3">
+          <Section icon={<Gamepad2 size={14} aria-hidden="true" />} title="Frame capture">
+            <Toggle
+              label="Measure frame rate in games"
+              description={FPS_CONSENT}
+              checked={draft.fpsCaptureEnabled}
+              onChange={(v) => set("fpsCaptureEnabled", v)}
+            />
+            <div className="space-y-1.5 text-[11.5px] leading-snug text-muted">
+              <p>{FPS_JAVELIN}</p>
+              <p>{FPS_UNTESTED}</p>
+            </div>
+          </Section>
+
+          <Section icon={<Eraser size={14} aria-hidden="true" />} title="Cache cleanup">
+            <Toggle
+              label="List browser and Discord caches"
+              description="Chrome, Edge, Firefox and Discord caches. Logins, cookies and history are kept. F9 never cleans them without asking."
+              checked={draft.includeBrowserCaches}
+              onChange={(v) => set("includeBrowserCaches", v)}
+            />
+            <Toggle
+              label="Confirm before cleaning"
+              description="When off, F9 cleans temporary files, the Windows Update cache and error reports right away."
+              checked={draft.confirmBeforePurge}
+              onChange={(v) => set("confirmBeforePurge", v)}
+            />
+            <div>
+              <div className="text-[13px] text-slate-200">Recycle Bin items to clean</div>
+              <p className="mb-2 mt-0.5 text-[11.5px] leading-snug text-muted">
+                Like Windows Storage Sense: keep recently deleted items. The Recycle Bin is never cleaned unless you select it.
+              </p>
+              <Segmented
+                ariaLabel="Recycle Bin age"
+                size="sm"
+                value={draft.recycleMinAgeDays ?? RECYCLE_ALL}
+                options={RECYCLE_OPTIONS}
+                onChange={(v) => set("recycleMinAgeDays", v === RECYCLE_ALL ? null : v)}
+                className="w-full justify-between [&>button]:flex-1"
+              />
+            </div>
           </Section>
 
           <Section icon={<Activity size={14} aria-hidden="true" />} title="Sensor driver">
@@ -267,23 +547,6 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                 )}
               </div>
             </div>
-          </Section>
-        </div>
-
-        <div className="flex flex-col gap-3">
-          <Section icon={<Eraser size={14} aria-hidden="true" />} title="Cache cleanup">
-            <Toggle
-              label="List browser and Discord caches"
-              description="Chrome, Edge, Firefox and Discord caches. Logins, cookies and history are kept. F9 never cleans them without asking."
-              checked={draft.includeBrowserCaches}
-              onChange={(v) => set("includeBrowserCaches", v)}
-            />
-            <Toggle
-              label="Confirm before cleaning"
-              description="When off, F9 cleans temporary files, the Windows Update cache and error reports right away."
-              checked={draft.confirmBeforePurge}
-              onChange={(v) => set("confirmBeforePurge", v)}
-            />
           </Section>
 
           <Section icon={<Cpu size={14} aria-hidden="true" />} title="Hardware Agent">
@@ -312,7 +575,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                 </div>
               )}
               {restartMsg && (
-                <p className={restartMsg.ok ? "mt-1.5 text-[11.5px] text-teal" : "mt-1.5 text-[11.5px] text-rose-400"} role="status">
+                <p className={cn("mt-1.5 text-[11.5px]", restartMsg.ok ? "text-teal" : "text-rose-400")} role="status">
                   {restartMsg.text}
                 </p>
               )}

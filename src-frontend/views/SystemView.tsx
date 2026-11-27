@@ -5,11 +5,13 @@ import { fmtClock } from "../lib/format";
 import { resolveUnavailable } from "../lib/status";
 import { useSystemSpec } from "../hooks/useSystemSpec";
 import { useSystemInfo } from "../hooks/useSystemInfo";
+import { useSettings } from "../hooks/useSettings";
 import { useTelemetry } from "../hooks/useTelemetryStream";
 import { Button } from "../components/ui/Button";
 import { toast } from "../components/feedback/Toast";
 import { copyText } from "../components/sensors/copyText";
 import { SpecTabs, panelDomId, tabDomId } from "../components/system/SpecTabs";
+import { SaveReportMenu } from "../components/system/SaveReportMenu";
 import {
   BoardPanel,
   CpuPanel,
@@ -34,13 +36,16 @@ function loadTab(): SpecTabId {
 }
 
 /**
- * System (F3): CPU-Z style spec sheet, "lite" for v1.0 (CONTRACT §1.4, §2.6, §4.10).
+ * System (F3): CPU-Z style spec sheet (CONTRACT §1.4, §1.4.1, §2.6, §4.10, §4.10.2): memory timings with
+ * their source, SPD JEDEC timings, FCLK/UCLK/MEMCLK, PCIe links, "Copy as text" and "Save report".
  * F5 (handled by App) and the Refresh button re-query with refresh:true.
  */
 export default function SystemView() {
   const { spec, loading, error, refresh } = useSystemSpec();
-  const { info } = useSystemInfo();
+  const { info, disks } = useSystemInfo();
   const { agent } = useTelemetry();
+  const { settings } = useSettings();
+  const tempUnit = settings?.tempUnit ?? "C";
 
   const [tab, setTab] = useState<SpecTabId>(loadTab);
   const [slot, setSlot] = useState<string | null>(null);
@@ -61,8 +66,9 @@ export default function SystemView() {
       missing: "unsupported",
       superIo: agent ? resolveUnavailable(agent, "pawnio") : "agentOffline",
       admin: info && !info.isAdmin ? "notElevated" : "unsupported",
+      tempUnit,
     }),
-    [agent, info],
+    [agent, info, tempUnit],
   );
 
   const doRefresh = useCallback(async () => {
@@ -77,7 +83,7 @@ export default function SystemView() {
   const copyAll = async () => {
     if (!spec) return;
     try {
-      await copyText(buildSpecText(spec, sectionReason, ctx, Date.now()));
+      await copyText(buildSpecText(spec, sectionReason, ctx, Date.now(), disks));
       toast("System details copied as text", "ok");
     } catch {
       toast("Could not copy to the clipboard", "warn");
@@ -136,7 +142,9 @@ export default function SystemView() {
           );
         break;
       case "os":
-        panel = <OsPanel os={spec.os} security={spec.security} ctx={ctx} />;
+        panel = (
+          <OsPanel os={spec.os} security={spec.security} ctx={ctx} diskLinks={spec.diskLinks ?? []} disks={disks} />
+        );
         break;
     }
   }
@@ -149,7 +157,7 @@ export default function SystemView() {
           <div className="text-[10.5px] uppercase tracking-[0.22em] text-gold/80">F3 · System details</div>
           <h1 className="mt-1 text-[22px] font-semibold tracking-tight text-ink">System</h1>
           <p className="mt-0.5 text-[12.5px] text-muted">
-            Processor, mainboard, memory, graphics and Windows, read once and kept until you refresh.
+            Processor, mainboard, memory timings, graphics, storage links and Windows, read once and kept until you refresh.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -168,6 +176,7 @@ export default function SystemView() {
           >
             Refresh
           </Button>
+          <SaveReportMenu disabled={!spec} />
           <Button size="sm" variant="teal" icon={ClipboardCopy} onClick={() => void copyAll()} disabled={!spec} title="Copy every tab as plain text">
             Copy as text
           </Button>
