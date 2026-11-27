@@ -1696,6 +1696,8 @@ pub struct FileOutcome<'a> {
 }
 
 /// Deletes every candidate of a plan, then removes now-empty sub-directories bottom-up.
+/// Test helper: the real purge path calls [`purge_plan_with`] so it can write the audit log.
+#[cfg(test)]
 pub fn purge_plan(plan: &RootPlan, deny: &DenyList) -> PurgeCounts {
     purge_plan_with(plan, deny, &mut |_: FileOutcome<'_>| {})
 }
