@@ -52,6 +52,7 @@ internal static class GpuMonitor
         t.TempC = Round(FindPositive(hw, SensorType.Temperature, "GPU Core", "GPU Temperature")
                         ?? FirstPositive(hw, SensorType.Temperature));
         t.HotspotTempC = Round(FindPositive(hw, SensorType.Temperature, "GPU Hot Spot", "GPU Hotspot"));
+        t.MemJunctionTempC = Round(MemJunctionTemp(hw));
 
         // Power (W).
         t.PowerW = Round(FindValue(hw, SensorType.Power,
@@ -66,6 +67,18 @@ internal static class GpuMonitor
 
         return t;
     }
+
+    /// <summary>
+    /// CONTRACT §1.1.1 (1.1): the first present temperature sensor named "GPU Memory Junction" (LHM NvidiaGpu,
+    /// GDDR6X junction) or "GPU Memory" (LHM AmdGpu, ADL PMLog TEMPERATURE_MEM). Readings ≤ 0 count as absent,
+    /// as for every other GPU temperature. Never substitutes another sensor.
+    /// </summary>
+    internal static float? MemJunctionTemp(IHardware hw) => hw.HardwareType switch
+    {
+        HardwareType.GpuNvidia => FindPositive(hw, SensorType.Temperature, "GPU Memory Junction"),
+        HardwareType.GpuAmd => FindPositive(hw, SensorType.Temperature, "GPU Memory"),
+        _ => FindPositive(hw, SensorType.Temperature, "GPU Memory Junction", "GPU Memory"),
+    };
 
     /// <summary>
     /// Primary GPU = first discrete GPU (NVIDIA, then discrete AMD) else the first GPU.

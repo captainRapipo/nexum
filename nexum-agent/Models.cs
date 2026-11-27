@@ -89,6 +89,8 @@ internal sealed class GpuTelemetry
     [JsonPropertyName("powerW")] public double? PowerW { get; set; }
     [JsonPropertyName("fanRpm")] public double? FanRpm { get; set; }
     [JsonPropertyName("fanPct")] public double? FanPct { get; set; }
+    /// <summary>[1.1] "GPU Memory Junction" (NVIDIA) / "GPU Memory" (AMD) temperature, else null (CONTRACT §1.1.1).</summary>
+    [JsonPropertyName("memJunctionTempC")] public double? MemJunctionTempC { get; set; }
 }
 
 internal sealed class RamTelemetry
@@ -230,6 +232,8 @@ internal sealed class AgentSpecMessage
     [JsonPropertyName("board")] public BoardSpecDto? Board { get; set; }
     [JsonPropertyName("memory")] public MemorySpecDto? Memory { get; set; }
     [JsonPropertyName("gpus")] public List<GpuSpecDto> Gpus { get; set; } = new();
+    /// <summary>[1.1] CONTRACT §1.4.1.</summary>
+    [JsonPropertyName("diskLinks")] public List<DiskLinkDto> DiskLinks { get; set; } = new();
     [JsonPropertyName("errors")] public List<string> Errors { get; set; } = new();
 }
 
@@ -282,6 +286,8 @@ internal sealed class DimmSpecDto
     [JsonPropertyName("ranks")] public int? Ranks { get; set; }
     [JsonPropertyName("voltage")] public double? Voltage { get; set; }
     [JsonPropertyName("formFactor")] public string FormFactor { get; set; } = "Other";
+    /// <summary>[1.1] SPD JEDEC data from LHM DimmMemory; null when unavailable or unmatched (CONTRACT §1.4.1).</summary>
+    [JsonPropertyName("spd")] public SpdInfoDto? Spd { get; set; }
 }
 
 internal sealed class MemorySpecDto
@@ -293,10 +299,96 @@ internal sealed class MemorySpecDto
     [JsonPropertyName("slotsUsed")] public int SlotsUsed { get; set; }
     [JsonPropertyName("slotsTotal")] public int? SlotsTotal { get; set; }
     [JsonPropertyName("dimms")] public List<DimmSpecDto> Dimms { get; set; } = new();
-    // v1.0 constants (CONTRACT §1.4).
-    [JsonPropertyName("timings")] public object? Timings => null;
-    [JsonPropertyName("timingsSource")] public string TimingsSource => "unavailable";
+    /// <summary>[1.1] Live (umc) or SPD-derived (spd) timings in cycles; null when unavailable.</summary>
+    [JsonPropertyName("timings")] public MemoryTimingsDto? Timings { get; set; }
+    /// <summary>"umc" | "spd" | "unavailable".</summary>
+    [JsonPropertyName("timingsSource")] public string TimingsSource { get; set; } = "unavailable";
+    /// <summary>Exact sentence from the CONTRACT §1.4.1 table; null only when <see cref="TimingsSource"/> is "umc".</summary>
+    [JsonPropertyName("timingsNote")] public string? TimingsNote { get; set; }
+    [JsonPropertyName("memclkMhz")] public double? MemclkMhz { get; set; }
+    [JsonPropertyName("fclkMhz")] public double? FclkMhz { get; set; }
+    [JsonPropertyName("uclkMhz")] public double? UclkMhz { get; set; }
+    /// <summary>Always null (XMP parsing is v1.3+).</summary>
     [JsonPropertyName("xmp")] public object? Xmp => null;
+}
+
+/// <summary>[1.1] DDR4 timings in clock cycles (CONTRACT §1.4.1). Every member null when not read.</summary>
+internal sealed class MemoryTimingsDto
+{
+    [JsonPropertyName("cl")] public int? Cl { get; set; }
+    [JsonPropertyName("rcdRd")] public int? RcdRd { get; set; }
+    [JsonPropertyName("rcdWr")] public int? RcdWr { get; set; }
+    [JsonPropertyName("rp")] public int? Rp { get; set; }
+    [JsonPropertyName("ras")] public int? Ras { get; set; }
+    [JsonPropertyName("rc")] public int? Rc { get; set; }
+    [JsonPropertyName("rfc")] public int? Rfc { get; set; }
+    [JsonPropertyName("rrds")] public int? Rrds { get; set; }
+    [JsonPropertyName("rrdl")] public int? Rrdl { get; set; }
+    [JsonPropertyName("faw")] public int? Faw { get; set; }
+    [JsonPropertyName("wtrs")] public int? Wtrs { get; set; }
+    [JsonPropertyName("wtrl")] public int? Wtrl { get; set; }
+    [JsonPropertyName("wr")] public int? Wr { get; set; }
+    [JsonPropertyName("rtp")] public int? Rtp { get; set; }
+    [JsonPropertyName("cwl")] public int? Cwl { get; set; }
+    /// <summary>"1T" | "2T" | null (null for SPD-derived timings).</summary>
+    [JsonPropertyName("commandRate")] public string? CommandRate { get; set; }
+    [JsonPropertyName("gearDown")] public bool? GearDown { get; set; }
+}
+
+/// <summary>[1.1] JEDEC timings in cycles at <see cref="SpdInfoDto.JedecSpeedMts"/>.</summary>
+internal sealed class SpdCyclesDto
+{
+    [JsonPropertyName("cl")] public int? Cl { get; set; }
+    [JsonPropertyName("rcd")] public int? Rcd { get; set; }
+    [JsonPropertyName("rp")] public int? Rp { get; set; }
+    [JsonPropertyName("ras")] public int? Ras { get; set; }
+    [JsonPropertyName("rc")] public int? Rc { get; set; }
+    [JsonPropertyName("rfc")] public int? Rfc { get; set; }
+    [JsonPropertyName("faw")] public int? Faw { get; set; }
+    [JsonPropertyName("rrds")] public int? Rrds { get; set; }
+    [JsonPropertyName("rrdl")] public int? Rrdl { get; set; }
+    [JsonPropertyName("wr")] public int? Wr { get; set; }
+    [JsonPropertyName("wtrs")] public int? Wtrs { get; set; }
+    [JsonPropertyName("wtrl")] public int? Wtrl { get; set; }
+}
+
+/// <summary>[1.1] One DIMM's SPD data (CONTRACT §1.4.1). Never contains serial numbers.</summary>
+internal sealed class SpdInfoDto
+{
+    [JsonPropertyName("source")] public string Source => "jedec";
+    [JsonPropertyName("jedecSpeedMts")] public int? JedecSpeedMts { get; set; }
+    /// <summary>Every <see cref="NexumAgent.Spec.SpdReader.TimingKeys"/> key, value in ns or null.</summary>
+    [JsonPropertyName("timingsNs")] public Dictionary<string, double?> TimingsNs { get; set; } = new();
+    [JsonPropertyName("cycles")] public SpdCyclesDto Cycles { get; set; } = new();
+    [JsonPropertyName("tempC")] public double? TempC { get; set; }
+    /// <summary>"order" | "partNumber".</summary>
+    [JsonPropertyName("matchedBy")] public string MatchedBy { get; set; } = "order";
+}
+
+/// <summary>[1.1] PCIe link (CONTRACT §1.4.1).</summary>
+internal sealed class PcieLinkDto
+{
+    [JsonPropertyName("gen")] public int? Gen { get; set; }
+    [JsonPropertyName("width")] public int? Width { get; set; }
+    [JsonPropertyName("maxGen")] public int? MaxGen { get; set; }
+    [JsonPropertyName("maxWidth")] public int? MaxWidth { get; set; }
+    /// <summary>"adl" | "devpkey" | "unknown".</summary>
+    [JsonPropertyName("source")] public string Source { get; set; } = "unknown";
+    [JsonPropertyName("note")] public string? Note { get; set; }
+}
+
+/// <summary>[1.1] Storage link per Windows disk (CONTRACT §1.4.1). No serials.</summary>
+internal sealed class DiskLinkDto
+{
+    [JsonPropertyName("diskNumber")] public int DiskNumber { get; set; }
+    [JsonPropertyName("model")] public string Model { get; set; } = "";
+    /// <summary>"nvme" | "sata" | "usb" | "other".</summary>
+    [JsonPropertyName("bus")] public string Bus { get; set; } = "other";
+    [JsonPropertyName("gen")] public int? Gen { get; set; }
+    [JsonPropertyName("width")] public int? Width { get; set; }
+    [JsonPropertyName("maxGen")] public int? MaxGen { get; set; }
+    [JsonPropertyName("maxWidth")] public int? MaxWidth { get; set; }
+    [JsonPropertyName("sataGen")] public int? SataGen { get; set; }
 }
 
 internal sealed class GpuSpecDto
@@ -307,4 +399,6 @@ internal sealed class GpuSpecDto
     [JsonPropertyName("vramGb")] public double? VramGb { get; set; }
     [JsonPropertyName("driverVersion")] public string? DriverVersion { get; set; }
     [JsonPropertyName("driverDate")] public string? DriverDate { get; set; }
+    /// <summary>[1.1] null when nothing readable.</summary>
+    [JsonPropertyName("link")] public PcieLinkDto? Link { get; set; }
 }

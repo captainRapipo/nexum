@@ -4,14 +4,17 @@ using System.Runtime.Intrinsics.X86;
 using System.Text.RegularExpressions;
 using LibreHardwareMonitor.Hardware;
 using LibreHardwareMonitor.Hardware.Cpu;
+using NexumAgent.Spec;
 using static NexumAgent.SensorUtil;
 
 namespace NexumAgent;
 
 /// <summary>
-/// The agent part of the System view (CONTRACT §1.4): cpu, board, memory, gpus. Each section is
-/// computed independently; a failing section becomes null ([] for gpus) plus an entry in errors.
-/// LHM objects are read briefly under the hardware lock; all WMI work runs outside it.
+/// The agent part of the System view (CONTRACT §1.4, §1.4.1): cpu, board, memory, gpus, diskLinks. Each section
+/// is computed independently; a failing section becomes null ([] for gpus/diskLinks) plus an entry in errors,
+/// and a failing 1.1 part (Memory timings, SPD, GPU link, Disk links) only nulls that part.
+/// LHM objects are read briefly under the hardware lock; WMI, Configuration Manager and the live memory-timing
+/// read (SMN, under the PCI-bus mutex) run outside it.
 /// </summary>
 internal static class SystemSpec
 {
@@ -22,7 +25,12 @@ internal static class SystemSpec
         public uint[,]? CpuIdLeaves;
         public uint[,]? CpuIdExtLeaves;
         public string? SuperIo;
-        public List<(string Vendor, string Name, double? VramGb)> Gpus = new();
+        public List<(string Vendor, string Name, double? VramGb, PcieLinkDto? AdlLink)> Gpus = new();
+        /// <summary>[1.1] LHM CPU clock sensors "Fabric Clock"/"Fabric" and "Uncore Clock"/"Uncore" (SMU PM table).</summary>
+        public double? FclkMhz;
+        public double? UclkMhz;
+        /// <summary>[1.1] LHM DimmMemory nodes (SPD), in LHM order.</summary>
+        public List<SpdReader.DimmFacts> Dimms = new();
     }
 
     /// <summary>Call while holding <see cref="TelemetryService.SyncRoot"/>. Cheap: no Update(), no WMI.</summary>
@@ -43,6 +51,9 @@ internal static class SystemSpec
                             f.CpuIdLeaves = first[0].Data;
                             f.CpuIdExtLeaves = first[0].ExtData;
                         }
+                        // CONTRACT names first, then the LHM 0.9.6 RyzenSMU PM-table names ("Fabric", "Uncore").
+                        f.FclkMhz = Round(FindPositive(hw, SensorType.Clock, "Fabric Clock", "Fabric"), 0);
+                        f.UclkMhz = Round(FindPositive(hw, SensorType.Clock, "Uncore Clock", "Uncore"), 0);
                         break;
                     case HardwareType.SuperIO when f.SuperIo is null:
                         var n = SafeName(hw);
@@ -50,8 +61,16 @@ internal static class SystemSpec
                         break;
                     case HardwareType.GpuNvidia or HardwareType.GpuAmd or HardwareType.GpuIntel:
                         var mb = FindValue(hw, SensorType.SmallData, "GPU Memory Total");
+                        PcieLinkDto? adl = null;
+                        if (hw.HardwareType == HardwareType.GpuAmd)
+                        {
+                            // LHM's AMD report only calls ADL *_Get functions (read-only).
+                            try { adl = PcieLinks.ParseAdlReport(hw.GetReport()); }
+                            catch (Exception ex) { Program.Log($"Spec: ADL report of {SafeId(hw)} failed: {ex.Message}"); }
+                        }
                         f.Gpus.Add((GpuMonitor.VendorOf(hw.HardwareType), SafeName(hw),
-                                    mb.HasValue && mb.Value > 0 ? Math.Round(mb.Value / 1024d, 1, MidpointRounding.AwayFromZero) : null));
+                                    mb.HasValue && mb.Value > 0 ? Math.Round(mb.Value / 1024d, 1, MidpointRounding.AwayFromZero) : null,
+                                    adl));
                         break;
                 }
             }
@@ -60,6 +79,8 @@ internal static class SystemSpec
                 Program.Log($"Spec: reading {SafeId(hw)} failed: {ex.Message}");
             }
         }
+        try { f.Dimms = SpdReader.Capture(svc.AllHardware()); }
+        catch (Exception ex) { Program.Log($"Spec: reading DIMM SPD nodes failed: {ex.Message}"); }
         return f;
     }
 
@@ -71,17 +92,20 @@ internal static class SystemSpec
         catch (Exception ex) { msg.Errors.Add($"CPU query failed: {ex.Message}"); }
         try { msg.Board = BuildBoard(lhm); }
         catch (Exception ex) { msg.Errors.Add($"Board query failed: {ex.Message}"); }
-        try { msg.Memory = BuildMemory(); }
+        try { msg.Memory = BuildMemory(lhm, msg.Errors); }
         catch (Exception ex) { msg.Errors.Add($"Memory query failed: {ex.Message}"); }
-        try { msg.Gpus = BuildGpus(lhm); }
+        try { msg.Gpus = BuildGpus(lhm, msg.Errors); }
         catch (Exception ex) { msg.Gpus = new(); msg.Errors.Add($"GPU query failed: {ex.Message}"); }
+        try { msg.DiskLinks = PcieLinks.BuildDiskLinks(); }
+        catch (Exception ex) { msg.DiskLinks = new(); msg.Errors.Add($"Disk links query failed: {ex.Message}"); }
         return msg;
     }
 
     // ---------------------------------------------------------------------------------------------
     // CPU
 
-    private static CpuSpecDto BuildCpu(LhmFacts lhm, StaticInfo info)
+    /// <summary>CPUID leaves (LHM's, else read directly), vendor and display family/model/stepping.</summary>
+    private static (uint[,]? Leaves, uint[,]? Ext, string Vendor, int Family, int Model, int Stepping) Identity(LhmFacts lhm)
     {
         var (leaves, ext) = (lhm.CpuIdLeaves, lhm.CpuIdExtLeaves);
         if (leaves is null || leaves.GetLength(0) < 2) (leaves, ext) = ReadCpuIdDirect();
@@ -102,6 +126,12 @@ internal static class SystemSpec
         int stepping = (int)(eax1 & 0xF);
         int family = baseFamily == 0xF ? baseFamily + extFamily : baseFamily;
         int model = baseFamily == 0xF || (vendor == "Intel" && baseFamily == 6) ? (extModel << 4) + baseModel : baseModel;
+        return (leaves, ext, vendor, family, model, stepping);
+    }
+
+    private static CpuSpecDto BuildCpu(LhmFacts lhm, StaticInfo info)
+    {
+        var (leaves, ext, vendor, family, model, stepping) = Identity(lhm);
 
         string? socket = null;
         int? baseClock = null;
@@ -207,6 +237,8 @@ internal static class SystemSpec
     /// Codename by (vendor, display family, display model). Only entries documented in the Linux kernel's
     /// x86 family/model tables (arch/x86/include/asm/intel-family.h, AMD family/model notes) are listed;
     /// ambiguous models (several products on one model number) are deliberately left out.
+    /// The X3D desktop parts (5700X3D, 5800X3D) share Vermeer's model 0x21 and get "Vermeer" (CONTRACT §1.4.1;
+    /// the UI may append "-X3D" when the name contains X3D).
     /// </summary>
     internal static string? Codename(string vendor, int family, int model)
     {
@@ -226,6 +258,7 @@ internal static class SystemSpec
                 (0x19, 0x50) => "Cezanne",
                 (0x19, 0x61) => "Raphael",
                 (0x19, 0x74) => "Phoenix",
+                (0x19, 0x75) => "Phoenix",
                 (0x1A, 0x44) => "Granite Ridge",
                 _ => null,
             };
@@ -338,7 +371,7 @@ internal static class SystemSpec
     private static readonly Regex BankChannel = new(@"CHANNEL\s*([A-H])", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex LocatorChannel = new(@"(?:DIMM|CHANNEL)[_\s-]*([A-H])\d?", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-    private static MemorySpecDto BuildMemory()
+    private static MemorySpecDto BuildMemory(LhmFacts lhm, List<string> errors)
     {
         var m = new MemorySpecDto();
         long totalBytes = 0;
@@ -413,7 +446,56 @@ internal static class SystemSpec
             }
         }
         m.SlotsTotal = slots > 0 ? (int)slots : null;
+
+        ApplyTimings(m, lhm, errors);
         return m;
+    }
+
+    /// <summary>CONTRACT §1.4.1: SPD per DIMM, live UMC timings (else the SPD JEDEC fallback), MEMCLK/FCLK/UCLK.</summary>
+    private static void ApplyTimings(MemorySpecDto m, LhmFacts lhm, List<string> errors)
+    {
+        try
+        {
+            var spdError = SpdReader.Apply(lhm.Dimms, m.Dimms);
+            if (spdError is not null) errors.Add(spdError);
+        }
+        catch (Exception ex)
+        {
+            foreach (var d in m.Dimms) d.Spd = null;
+            errors.Add($"SPD query failed: {ex.Message}");
+        }
+
+        MemoryTimings.LiveResult live;
+        try
+        {
+            var id = Identity(lhm);
+            live = MemoryTimings.GetLive(id.Vendor, id.Family, m.Type);
+        }
+        catch (Exception ex)
+        {
+            live = new MemoryTimings.LiveResult { Note = MemoryTimings.NoteFailed, Error = $"Memory timings query failed: {ex.Message}" };
+        }
+        if (live.Error is not null) errors.Add(live.Error);
+
+        if (live.Timings is not null)
+        {
+            m.Timings = live.Timings;
+            m.TimingsSource = "umc";
+            m.TimingsNote = null;
+        }
+        else
+        {
+            var first = m.Dimms.FirstOrDefault(d => d.Spd is not null);
+            m.Timings = first?.Spd is { } spd ? MemoryTimings.FromSpd(spd.Cycles) : null;
+            m.TimingsSource = m.Timings is not null ? "spd" : "unavailable";
+            m.TimingsNote = live.Note ?? MemoryTimings.NoteFailed;
+        }
+
+        var firstConfigured = m.Dimms.FirstOrDefault()?.ConfiguredSpeedMts;
+        m.MemclkMhz = live.MemclkMhz
+                      ?? (firstConfigured is > 0 ? Math.Round(firstConfigured.Value / 2.0, 0, MidpointRounding.AwayFromZero) : null);
+        m.FclkMhz = lhm.FclkMhz;
+        m.UclkMhz = lhm.UclkMhz;
     }
 
     internal static char? ParseChannel(string bankLabel, string deviceLocator)
@@ -428,10 +510,10 @@ internal static class SystemSpec
     // ---------------------------------------------------------------------------------------------
     // GPUs
 
-    private static List<GpuSpecDto> BuildGpus(LhmFacts lhm)
+    private static List<GpuSpecDto> BuildGpus(LhmFacts lhm, List<string> errors)
     {
         var list = new List<GpuSpecDto>();
-        var unused = new List<(string Vendor, string Name, double? VramGb)>(lhm.Gpus);
+        var unused = new List<(string Vendor, string Name, double? VramGb, PcieLinkDto? AdlLink)>(lhm.Gpus);
         using var searcher = new ManagementObjectSearcher("SELECT Name, PNPDeviceID, DriverVersion, DriverDate FROM Win32_VideoController");
         using var results = searcher.Get();
         foreach (ManagementObject mo in results)
@@ -454,11 +536,17 @@ internal static class SystemSpec
                     if (sameVendor.Count == 1) idx = sameVendor[0].i;
                 }
                 double? vram = null;
+                PcieLinkDto? adlLink = null;
                 if (idx >= 0)
                 {
                     vram = unused[idx].VramGb;
+                    adlLink = unused[idx].AdlLink;
                     unused.RemoveAt(idx);
                 }
+
+                PcieLinkDto? link = null;
+                try { link = PcieLinks.ForGpu(vendor, pnp, adlLink); }
+                catch (Exception ex) { errors.Add($"GPU link query failed: {ex.Message}"); }
 
                 var driverVersion = Trimmed(mo["DriverVersion"]);
                 list.Add(new GpuSpecDto
@@ -468,6 +556,7 @@ internal static class SystemSpec
                     VramGb = vram,
                     DriverVersion = string.IsNullOrEmpty(driverVersion) ? null : driverVersion,
                     DriverDate = CimDate(mo["DriverDate"]),
+                    Link = link,
                 });
             }
         }

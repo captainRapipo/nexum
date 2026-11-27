@@ -9,9 +9,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
 
-    <Version>1.0.0</Version>
-    <AssemblyVersion>1.0.0.0</AssemblyVersion>
-    <FileVersion>1.0.0.0</FileVersion>
+    <Version>1.1.0</Version>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <FileVersion>1.1.0.0</FileVersion>
     <Product>Nexum Agent</Product>
     <Description>Nexum hardware telemetry sidecar (NDJSON over stdio)</Description>
 
@@ -46,6 +46,11 @@
   <ItemGroup>
     <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />
     <PackageReference Include="System.Management" Version="10.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The real PresentMon 2.6.0 CSV header (CONTRACT §1.6.3); the agent self-test resolves every fatal column from it. -->
+    <EmbeddedResource Include="Frames/HEADER-2.6.0.txt" LogicalName="NexumAgent.Frames.HEADER-2.6.0.txt" />
   </ItemGroup>
 
 </Project>

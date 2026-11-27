@@ -12,7 +12,8 @@ internal static class SelfTest
     private static int _failures;
     private static int _checks;
 
-    public static int Run()
+    /// <param name="presentMonPath">From <c>--presentmon</c>: when given, the full trust check must pass on that file.</param>
+    public static int Run(string? presentMonPath = null)
     {
         _failures = 0;
         _checks = 0;
@@ -23,6 +24,8 @@ internal static class SelfTest
         SensorDriverStatusRules();
         Helpers();
         SelfTestFans.Run((name, ok, detail) => Check(name, ok, detail));
+        Frames.FrameSelfTest.Run((name, ok, detail) => Check(name, ok, detail), presentMonPath);
+        Spec.SpecSelfTest.Run((name, ok, detail) => Check(name, ok, detail));
 
         Program.Log($"selftest: {_checks - _failures}/{_checks} checks passed");
         return _failures == 0 ? 0 : 1;

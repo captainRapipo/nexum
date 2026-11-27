@@ -1,0 +1,20 @@
+ZenStates-Core
+https://github.com/irusanov/ZenStates-Core
+Copyright (c) irusanov and ZenStates-Core contributors
+Licence: GNU General Public License v3.0 (GPL-3.0), the same licence as Nexum.
+The full licence text is the LICENSE file shipped with Nexum.
+
+What Nexum uses
+---------------
+Nexum does not ship ZenStates-Core or any of its binaries. The DDR4 memory-controller
+(UMC) register map that Nexum's hardware agent uses to read the live DDR4 timings on
+AMD Ryzen (Family 17h/19h) processors follows ZenStates-Core's
+Dictionaries/DDR4Dictionary.cs (register offsets, bit fields and the MEMCLK
+calculation). It is re-implemented in nexum-agent/Spec/MemoryTimings.cs, which names
+the upstream file and commit it follows. The registers are read only, through the
+LibreHardwareMonitorLib PawnIO AMD Family 17h interface, and only while holding the
+global PCI bus mutex that LibreHardwareMonitorLib itself uses.
+
+Nexum never writes memory-controller, SMU or MSR registers.
+
+Upstream state when this notice was written: commit 869b7e8 (2026-10-05).

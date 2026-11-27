@@ -7,17 +7,23 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using LibreHardwareMonitor.Hardware;
 using LibreHardwareMonitor.Hardware.Storage;
+using NexumAgent.Frames;
+using NexumAgent.Tuning;
 
 namespace NexumAgent;
 
 /// <summary>
-/// Nexum hardware sidecar. Protocol 2 (CONTRACT §1): NDJSON on stdout (one object per line,
+/// Nexum hardware sidecar. Protocol 3 (CONTRACT §1): NDJSON on stdout (one object per line,
 /// UTF-8 without BOM, flushed per line), NDJSON commands on stdin, all logs on stderr.
+/// Command line: <c>nexum-agent [--presentmon "&lt;absolute path&gt;"] [--selftest] [--dump]</c>.
 /// </summary>
 internal static class Program
 {
-    public const string AgentVersion = "1.0.0";
-    public const int ProtocolVersion = 2;
+    public const string AgentVersion = "1.1.0";
+    public const int ProtocolVersion = 3;
+
+    /// <summary>Hard budget for stopping frame capture during shutdown, after the fan restore (CONTRACT §1.6.6).</summary>
+    private const int FrameStopBudgetMs = 2000;
 
     private const int DefaultIntervalMs = 1000;
     private const int MinIntervalMs = 250;
@@ -59,6 +65,13 @@ internal static class Program
     private static FanController? _fans;
     private static FanSafety? _safety;
     private static readonly SensorTree Tree = new();
+    private static FrameMonitor? _frames;
+
+    /// <summary>One background tuning call per command kind; a duplicate request is answered by the running one (CONTRACT §1.7.2).</summary>
+    private sealed class InFlight { public int Busy; }
+    private static readonly InFlight TuningGetInFlight = new();
+    private static readonly InFlight TuningProbeInFlight = new();
+
     /// <summary>Set after the first telemetry tick built the sensor tree (values are then populated).</summary>
     private static readonly ManualResetEventSlim FirstTreeBuilt = new(false);
 
@@ -100,9 +113,12 @@ internal static class Program
 
         IsAdmin = DetectAdmin();
 
+        // CONTRACT §1.1: the only source of the PresentMon path. No PATH lookup, no fallback location.
+        string? presentMonPath = ArgValue(args, "--presentmon");
+
         if (args.Any(a => string.Equals(a, "--selftest", StringComparison.OrdinalIgnoreCase)))
         {
-            return SelfTest.Run();
+            return SelfTest.Run(presentMonPath);
         }
 
         SensorDriver = ComputeSensorDriver(IsAdmin);
@@ -113,7 +129,7 @@ internal static class Program
             return DumpSensors();
         }
 
-        Log($"nexum-agent {AgentVersion} (protocol {ProtocolVersion}) starting (pid {Environment.ProcessId}, admin={IsAdmin})");
+        Log($"nexum-agent {AgentVersion} (protocol {ProtocolVersion}) starting (pid {Environment.ProcessId}, admin={IsAdmin}, presentmon={(presentMonPath is null ? "not provided" : "provided")})");
         Log($"Sensor driver: kind={SensorDriver.Kind} version={SensorDriver.Version ?? "n/a"} ok={SensorDriver.Ok} reason={SensorDriver.Reason ?? "none"}");
         if (!IsAdmin)
         {
@@ -124,6 +140,7 @@ internal static class Program
         string fanFlag = FanFlag.CheckAtStart(IsAdmin);
         _fans = new FanController();
         _safety = new FanSafety(_fans, IsAdmin, fanFlag);
+        _frames = new FrameMonitor(presentMonPath, IsAdmin, Emit, Ack, Log);
 
         // Read stdin right away so 'shutdown' / EOF are honoured during the (slow) hardware open.
         // Every other command waits until 'hello' has been written (causal order).
@@ -158,6 +175,7 @@ internal static class Program
             FanFlag = fanFlag,
         });
         if (initError is not null) EmitError(initError);
+        _frames.EmitInitialSession(); // CONTRACT §1.6.6: one frameSession (stopped) right after hello
         InitDone.Set();
 
         if (!ExitSignal.IsSet)
@@ -559,12 +577,149 @@ internal static class Program
                     StartSpec();
                     break;
 
+                // ---- Frame capture (CONTRACT §1.6) ----
+                case "frames":
+                {
+                    if (!root.TryGetProperty("enabled", out var en) || en.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                    {
+                        Ack(cmd, false, InvalidCommand);
+                        break;
+                    }
+                    _frames!.SetEnabled(en.ValueKind == JsonValueKind.True);
+                    break;
+                }
+
+                case "frameTarget":
+                {
+                    if (!root.TryGetProperty("pid", out var pidEl))
+                    {
+                        Ack(cmd, false, InvalidCommand);
+                        break;
+                    }
+                    if (pidEl.ValueKind == JsonValueKind.Null)
+                    {
+                        _frames!.SetTarget(null);
+                        break;
+                    }
+                    if (pidEl.ValueKind != JsonValueKind.Number || !pidEl.TryGetInt32(out int targetPid) || targetPid <= 0)
+                    {
+                        Ack(cmd, false, InvalidCommand);
+                        break;
+                    }
+                    _frames!.SetTarget(targetPid);
+                    break;
+                }
+
+                case "frameWindow":
+                {
+                    if (!root.TryGetProperty("sec", out var secEl) || secEl.ValueKind != JsonValueKind.Number ||
+                        !secEl.TryGetDouble(out double sec) || !double.IsFinite(sec))
+                    {
+                        Ack(cmd, false, InvalidCommand);
+                        break;
+                    }
+                    _frames!.SetWindow((int)Math.Clamp(Math.Round(sec), 5, 120));
+                    break;
+                }
+
+                case "frameExclude":
+                {
+                    if (!root.TryGetProperty("names", out var namesEl) || namesEl.ValueKind != JsonValueKind.Array)
+                    {
+                        Ack(cmd, false, InvalidCommand);
+                        break;
+                    }
+                    // Sanitized by the agent's own rule; the names only feed the row filter, never a command line.
+                    var names = namesEl.EnumerateArray()
+                        .Select(e => e.ValueKind == JsonValueKind.String ? e.GetString() : null)
+                        .ToList();
+                    _frames!.SetExcludes(names);
+                    break;
+                }
+
+                case "presentingList":
+                    _frames!.EmitPresentingList();
+                    break;
+
+                // ---- GPU tuning, read-only (CONTRACT §1.7.2) ----
+                case "tuningGet":
+                    StartTuning(cmd, TuningGetInFlight, () => TuningService.GetState(IsAdmin));
+                    break;
+
+                case "tuningProbe":
+                {
+                    if (!root.TryGetProperty("write", out var wEl) || wEl.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                    {
+                        Ack(cmd, false, InvalidCommand);
+                        break;
+                    }
+                    if (wEl.ValueKind == JsonValueKind.True)
+                    {
+                        // The write probe is not part of v1.1 (ROADMAP Q5): rejected without calling the tuning code.
+                        Ack(cmd, false, "The write probe is not available in this version.");
+                        break;
+                    }
+                    StartTuning(cmd, TuningProbeInFlight, () => TuningService.ProbeReadOnly(IsAdmin));
+                    break;
+                }
+
                 default:
                     Ack(cmd, false, "Unknown command");
                     break;
             }
         }
         return false;
+    }
+
+    private const string InvalidCommand = "Invalid command";
+
+    /// <summary>
+    /// Runs a read-only tuning call on a background thread ("tuning", BelowNormal) and emits its reply.
+    /// While one of the same kind runs, a second request starts nothing: the running reply answers both.
+    /// </summary>
+    private static void StartTuning(string cmd, InFlight inFlight, Func<object> work)
+    {
+        if (Interlocked.CompareExchange(ref inFlight.Busy, 1, 0) != 0) return;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                object reply = work();
+                if (Volatile.Read(ref _shutdownStarted) == 0) Emit(reply);
+            }
+            catch (Exception ex)
+            {
+                // TuningService never throws by contract; last resort so Rust is not left waiting.
+                Log($"{cmd} failed: {ex}");
+                if (Volatile.Read(ref _shutdownStarted) == 0) Ack(cmd, false, "GPU tuning data could not be read.");
+            }
+            finally
+            {
+                Volatile.Write(ref inFlight.Busy, 0);
+            }
+        })
+        { IsBackground = true, Name = "tuning", Priority = ThreadPriority.BelowNormal };
+        try
+        {
+            thread.Start();
+        }
+        catch
+        {
+            Volatile.Write(ref inFlight.Busy, 0);
+            throw;
+        }
+    }
+
+    /// <summary>Value after <paramref name="flag"/> (case-insensitive flag match), or null.</summary>
+    internal static string? ArgValue(string[] args, string flag)
+    {
+        for (int i = 0; i < args.Length - 1; i++)
+        {
+            if (!string.Equals(args[i], flag, StringComparison.OrdinalIgnoreCase)) continue;
+            var v = args[i + 1];
+            return string.IsNullOrWhiteSpace(v) || v.StartsWith("--", StringComparison.Ordinal) ? null : v;
+        }
+        return null;
     }
 
     private static void WaitForHello()
@@ -645,7 +800,8 @@ internal static class Program
 
     /// <summary>
     /// Idempotent: stops the loop, restores fan control defaults (except in failsafe mode, CONTRACT
-    /// §1.5.4), deletes the fan flag when every restore succeeded, closes the Computer.
+    /// §1.5.4), deletes the fan flag when every restore succeeded, then stops frame capture within its
+    /// 2 s budget (CONTRACT §1.6.6: fans first), then closes the Computer.
     /// </summary>
     private static void Shutdown(string reason)
     {
@@ -658,6 +814,7 @@ internal static class Program
         var safety = _safety;
         if (svc is null)
         {
+            StopFrames();
             ExitSignal.Set();
             return;
         }
@@ -677,6 +834,9 @@ internal static class Program
                 catch (Exception ex) { Log($"Fan restore failed: {ex.Message}"); }
             }
 
+            // Fans first (above), then frame capture with its own hard budget, then the Computer.
+            StopFrames();
+
             // In failsafe the Computer must stay open: LHM's Close() would write back the stale manual
             // values this process captured (CONTRACT §1.5.4).
             bool failsafe = safety?.Failsafe ?? false;
@@ -690,10 +850,16 @@ internal static class Program
         }
     }
 
+    private static void StopFrames()
+    {
+        try { _frames?.Shutdown(FrameStopBudgetMs); }
+        catch (Exception ex) { Log($"Frame capture stop failed: {ex.Message}"); }
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Output
 
-    private static void Ack(string cmd, bool ok, string message) =>
+    internal static void Ack(string cmd, bool ok, string message) =>
         Emit(new AckMessage { Cmd = cmd, Ok = ok, Message = message });
 
     private static void EmitError(string message) => Emit(new ErrorMessage { Message = message });
@@ -705,7 +871,7 @@ internal static class Program
         EmitError(message);
     }
 
-    private static void Emit(object message)
+    internal static void Emit(object message)
     {
         string json;
         try
