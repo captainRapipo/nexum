@@ -7,11 +7,15 @@ import type {
   AgentStatus,
   DriverBackupResult,
   DriverInfo,
+  FanFailsafeState,
   FanPreset,
   PhysicalDisk,
   PurgeResult,
+  SensorTree,
   Settings,
   SystemInfo,
+  SystemSpec,
+  TrashCategoryId,
   TrashScan,
   Volume,
 } from "../types";
@@ -69,10 +73,9 @@ export const api = {
   scanTrash: (includeBrowser: boolean) =>
     call<TrashScan>("scan_trash", { includeBrowser }, (m) => m.scanTrash(includeBrowser)),
 
-  purgeTrash: (categories: readonly string[], flushStandby: boolean) =>
-    call<PurgeResult>("purge_trash", { categories: [...categories], flushStandby }, (m) =>
-      m.purgeTrash([...categories], flushStandby),
-    ),
+  /** [BREAKING 1.0.0-gate] no flushStandby argument. */
+  purgeTrash: (categories: readonly TrashCategoryId[]) =>
+    call<PurgeResult>("purge_trash", { categories: [...categories] }, (m) => m.purgeTrash([...categories])),
 
   exportDrivers: (format: "json" | "csv") =>
     call<string>("export_drivers", { format }, (m) => m.exportDrivers(format)),
@@ -92,8 +95,6 @@ export const api = {
     return call<void>("set_fan_control", { id, pct: v }, (m) => m.setFanControl(id, v));
   },
 
-  flushStandby: () => call<void>("flush_standby", undefined, (m) => m.flushStandby()),
-
   getSettings: () => call<Settings>("get_settings", undefined, (m) => m.getSettings()),
 
   saveSettings: (settings: Settings) =>
@@ -105,6 +106,33 @@ export const api = {
 
   openExternal: (target: string) =>
     call<void>("open_external", { target }, (m) => m.openExternal(target)),
+
+  /** [NEW] Cached LHM sensor tree, or null when the agent is down / did not answer within 5 s. */
+  getSensorTree: () => call<SensorTree | null>("get_sensor_tree", undefined, (m) => m.getSensorTree()),
+
+  /** [NEW] Prefer `useSensorStream(active)` (ref-counted) over calling this directly. */
+  setSensorStream: (on: boolean) => call<void>("set_sensor_stream", { on }, (m) => m.setSensorStream(on)),
+
+  /** [NEW] Reset session min/max/avg; `null` = every sensor. */
+  resetSensorStats: (ids: string[] | null) =>
+    call<void>("reset_sensor_stats", { ids: ids == null ? null : [...ids] }, (m) => m.resetSensorStats(ids)),
+
+  /** [NEW] Cached system spec; `refresh: true` re-queries the agent (F5 in the System view). */
+  getSystemSpec: (refresh = false) =>
+    call<SystemSpec>("get_system_spec", { refresh }, (m) => m.getSystemSpec(refresh)),
+
+  /** [NEW] */
+  getFanFailsafeState: () => call<FanFailsafeState>("get_fan_failsafe_state", undefined, (m) => m.getFanFailsafeState()),
+
+  /** [NEW] Clears only kind "previousBoot"; rejects otherwise. */
+  dismissFanFailsafe: () => call<FanFailsafeState>("dismiss_fan_failsafe", undefined, (m) => m.dismissFanFailsafe()),
+
+  /** [NEW] Relaunch elevated (UAC) and exit this instance. Rejects if already admin or UAC is cancelled. */
+  restartAsAdmin: () => call<void>("restart_as_admin", undefined, (m) => m.restartAsAdmin()),
+
+  /** [NEW] Opens Windows Reliability Monitor (perfmon /rel). */
+  openReliabilityMonitor: () =>
+    call<void>("open_reliability_monitor", undefined, (m) => m.openReliabilityMonitor()),
 
   /** App version (Tauri app metadata when native, package.json version otherwise). */
   getAppVersion: async (): Promise<string> => {
@@ -162,3 +190,6 @@ export function subscribe<T>(name: string, cb: (payload: T) => void): () => void
     }
   };
 }
+
+/** Official PawnIO site (MF-2/MF-3). The only outbound action is handing this URL to the browser. */
+export const PAWNIO_URL = "https://pawnio.eu/";
