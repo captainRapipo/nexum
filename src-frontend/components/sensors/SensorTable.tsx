@@ -74,6 +74,8 @@ function SensorTableImpl(props: SensorTableProps) {
   } = props;
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  /** The focusable treegrid (header + body); keyboard handling and aria-activedescendant live here. */
+  const gridRef = useRef<HTMLDivElement>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewH, setViewH] = useState(480);
   const scrollRaf = useRef(0);
@@ -219,7 +221,7 @@ function SensorTableImpl(props: SensorTableProps) {
     if (el) {
       el.scrollTop = Math.max(0, i * ROW_H - el.clientHeight / 3);
       setScrollTop(el.scrollTop);
-      el.focus({ preventScroll: true });
+      gridRef.current?.focus({ preventScroll: true });
     }
     // Runs only when a new request arrives or its row appears, not on every row-list change.
   }, [focusRequest, indexByKey.has(focusRequest?.key ?? "")]); // eslint-disable-line
@@ -251,7 +253,7 @@ function SensorTableImpl(props: SensorTableProps) {
     [sensorRowAt, labelOf, indexByKey, ensureVisible],
   );
 
-  const refocus = () => requestAnimationFrame(() => scrollRef.current?.focus({ preventScroll: true }));
+  const refocus = () => requestAnimationFrame(() => gridRef.current?.focus({ preventScroll: true }));
 
   const commitRename = useCallback(() => {
     const r = sensorRowAt(editingKey);
@@ -413,7 +415,7 @@ function SensorTableImpl(props: SensorTableProps) {
       e.preventDefault();
       const r = sensorRowAt(focusKey);
       if (r) startRename(r.key);
-      else scrollRef.current?.focus({ preventScroll: true });
+      else gridRef.current?.focus({ preventScroll: true });
     };
     window.addEventListener("keydown", onWinKey);
     return () => window.removeEventListener("keydown", onWinKey);
@@ -438,6 +440,7 @@ function SensorTableImpl(props: SensorTableProps) {
         <SensorRow
           key={r.key}
           row={r}
+          rowIndex={i + 2}
           domId={domIdOf(r.key)}
           top={top}
           label={labelOf(r.meta.id, r.meta.name)}
@@ -466,6 +469,7 @@ function SensorTableImpl(props: SensorTableProps) {
         <TreeNodeRow
           key={r.key}
           row={r}
+          rowIndex={i + 2}
           domId={domIdOf(r.key)}
           top={top}
           selected={selected}
@@ -477,50 +481,73 @@ function SensorTableImpl(props: SensorTableProps) {
     }
   }
 
+  // ARIA treegrid (header row + virtualized body). aria-rowcount / aria-rowindex let assistive tech
+  // announce positions in the full list although only the visible window is in the DOM.
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div
+      ref={gridRef}
+      role="treegrid"
+      aria-label="Hardware sensors"
+      aria-multiselectable="true"
+      aria-rowcount={rows.length + 1}
+      aria-colcount={6}
+      aria-activedescendant={focusKey && focusIndex >= first && focusIndex < last ? domIdOf(focusKey) : undefined}
+      tabIndex={0}
+      onKeyDown={onKeyDown}
+      onFocus={(e) => {
+        if (e.target === e.currentTarget && focusKey == null && rows.length > 0) setFocusKey(rows[0].key);
+      }}
+      className={cn(
+        "flex min-h-0 flex-1 flex-col rounded-b-lg outline-none",
+        "focus-visible:shadow-[inset_0_0_0_1px_rgba(45,212,191,0.35)]",
+        stale && "[&_.num]:opacity-55",
+      )}
+    >
       {/* Column header (reserves the same scrollbar gutter as the body so columns align) */}
-      <div
-        className="grid shrink-0 items-end gap-x-3 overflow-hidden border-b border-line pb-1.5 pr-3 scrollbar-gutter-stable"
-        style={{ gridTemplateColumns: GRID_COLS }}
-        aria-hidden="true"
-      >
-        {["Sensor", "Value", "Min", "Max", "Avg", "60 s"].map((h, i) => (
-          <span
-            key={h}
-            className={cn(
-              "label-caps [--label-color:#64748b] [--label-size:10px]",
-              i === 0 ? "pl-3" : i === 5 ? "pl-2 normal-case tracking-[0.08em]" : "text-right",
-            )}
-          >
-            {h}
-          </span>
-        ))}
+      <div role="rowgroup" className="shrink-0">
+        <div
+          role="row"
+          aria-rowindex={1}
+          className="grid items-end gap-x-3 overflow-hidden border-b border-line pb-1.5 pr-3 scrollbar-gutter-stable"
+          style={{ gridTemplateColumns: GRID_COLS }}
+        >
+          {COLUMNS.map((h, i) => (
+            <span
+              key={h.label}
+              role="columnheader"
+              aria-colindex={i + 1}
+              aria-label={h.aria}
+              className={cn(
+                "label-caps [--label-color:#64748b] [--label-size:10px]",
+                i === 0 ? "pl-3" : i === 5 ? "pl-2 normal-case tracking-[0.08em]" : "text-right",
+              )}
+            >
+              {h.label}
+            </span>
+          ))}
+        </div>
       </div>
 
       <div
         ref={scrollRef}
-        role="tree"
-        aria-label="Hardware sensors"
-        aria-multiselectable="true"
-        aria-activedescendant={focusKey && focusIndex >= first && focusIndex < last ? domIdOf(focusKey) : undefined}
-        tabIndex={0}
+        role="rowgroup"
         onScroll={onScroll}
-        onKeyDown={onKeyDown}
-        onFocus={() => {
-          if (focusKey == null && rows.length > 0) setFocusKey(rows[0].key);
-        }}
-        className={cn(
-          "relative min-h-0 flex-1 overflow-y-auto overflow-x-hidden outline-none scrollbar-gutter-stable",
-          "focus-visible:shadow-[inset_0_0_0_1px_rgba(45,212,191,0.35)] rounded-b-lg",
-          stale && "[&_.num]:opacity-55",
-        )}
+        className="relative min-h-0 flex-1 overflow-y-auto overflow-x-hidden scrollbar-gutter-stable"
       >
         <div style={{ height: rows.length * ROW_H, position: "relative" }}>{items}</div>
       </div>
     </div>
   );
 }
+
+const COLUMNS: { label: string; aria: string }[] = [
+  { label: "Sensor", aria: "Sensor" },
+  { label: "Value", aria: "Current value" },
+  { label: "Min", aria: "Session minimum" },
+  { label: "Max", aria: "Session maximum" },
+  { label: "Avg", aria: "Session average" },
+  { label: "60 s", aria: "Last 60 seconds" },
+];
 
 const EMPTY: readonly (number | null)[] = [];
 

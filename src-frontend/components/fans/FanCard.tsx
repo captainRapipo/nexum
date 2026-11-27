@@ -203,7 +203,10 @@ export default function FanCard({ fan, label, onRename, maxRpm, canControl, held
           />
         ) : (
           <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/[0.06]">
-            <div className="h-full rounded-full bg-white/20" style={{ width: `${clampPct(telemetryPct ?? 0)}%` }} />
+            {/* No duty reading: leave the track empty rather than drawing a made-up level. */}
+            {telemetryPct != null && Number.isFinite(telemetryPct) && (
+              <div className="h-full rounded-full bg-white/20" style={{ width: `${clampPct(telemetryPct)}%` }} />
+            )}
           </div>
         )}
         <div className="mt-1 flex justify-between font-mono text-[9.5px] text-muted">

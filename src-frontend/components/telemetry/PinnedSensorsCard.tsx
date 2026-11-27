@@ -13,15 +13,16 @@ import { needForHardware } from "./sensorHelpers";
 /**
  * Pinned sensors (Dashboard): the user's pins, or the default rule (CPU temperature, GPU hot spot, VRM,
  * system-drive temperature) while nothing was pinned yet. Values come from the sensor stream, which is
- * switched on only while this card is mounted.
+ * switched on only while this card is mounted and shows at least one pin.
  */
 export default function PinnedSensorsCard() {
-  useSensorStream(true);
   const { agent } = useTelemetry();
   const { settings } = useSettings();
   const tempUnit = settings?.tempUnit ?? "C";
   const { tree, byId, statsOf } = useSensors();
   const { pinned, labelOf, togglePin } = useSensorLabels();
+  // The tree itself comes from get_sensor_tree; values are needed only while something is pinned.
+  useSensorStream(pinned.length > 0);
 
   const openSensors = () => requestNavigate("sensors");
 

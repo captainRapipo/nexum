@@ -425,9 +425,11 @@ export function deriveHealth(input: DeriveHealthInput): SystemHealth {
     );
   }
 
-  // 9. Limited mode
-  if (!offline && agent && (agent.limitedReasons?.length ?? 0) > 0) {
-    const notElevated = agent.limitedReasons.includes("notElevated");
+  // 9. Limited mode. ROADMAP MF-6: Optimal needs an *elevated* agent, so a non-elevated agent counts as
+  // limited even if a core that predates protocol 2 sent no limitedReasons.
+  const reasons = agent?.limitedReasons ?? [];
+  if (!offline && agent && (reasons.length > 0 || !agent.isAdmin)) {
+    const notElevated = reasons.includes("notElevated") || !agent.isAdmin;
     const missing = agent.missingFeatures ?? [];
     out.push(
       cond(9, {
@@ -442,7 +444,7 @@ export function deriveHealth(input: DeriveHealthInput): SystemHealth {
         action: notElevated
           ? { label: "Restart as administrator", command: "restartAsAdmin" }
           : { label: "Get PawnIO", command: "getPawnIo" },
-        stateKey: agent.limitedReasons.join("+"),
+        stateKey: (reasons.length > 0 ? reasons : ["notElevated"]).join("+"),
       }),
     );
   }

@@ -39,6 +39,13 @@ function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 }
 
+/** "Last 2 min" / "Last 45 s" from the packet timestamps (the poll interval is not always 1 s). */
+function spanText(win: readonly TelemetryPacket[]): string {
+  if (win.length < 2) return "Live";
+  const secs = Math.max(1, Math.round((win[win.length - 1].ts - win[0].ts) / 1000));
+  return secs >= 90 ? `Last ${Math.round(secs / 60)} min` : `Last ${secs} s`;
+}
+
 interface ChartData {
   labels: string[];
   values: Record<SeriesKey, (number | null)[]>;
@@ -222,7 +229,7 @@ export default function LiveChart() {
       bodyClassName="flex min-h-0 flex-1 flex-col"
       actions={
         <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted max-[1439px]:hidden">
-          Last {Math.min(data.labels.length, WINDOW)} s
+          {spanText(source.slice(-WINDOW))}
         </span>
       }
     >

@@ -6,6 +6,8 @@ import { HW_ICON, INDENT, KIND_ICON, KIND_LABEL, ROOT_ICON, ROW_H, type GroupRow
 
 export interface TreeNodeRowProps {
   row: RootRow | HwRow | GroupRow;
+  /** 1-based position in the treegrid (row 1 is the column header). */
+  rowIndex: number;
   domId: string;
   top: number;
   selected: boolean;
@@ -15,7 +17,7 @@ export interface TreeNodeRowProps {
 }
 
 /** Hostname root, hardware node or sensor-kind group header. Subtle, never zebra. */
-function TreeNodeRowImpl({ row, domId, top, selected, focused, onPointerSelect, onToggle }: TreeNodeRowProps) {
+function TreeNodeRowImpl({ row, rowIndex, domId, top, selected, focused, onPointerSelect, onToggle }: TreeNodeRowProps) {
   let Icon = ROOT_ICON;
   let title = "";
   let meta = "";
@@ -37,7 +39,8 @@ function TreeNodeRowImpl({ row, domId, top, selected, focused, onPointerSelect, 
   return (
     <div
       id={domId}
-      role="treeitem"
+      role="row"
+      aria-rowindex={rowIndex}
       aria-level={row.level + 1}
       aria-selected={selected}
       aria-expanded={row.expandable ? row.expanded : undefined}
@@ -51,7 +54,14 @@ function TreeNodeRowImpl({ row, domId, top, selected, focused, onPointerSelect, 
       )}
       style={{ top, height: ROW_H, gridTemplateColumns: GRID_COLS }}
     >
-      <div className="col-span-6 flex min-w-0 items-center gap-1.5" style={{ paddingLeft: 4 + row.level * INDENT }}>
+      <div
+        role="gridcell"
+        aria-colindex={1}
+        aria-colspan={6}
+        aria-label={meta ? `${title}, ${row.kind === "root" ? meta : `${meta} sensors`}` : title}
+        className="col-span-6 flex min-w-0 items-center gap-1.5"
+        style={{ paddingLeft: 4 + row.level * INDENT }}
+      >
         <button
           type="button"
           tabIndex={-1}

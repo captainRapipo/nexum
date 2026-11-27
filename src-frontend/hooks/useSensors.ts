@@ -40,6 +40,13 @@ export interface SensorsValue {
 
 const SensorsContext = createContext<SensorsValue | null>(null);
 
+/** Stable actions only: consumers of this context do not re-render on every values packet. */
+interface SensorsActions {
+  reset: (ids: string[] | null) => Promise<void>;
+  refreshTree: () => Promise<void>;
+}
+const SensorsActionsContext = createContext<SensorsActions | null>(null);
+
 interface Sample {
   ts: number;
   value: ReadonlyArray<number | null>;
@@ -182,12 +189,28 @@ export function SensorsProvider({ children }: { children: ReactNode }) {
     [tree, values, tick, byId, statsOf, historyOf, reset, refreshTree],
   );
 
-  return createElement(SensorsContext.Provider, { value }, children);
+  const actions = useMemo<SensorsActions>(() => ({ reset, refreshTree }), [reset, refreshTree]);
+
+  return createElement(
+    SensorsActionsContext.Provider,
+    { value: actions },
+    createElement(SensorsContext.Provider, { value }, children),
+  );
 }
 
 export function useSensors(): SensorsValue {
   const ctx = useContext(SensorsContext);
   if (!ctx) throw new Error("useSensors() must be used inside <SensorsProvider>");
+  return ctx;
+}
+
+/**
+ * `refreshTree` / `reset` without subscribing to the value stream. App's shell uses it for F5 so the
+ * whole shell does not re-render on every `sensor-values` packet.
+ */
+export function useSensorsActions(): SensorsActions {
+  const ctx = useContext(SensorsActionsContext);
+  if (!ctx) throw new Error("useSensorsActions() must be used inside <SensorsProvider>");
   return ctx;
 }
 

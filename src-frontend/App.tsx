@@ -19,7 +19,7 @@ import { SettingsProvider, useSettings } from "./hooks/useSettings";
 import { SystemInfoProvider, useSystemInfo } from "./hooks/useSystemInfo";
 import { DriverScanProvider, useDriverScan } from "./hooks/useDriverScan";
 import { TelemetryProvider } from "./hooks/useTelemetryStream";
-import { SensorsProvider, useSensors } from "./hooks/useSensors";
+import { SensorsProvider, useSensorsActions } from "./hooks/useSensors";
 import { SystemSpecProvider, useSystemSpecRefresh } from "./hooks/useSystemSpec";
 import { HealthProvider } from "./hooks/useHealth";
 import { TopBar } from "./components/layout/TopBar";
@@ -187,7 +187,8 @@ function Shell() {
   const { settings } = useSettings();
   const { refresh: refreshSystem, loading: systemLoading } = useSystemInfo();
   const { rescan, loading: scanLoading } = useDriverScan();
-  const { refreshTree } = useSensors();
+  // Actions only: subscribing to useSensors() here would re-render the whole shell on every values packet.
+  const { refreshTree } = useSensorsActions();
   const refreshSpec = useSystemSpecRefresh();
 
   const settingsRef = useRef(settings);
@@ -265,7 +266,11 @@ function Shell() {
       // Caret-browsing prompt in WebView2.
       if (key === "F7") e.preventDefault();
 
-      if (typing) return;
+      if (typing) {
+        // Keep WebView2 defaults (help, find bar, …) off our F-keys; the text field keeps every other key.
+        if (FKEY_MAP[key] && !e.ctrlKey && !e.altKey && !e.metaKey) e.preventDefault();
+        return;
+      }
 
       // Ctrl+1..7 → VIEW_ORDER[n-1]
       if (e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && /^[1-7]$/.test(key)) {

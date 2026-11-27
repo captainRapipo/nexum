@@ -137,14 +137,16 @@ export default function StorageView() {
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatTile
           label="Drive health"
-          value={total > 0 ? `${attention} of ${total}` : "—"}
+          value={total > 0 ? (attention === 0 && unknown >= total ? "Unknown" : `${attention} of ${total}`) : "—"}
           accent="silver"
           valueTone={total > 0 ? healthSummary.tone : undefined}
           icon={<HeartPulse size={15} />}
           title={ATTENTION_RULE}
           sub={
             total > 0
-              ? `${total === 1 ? "drive" : "drives"} ${attention === 1 ? "needs" : "need"} attention${unknown > 0 ? ` · ${unknown} unknown` : ""}`
+              ? attention === 0 && unknown >= total
+                ? `No S.M.A.R.T. data for ${total === 1 ? "this drive" : `any of ${total} drives`}`
+                : `${total === 1 ? "drive" : "drives"} ${attention === 1 ? "needs" : "need"} attention${unknown > 0 ? ` · ${unknown} unknown` : ""}`
               : "Waiting for drive data"
           }
         />

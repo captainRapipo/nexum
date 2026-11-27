@@ -61,9 +61,9 @@ export default function DrivesCard() {
         <>
           <div className="mb-2 flex items-center justify-between gap-2">
             <span className="truncate text-[11.5px] text-silver" title={ATTENTION_RULE}>
-              {attentionText(attention, rows.length)}
+              {attentionText(attention, rows.length, unknown)}
             </span>
-            {unknown > 0 && (
+            {unknown > 0 && unknown < rows.length && (
               <span className="shrink-0 text-[10.5px] text-muted" title="Drives whose health cannot be read are never shown as good.">
                 {unknown} unknown
               </span>

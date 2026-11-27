@@ -18,6 +18,8 @@ export interface SensorStats {
 
 export interface SensorRowProps {
   row: SensorRowModel;
+  /** 1-based position in the treegrid (row 1 is the column header). */
+  rowIndex: number;
   domId: string;
   top: number;
   label: string;
@@ -86,6 +88,7 @@ function ActionButton({
 function SensorRowImpl(props: SensorRowProps) {
   const {
     row,
+    rowIndex,
     domId,
     top,
     label,
@@ -142,7 +145,8 @@ function SensorRowImpl(props: SensorRowProps) {
   return (
     <div
       id={domId}
-      role="treeitem"
+      role="row"
+      aria-rowindex={rowIndex}
       aria-level={row.level + 1}
       aria-selected={selected}
       onMouseDown={(e) => onPointerSelect(e, row.key)}
@@ -157,7 +161,7 @@ function SensorRowImpl(props: SensorRowProps) {
       style={{ top, height: ROW_H, gridTemplateColumns: GRID_COLS }}
     >
       {/* Sensor name */}
-      <div className="flex min-w-0 items-center gap-1.5" style={{ paddingLeft: 12 + row.level * INDENT }}>
+      <div role="gridcell" aria-colindex={1} className="flex min-w-0 items-center gap-1.5" style={{ paddingLeft: 12 + row.level * INDENT }}>
         {editing ? (
           <input
             ref={inputRef}
@@ -221,15 +225,20 @@ function SensorRowImpl(props: SensorRowProps) {
       </div>
 
       {/* Value / Min / Max / Avg */}
-      <span className="num whitespace-nowrap text-right tabular-nums text-ink">
+      <span role="gridcell" aria-colindex={2} className="num whitespace-nowrap text-right tabular-nums text-ink">
         {value == null ? <Unavailable reason={nullReason} compact /> : fmt(value)}
       </span>
-      <span className="num whitespace-nowrap text-right tabular-nums text-slate-400">{fmt(stats?.min)}</span>
-      <span className="num whitespace-nowrap text-right tabular-nums text-slate-300">{fmt(stats?.max)}</span>
-      <span className="num whitespace-nowrap text-right tabular-nums text-slate-400">{fmt(stats?.avg)}</span>
+      <span role="gridcell" aria-colindex={3} className="num whitespace-nowrap text-right tabular-nums text-slate-400">{fmt(stats?.min)}</span>
+      <span role="gridcell" aria-colindex={4} className="num whitespace-nowrap text-right tabular-nums text-slate-300">{fmt(stats?.max)}</span>
+      <span role="gridcell" aria-colindex={5} className="num whitespace-nowrap text-right tabular-nums text-slate-400">{fmt(stats?.avg)}</span>
 
       {/* 60 s sparkline (none for static sensors) */}
-      <div className="flex h-full items-center pl-2 opacity-85" aria-hidden="true">
+      <div
+        role="gridcell"
+        aria-colindex={6}
+        aria-label={meta.static ? "No history (fixed value)" : "60 second history"}
+        className="flex h-full items-center pl-2 opacity-85"
+      >
         {meta.static ? null : <Sparkline data={history} color={sparkColor(meta.kind)} height={16} fill={false} strokeWidth={1.3} />}
       </div>
     </div>

@@ -149,8 +149,14 @@ export default function StorageGauge() {
       accent="teal"
       actions={
         vol ? (
-          <StatusPill tone={crit ? "crit" : warn ? "warn" : "ok"} title={`${vol.letter || "System volume"}: ${SPACE_RULE}`}>
+          // Free space only: the text says so, so a green pill is never read as "this drive is healthy"
+          // (drive health lives in the Drives card and on Storage).
+          <StatusPill
+            tone={crit ? "crit" : warn ? "warn" : "ok"}
+            title={`${vol.letter || "System volume"} free space. ${SPACE_RULE} Drive health is shown under Drives.`}
+          >
             {vol.letter || "SYS"}
+            {freePct !== null ? ` ${freePct.toFixed(0)}% free` : ""}
           </StatusPill>
         ) : null
       }

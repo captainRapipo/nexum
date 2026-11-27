@@ -14,7 +14,7 @@ import { toast } from "../components/feedback/Toast";
 import FanCard, { FAN_CARD_CSS } from "../components/fans/FanCard";
 import PresetSelector, { type SelectablePreset } from "../components/fans/PresetSelector";
 import CoolingTemps from "../components/fans/CoolingTemps";
-import { CpuLoadPanel, GpuCoolingPanel } from "../components/fans/HardwarePanels";
+import { GpuCoolingPanel } from "../components/fans/HardwarePanels";
 import { isGpuFan } from "../components/telemetry/sensorHelpers";
 
 const OVERRIDE_MS = 5000;
@@ -286,7 +286,9 @@ export default function CoolingView() {
         )}
       </GlassCard>
 
-      <div className="grid grid-cols-1 gap-5 xl:grid-cols-3">
+      {/* ROADMAP §6.5 / CONTRACT §4.10: no duplicated CPU / RAM panels here. GPU fans stay (read-only),
+          because the motherboard grid above never lists them. */}
+      <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
         <CoolingTemps agent={agent} tempUnit={unit} />
         <GpuCoolingPanel
           gpus={latest?.gpus ?? []}
@@ -296,7 +298,6 @@ export default function CoolingView() {
           unit={unit}
           agent={agent}
         />
-        <CpuLoadPanel cpu={latest?.cpu ?? null} unit={unit} agent={agent} />
       </div>
     </div>
   );

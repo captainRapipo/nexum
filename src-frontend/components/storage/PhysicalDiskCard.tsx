@@ -128,18 +128,24 @@ export default function PhysicalDiskCard({
         />
         <Readout
           label="Life"
-          value={life == null ? <Unavailable compact reason={telemetry ? "unsupported" : smartReason} /> : `${Math.round(life)}%`}
+          value={life == null ? <Unavailable compact reason={smartReason} /> : `${Math.round(life)}%`}
           valueClass={life == null ? undefined : toneCls.text}
           title={`Remaining rated life. State: ${view.label}`}
         />
         <Readout
           label="Written"
-          value={fmtTb(telemetry?.tbw)}
+          value={telemetry?.tbw != null ? fmtTb(telemetry.tbw) : <Unavailable compact reason={smartReason} />}
           unit={telemetry?.tbw != null ? "TB" : undefined}
         />
         <Readout
           label="Power-on"
-          value={telemetry?.powerOnHours != null ? fmtCount(telemetry.powerOnHours) : "—"}
+          value={
+            telemetry?.powerOnHours != null ? (
+              fmtCount(telemetry.powerOnHours)
+            ) : (
+              <Unavailable compact reason={smartReason} />
+            )
+          }
           unit={telemetry?.powerOnHours != null ? "h" : undefined}
         />
       </div>

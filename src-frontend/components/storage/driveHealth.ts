@@ -24,7 +24,13 @@ export function lifeText(tele: DiskTelemetry | null | undefined): string | null 
   return `Life ${Math.round(Math.max(0, Math.min(100, h)))}%`;
 }
 
-/** "1 of 3 drives needs attention" / "2 of 3 drives need attention". */
-export function attentionText(n: number, total: number): string {
+/**
+ * "1 of 3 drives needs attention" / "2 of 3 drives need attention". When no drive could be read at all,
+ * "0 of 3 need attention" would read as an all-clear, so say that health is unknown instead.
+ */
+export function attentionText(n: number, total: number, unknown = 0): string {
+  if (n === 0 && total > 0 && unknown >= total) {
+    return total === 1 ? "Drive health unknown" : `Health unknown for all ${total} drives`;
+  }
   return `${n} of ${total} ${total === 1 ? "drive" : "drives"} ${n === 1 ? "needs" : "need"} attention`;
 }
