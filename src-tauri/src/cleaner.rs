@@ -1,4 +1,5 @@
-//! Deep Purge engine (CONTRACT §3).
+//! Cache cleanup engine (CONTRACT §3). Internal names (`scan_trash`, `purge_trash`) are not UI
+//! copy.
 //!
 //! Safety model:
 //! * Only files *inside* enumerated category roots are candidates; a root itself is never
@@ -21,21 +22,24 @@
 //!   inside the canonical root and outside the deny-list. This closes the TOCTOU window where
 //!   a directory is swapped for a junction between scan and purge.
 //! * Each file is handled individually; any failure increments `skipped`.
-//! * `scan_trash` and `purge_trash` share the same enumerator (`plan_category`).
+//! * `scan_trash` and `purge_trash` share the same enumerator (`plan_category`) and the same
+//!   skip rules (running apps, pending Windows updates, dump retention), so numbers match.
+//! * Crash dumps keep the 5 newest per folder and anything younger than 30 days; `MEMORY.DMP` is
+//!   its own explicit opt-in. Prefetch is never touched.
+//! * The Delivery Optimization cache is cleared only through Microsoft's cmdlet, never by
+//!   deleting files under the NetworkService profile.
+//! * Every purge writes a JSONL audit log; without it the purge does not start.
 
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 
-use serde::Serialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, BOOLEAN, HANDLE, HWND};
+use windows::Win32::Foundation::{BOOLEAN, HANDLE, HWND};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FileDispositionInfo, FileDispositionInfoEx, GetFileInformationByHandle,
     GetFinalPathNameByHandleW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
@@ -52,8 +56,13 @@ use windows::Win32::UI::Shell::{
     SHERB_NOSOUND, SHQUERYRBINFO,
 };
 
+use crate::purge_log::PurgeLog;
 use crate::state::AppState;
-use crate::util::{known_folder, windows_dir};
+use crate::system_info::{is_admin, query_soft, wmi_connection, NS_CIMV2};
+use crate::util::{
+    fmt_bytes, hklm_key_state, hklm_value_state, known_folder, now_ms, to_wide, unix_ms,
+    win32_code, windows_dir, OwnedHandle,
+};
 
 const REPARSE_ATTR: u32 = FILE_ATTRIBUTE_REPARSE_POINT.0; // 0x400
 const DIRECTORY_ATTR: u32 = FILE_ATTRIBUTE_DIRECTORY.0; // 0x10
@@ -64,7 +73,20 @@ const RECENT_GUARD: Duration = Duration::from_secs(24 * 60 * 60);
 /// (`C:\Windows\Temp` = 2).
 const MIN_ROOT_DEPTH: usize = 2;
 const MAX_DEPTH: usize = 64;
-const STANDBY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Crash dumps: the newest N per folder are always kept (CONTRACT §3 rule 7).
+const KEEP_NEWEST_DUMPS: usize = 5;
+/// `Delete-DeliveryOptimizationCache` time limit (CONTRACT §3 rule 10).
+const DO_TIMEOUT: Duration = Duration::from_secs(120);
+const DO_ACTION: &str = "Delete-DeliveryOptimizationCache";
+const RECYCLE_ACTION: &str = "SHEmptyRecycleBinW";
+
+pub const NOTE_NEEDS_ADMIN: &str = "Needs administrator rights.";
+pub const NOTE_UPDATE_PENDING: &str =
+    "Skipped the Windows Update download cache: an update is waiting to install or restart.";
+const SHADER_DESCRIPTION: &str =
+    "Only clear if a game shows corrupted graphics. Expect stutter while caches rebuild.";
+const DUMPS_DESCRIPTION: &str = "Keeps the 5 newest dumps and anything less than 30 days old. Windows and support staff use dumps to diagnose crashes.";
+const MEMORY_DUMP_TAIL: &str = "Delete it only if you do not need it for troubleshooting.";
 
 // ---------------------------------------------------------------------------------------------
 // Public shapes (CONTRACT §2.1)
@@ -81,14 +103,21 @@ pub struct TrashCategory {
     pub enabled: bool,
     pub optional: bool,
     pub requires_admin: bool,
+    /// False when the category cannot run in this session (needs administrator rights).
+    pub available: bool,
+    pub unavailable_reason: Option<String>,
+    /// Display-ready sentence about parts that will be skipped, or null.
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrashScan {
     pub categories: Vec<TrashCategory>,
+    /// Bytes of available categories only.
     pub total_bytes: u64,
     pub duration_ms: u64,
+    pub is_admin: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,6 +128,7 @@ pub struct PurgeCategoryResult {
     pub freed_bytes: u64,
     pub deleted: u64,
     pub skipped: u64,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,8 +139,8 @@ pub struct PurgeResult {
     pub files_skipped: u64,
     pub duration_ms: u64,
     pub per_category: Vec<PurgeCategoryResult>,
-    pub standby_flushed: Option<bool>,
-    pub standby_message: Option<String>,
+    /// Absolute path of this run's JSONL audit log.
+    pub log_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -130,34 +160,38 @@ pub struct PurgeProgress {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CategoryId {
     Temp,
-    Recycle,
     WuCache,
-    Shader,
-    Browser,
     Logs,
-    Standby,
+    Dumps,
+    MemoryDump,
+    Shader,
+    Recycle,
+    Browser,
 }
 
 impl CategoryId {
-    pub const ALL: [CategoryId; 7] = [
+    /// Display / processing order (CONTRACT §3.1 table order).
+    pub const ALL: [CategoryId; 8] = [
         CategoryId::Temp,
-        CategoryId::Recycle,
         CategoryId::WuCache,
-        CategoryId::Shader,
-        CategoryId::Browser,
         CategoryId::Logs,
-        CategoryId::Standby,
+        CategoryId::Dumps,
+        CategoryId::MemoryDump,
+        CategoryId::Shader,
+        CategoryId::Recycle,
+        CategoryId::Browser,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             CategoryId::Temp => "temp",
-            CategoryId::Recycle => "recycle",
             CategoryId::WuCache => "wu-cache",
-            CategoryId::Shader => "shader",
-            CategoryId::Browser => "browser",
             CategoryId::Logs => "logs",
-            CategoryId::Standby => "standby",
+            CategoryId::Dumps => "dumps",
+            CategoryId::MemoryDump => "memory-dump",
+            CategoryId::Shader => "shader",
+            CategoryId::Recycle => "recycle",
+            CategoryId::Browser => "browser",
         }
     }
 
@@ -168,40 +202,172 @@ impl CategoryId {
             .find(|c| c.as_str().eq_ignore_ascii_case(s))
     }
 
+    /// Exact labels (CONTRACT §3.1).
     pub fn label(self) -> &'static str {
         match self {
-            CategoryId::Temp => "Temporary Files",
+            CategoryId::Temp => "Temporary files",
+            CategoryId::WuCache => "Windows Update cache",
+            CategoryId::Logs => "Error reports and old logs",
+            CategoryId::Dumps => "Old crash dumps",
+            CategoryId::MemoryDump => "Full memory dump (MEMORY.DMP)",
+            CategoryId::Shader => "Shader caches",
             CategoryId::Recycle => "Recycle Bin",
-            CategoryId::WuCache => "Windows Update Cache",
-            CategoryId::Shader => "GPU Shader Caches",
-            CategoryId::Browser => "Browser & App Caches",
-            CategoryId::Logs => "Logs & Crash Dumps",
-            CategoryId::Standby => "RAM Standby List",
+            CategoryId::Browser => "Browser and Discord caches",
         }
     }
 
-    pub fn description(self) -> &'static str {
+    /// Static descriptions; `shader` and `memory-dump` are completed by [`describe`].
+    fn base_description(self) -> &'static str {
         match self {
-            CategoryId::Temp => "User %TEMP% and C:\\Windows\\Temp files older than 24 hours. Locked and in-use files are skipped.",
-            CategoryId::Recycle => "Empties the Recycle Bin on all mounted drives.",
-            CategoryId::WuCache => "Windows Update download leftovers and the Delivery Optimization cache (files older than 24 hours).",
-            CategoryId::Shader => "DirectX, NVIDIA, AMD and Intel shader caches. They are rebuilt automatically.",
-            CategoryId::Browser => "Chrome, Edge, Firefox and Discord caches. Logins, cookies and history are never touched.",
-            CategoryId::Logs => "Crash dumps, Windows Error Reporting files, Prefetch and CBS logs older than 30 days.",
-            CategoryId::Standby => "Releases cached standby memory via the hardware agent. No files are deleted.",
+            CategoryId::Temp => "Files in your temporary folder (and the Windows temporary folder when running as administrator) that have not changed for 24 hours. Files in use are skipped.",
+            CategoryId::WuCache => "Windows Update downloads older than 24 hours, and the Delivery Optimization cache cleared through the Windows cmdlet.",
+            CategoryId::Logs => "Windows Error Reporting queues and archives, and component servicing logs older than 30 days.",
+            CategoryId::Dumps => DUMPS_DESCRIPTION,
+            CategoryId::MemoryDump => "Written by Windows after a system crash. Delete it only if you do not need it for troubleshooting.",
+            CategoryId::Shader => SHADER_DESCRIPTION,
+            CategoryId::Recycle => "Permanently deletes everything in the Recycle Bin.",
+            CategoryId::Browser => "Chrome, Edge, Firefox and Discord caches. Logins, cookies and history are never touched, and apps that are open are skipped.",
         }
     }
 
+    /// Never run by the F9 quick path.
     pub fn optional(self) -> bool {
-        matches!(self, CategoryId::Browser | CategoryId::Standby)
+        matches!(
+            self,
+            CategoryId::Dumps
+                | CategoryId::MemoryDump
+                | CategoryId::Shader
+                | CategoryId::Recycle
+                | CategoryId::Browser
+        )
     }
 
     pub fn requires_admin(self) -> bool {
         matches!(
             self,
-            CategoryId::Temp | CategoryId::WuCache | CategoryId::Logs | CategoryId::Standby
+            CategoryId::WuCache | CategoryId::Logs | CategoryId::Dumps | CategoryId::MemoryDump
         )
     }
+
+    /// Default selection (CONTRACT §3.1): only temp, wu-cache and logs.
+    pub fn default_enabled(self) -> bool {
+        matches!(
+            self,
+            CategoryId::Temp | CategoryId::WuCache | CategoryId::Logs
+        )
+    }
+}
+
+/// Apps whose caches are skipped while they run (CONTRACT §3 rule 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum App {
+    Chrome,
+    Edge,
+    Firefox,
+    Discord,
+}
+
+impl App {
+    pub const ALL: [App; 4] = [App::Chrome, App::Edge, App::Firefox, App::Discord];
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            App::Chrome => "Chrome",
+            App::Edge => "Edge",
+            App::Firefox => "Firefox",
+            App::Discord => "Discord",
+        }
+    }
+
+    /// Process image name (`msedgewebview2.exe` deliberately does not count for Edge).
+    pub fn process_name(self) -> &'static str {
+        match self {
+            App::Chrome => "chrome.exe",
+            App::Edge => "msedge.exe",
+            App::Firefox => "firefox.exe",
+            App::Discord => "Discord.exe",
+        }
+    }
+}
+
+/// GPU vendors present in the machine (from `Win32_VideoController.PNPDeviceID`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GpuVendors {
+    pub nvidia: bool,
+    pub amd: bool,
+    pub intel: bool,
+}
+
+impl GpuVendors {
+    pub fn from_pnp_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut v = GpuVendors::default();
+        for id in ids {
+            let u = id.to_ascii_uppercase();
+            if !u.starts_with(r"PCI\") {
+                continue;
+            }
+            v.nvidia |= u.contains("VEN_10DE");
+            v.amd |= u.contains("VEN_1002");
+            v.intel |= u.contains("VEN_8086");
+        }
+        v
+    }
+
+    /// Shader-cache folders for the detected vendors, as (base, relative path). `D3DSCache` is
+    /// always included.
+    fn shader_folders(self) -> Vec<(ShaderBase, &'static str)> {
+        let mut out = vec![(ShaderBase::LocalAppData, "D3DSCache")];
+        if self.nvidia {
+            out.push((ShaderBase::LocalAppData, r"NVIDIA\DXCache"));
+            out.push((ShaderBase::LocalAppData, r"NVIDIA\GLCache"));
+            out.push((ShaderBase::ProgramData, r"NVIDIA Corporation\NV_Cache"));
+        }
+        if self.amd {
+            out.push((ShaderBase::LocalAppData, r"AMD\DxCache"));
+            out.push((ShaderBase::LocalAppData, r"AMD\DxcCache"));
+            out.push((ShaderBase::LocalAppData, r"AMD\VkCache"));
+            out.push((ShaderBase::LocalAppData, r"AMD\GLCache"));
+        }
+        if self.intel {
+            out.push((ShaderBase::LocalAppData, r"Intel\ShaderCache"));
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShaderBase {
+    LocalAppData,
+    ProgramData,
+}
+
+/// Why a file inside a root is left alone (logged as `result:"skipped"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldReason {
+    TooNew,
+    KeptNewest,
+    DenyList,
+}
+
+impl HoldReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            HoldReason::TooNew => "tooNew",
+            HoldReason::KeptNewest => "keptNewest",
+            HoldReason::DenyList => "denyList",
+        }
+    }
+}
+
+/// Outcome of a filter for one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// A deletion candidate.
+    Take,
+    /// A file of this category that a rule keeps (logged at purge time).
+    Hold(HoldReason),
+    /// Not part of this category at all.
+    Ignore,
 }
 
 /// Which files inside a root qualify.
@@ -209,10 +375,11 @@ impl CategoryId {
 enum Filter {
     /// Every regular file.
     All,
-    /// `*.dmp`, `*.mdmp`, `*.hdmp`.
-    CrashDumps,
-    /// `*.pf` older than 30 days.
-    PrefetchOld,
+    /// `*.dmp`, `*.mdmp`, `*.hdmp`; the newest 5 and anything < 30 days old are kept
+    /// (applied per folder after enumeration).
+    Dumps,
+    /// The single file `MEMORY.DMP` (explicit opt-in, no age guard).
+    MemoryDump,
     /// `*.log` older than 30 days, except `CBS.log`.
     CbsLogsOld,
     /// Browser cache content; `allow_sqlite` only inside Firefox `cache2`.
@@ -222,6 +389,16 @@ enum Filter {
     /// is running right now (extracted minutes ago, often with old embedded mtimes, hence the
     /// creation time) are left alone.
     Stale(Duration),
+}
+
+/// A condition that skips a whole root while it holds (CONTRACT §3 rules 8–9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    None,
+    /// Skipped while this app runs.
+    App(App),
+    /// `SoftwareDistribution\Download`: skipped while an update is pending or installing.
+    WuDownload,
 }
 
 /// Extra validation applied to a root after canonicalization.
@@ -240,6 +417,7 @@ struct RootSpec {
     recursive: bool,
     filter: Filter,
     guard: RootGuard,
+    gate: Gate,
 }
 
 impl RootSpec {
@@ -250,6 +428,7 @@ impl RootSpec {
             recursive,
             filter,
             guard: RootGuard::Fixed,
+            gate: Gate::None,
         }
     }
     fn file(path: PathBuf, filter: Filter) -> Self {
@@ -259,6 +438,7 @@ impl RootSpec {
             recursive: false,
             filter,
             guard: RootGuard::Fixed,
+            gate: Gate::None,
         }
     }
     fn user_temp(path: PathBuf) -> Self {
@@ -268,7 +448,12 @@ impl RootSpec {
             recursive: true,
             filter: Filter::Stale(RECENT_GUARD),
             guard: RootGuard::UserTemp,
+            gate: Gate::None,
         }
+    }
+    fn gated(mut self, gate: Gate) -> Self {
+        self.gate = gate;
+        self
     }
 }
 
@@ -315,8 +500,45 @@ fn pick_user_temp(
     p.is_absolute().then_some(p)
 }
 
-fn category_roots(id: CategoryId, env: &Env) -> Vec<RootSpec> {
+/// Everything the category rules depend on besides the file system: base folders, the
+/// deny-list, elevation and the skip conditions of CONTRACT §3 rules 8–9.
+struct Context {
+    env: Env,
+    deny: DenyList,
+    is_admin: bool,
+    /// Apps (rule 8) currently running for this user.
+    running: Vec<App>,
+    /// A Windows update is pending a restart or installing (rule 9).
+    wu_pending: bool,
+    gpus: GpuVendors,
+}
+
+impl Context {
+    /// Gathers only what the given categories need (process list, registry, WMI).
+    fn current(ids: &[CategoryId]) -> Self {
+        let has = |c: CategoryId| ids.contains(&c);
+        Self {
+            env: Env::current(),
+            deny: DenyList::build(),
+            is_admin: is_admin(),
+            running: if has(CategoryId::Browser) {
+                detect_running_apps()
+            } else {
+                Vec::new()
+            },
+            wu_pending: has(CategoryId::WuCache) && detect_wu_pending(),
+            gpus: if has(CategoryId::Shader) {
+                detect_gpu_vendors()
+            } else {
+                GpuVendors::default()
+            },
+        }
+    }
+}
+
+fn category_roots(id: CategoryId, ctx: &Context) -> Vec<RootSpec> {
     use Filter::*;
+    let env = &ctx.env;
     let mut roots = Vec::new();
     let w = &env.windir;
     match id {
@@ -324,115 +546,115 @@ fn category_roots(id: CategoryId, env: &Env) -> Vec<RootSpec> {
             if let Some(t) = &env.temp {
                 roots.push(RootSpec::user_temp(t.clone()));
             }
-            roots.push(RootSpec::dir(w.join("Temp"), true, Stale(RECENT_GUARD)));
+            if ctx.is_admin {
+                roots.push(RootSpec::dir(w.join("Temp"), true, Stale(RECENT_GUARD)));
+            }
         }
         CategoryId::WuCache => {
-            roots.push(RootSpec::dir(
-                w.join(r"SoftwareDistribution\Download"),
-                true,
-                Stale(RECENT_GUARD),
-            ));
-            roots.push(RootSpec::dir(
-                w.join(r"ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache"),
-                true,
-                Stale(RECENT_GUARD),
-            ));
+            roots.push(
+                RootSpec::dir(
+                    w.join(r"SoftwareDistribution\Download"),
+                    true,
+                    Stale(RECENT_GUARD),
+                )
+                .gated(Gate::WuDownload),
+            );
+            // The Delivery Optimization cache is not a file root: it is cleared only through
+            // the Windows cmdlet (rule 10, `clear_delivery_optimization`).
         }
-        CategoryId::Shader => {
+        CategoryId::Logs => {
+            if let Some(pd) = &env.programdata {
+                for rel in [
+                    r"Microsoft\Windows\WER\ReportArchive",
+                    r"Microsoft\Windows\WER\ReportQueue",
+                ] {
+                    roots.push(RootSpec::dir(pd.join(rel), true, All));
+                }
+            }
             if let Some(l) = &env.local_appdata {
                 for rel in [
-                    "D3DSCache",
-                    r"NVIDIA\DXCache",
-                    r"NVIDIA\GLCache",
-                    r"AMD\DxCache",
-                    r"AMD\DxcCache",
-                    r"AMD\VkCache",
-                    r"AMD\GLCache",
-                    r"Intel\ShaderCache",
+                    r"Microsoft\Windows\WER\ReportArchive",
+                    r"Microsoft\Windows\WER\ReportQueue",
                 ] {
                     roots.push(RootSpec::dir(l.join(rel), true, All));
                 }
             }
-            if let Some(pd) = &env.programdata {
-                roots.push(RootSpec::dir(
-                    pd.join(r"NVIDIA Corporation\NV_Cache"),
-                    true,
-                    All,
-                ));
+            roots.push(RootSpec::dir(w.join(r"Logs\CBS"), false, CbsLogsOld));
+        }
+        CategoryId::Dumps => {
+            roots.push(RootSpec::dir(w.join("Minidump"), false, Dumps));
+            if let Some(l) = &env.local_appdata {
+                roots.push(RootSpec::dir(l.join("CrashDumps"), false, Dumps));
+            }
+        }
+        CategoryId::MemoryDump => {
+            roots.push(RootSpec::file(w.join("MEMORY.DMP"), MemoryDump));
+        }
+        CategoryId::Shader => {
+            for (base, rel) in ctx.gpus.shader_folders() {
+                let base = match base {
+                    ShaderBase::LocalAppData => &env.local_appdata,
+                    ShaderBase::ProgramData => &env.programdata,
+                };
+                if let Some(b) = base {
+                    roots.push(RootSpec::dir(b.join(rel), true, All));
+                }
             }
         }
         CategoryId::Browser => {
+            let cache = BrowserCache {
+                allow_sqlite: false,
+            };
             if let Some(l) = &env.local_appdata {
-                for user_data in [
-                    l.join(r"Google\Chrome\User Data"),
-                    l.join(r"Microsoft\Edge\User Data"),
+                for (app, user_data) in [
+                    (App::Chrome, l.join(r"Google\Chrome\User Data")),
+                    (App::Edge, l.join(r"Microsoft\Edge\User Data")),
                 ] {
                     for profile in chromium_profiles(&user_data) {
                         for rel in [r"Cache\Cache_Data", "Code Cache", "GPUCache"] {
-                            roots.push(RootSpec::dir(
-                                profile.join(rel),
-                                true,
-                                BrowserCache {
-                                    allow_sqlite: false,
-                                },
-                            ));
+                            roots.push(
+                                RootSpec::dir(profile.join(rel), true, cache).gated(Gate::App(app)),
+                            );
                         }
                     }
                     for rel in ["ShaderCache", "GrShaderCache"] {
-                        roots.push(RootSpec::dir(
-                            user_data.join(rel),
-                            true,
-                            BrowserCache {
-                                allow_sqlite: false,
-                            },
-                        ));
+                        roots.push(
+                            RootSpec::dir(user_data.join(rel), true, cache).gated(Gate::App(app)),
+                        );
                     }
                 }
                 for profile in list_plain_subdirs(&l.join(r"Mozilla\Firefox\Profiles")) {
-                    roots.push(RootSpec::dir(
-                        profile.join("cache2"),
-                        true,
-                        BrowserCache { allow_sqlite: true },
-                    ));
+                    roots.push(
+                        RootSpec::dir(
+                            profile.join("cache2"),
+                            true,
+                            BrowserCache { allow_sqlite: true },
+                        )
+                        .gated(Gate::App(App::Firefox)),
+                    );
                 }
             }
             if let Some(r) = &env.roaming_appdata {
                 for rel in ["Cache", "Code Cache", "GPUCache"] {
-                    roots.push(RootSpec::dir(
-                        r.join("discord").join(rel),
-                        true,
-                        BrowserCache {
-                            allow_sqlite: false,
-                        },
-                    ));
+                    roots.push(
+                        RootSpec::dir(r.join("discord").join(rel), true, cache)
+                            .gated(Gate::App(App::Discord)),
+                    );
                 }
             }
         }
-        CategoryId::Logs => {
-            roots.push(RootSpec::dir(w.join("Minidump"), false, CrashDumps));
-            roots.push(RootSpec::file(w.join("MEMORY.DMP"), CrashDumps));
-            if let Some(l) = &env.local_appdata {
-                roots.push(RootSpec::dir(l.join("CrashDumps"), false, CrashDumps));
-                roots.push(RootSpec::dir(l.join(r"Microsoft\Windows\WER"), true, All));
-            }
-            if let Some(pd) = &env.programdata {
-                roots.push(RootSpec::dir(
-                    pd.join(r"Microsoft\Windows\WER\ReportArchive"),
-                    true,
-                    All,
-                ));
-                roots.push(RootSpec::dir(
-                    pd.join(r"Microsoft\Windows\WER\ReportQueue"),
-                    true,
-                    All,
-                ));
-            }
-            roots.push(RootSpec::dir(w.join("Prefetch"), false, PrefetchOld));
-            roots.push(RootSpec::dir(w.join(r"Logs\CBS"), false, CbsLogsOld));
-        }
-        CategoryId::Recycle | CategoryId::Standby => {}
+        CategoryId::Recycle => {}
     }
     roots
+}
+
+/// `D3DSCache, NVIDIA\DXCache, …` for the shader description.
+fn shader_folder_names(gpus: GpuVendors) -> String {
+    gpus.shader_folders()
+        .into_iter()
+        .map(|(_, rel)| rel)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Direct, non-reparse subdirectories of `dir`.
@@ -751,6 +973,18 @@ impl DenyList {
         let local_appdata = known_folder(&FOLDERID_LocalAppData).or_else(dirs::data_local_dir);
         let roaming_appdata = known_folder(&FOLDERID_RoamingAppData).or_else(dirs::data_dir);
         let programdata = known_folder(&FOLDERID_ProgramData);
+
+        // Nexum's own state (the fan write-ahead flag) and install folder (Nexum.exe and the
+        // agent next to it), wherever they are.
+        if let Some(pd) = &programdata {
+            prefixes.push(pd.join("Nexum"));
+        }
+        if let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        {
+            prefixes.push(dir);
+        }
         never_root.push(windir.clone());
         never_root.extend(local_appdata.clone());
         never_root.extend(roaming_appdata);
@@ -890,31 +1124,56 @@ fn extension_lower(name: &str) -> String {
         .unwrap_or_default()
 }
 
+fn is_dump_name(name: &str) -> bool {
+    matches!(extension_lower(name).as_str(), "dmp" | "mdmp" | "hdmp")
+}
+
 impl Filter {
     /// `rel` = normalized path relative to the root (components separated by `\`).
-    fn accepts(self, name: &str, rel: &str, md: &std::fs::Metadata, now: SystemTime) -> bool {
+    fn verdict(self, name: &str, rel: &str, md: &std::fs::Metadata, now: SystemTime) -> Verdict {
         match self {
-            Filter::All => true,
-            Filter::Stale(age) => stale(md, age, now),
-            Filter::CrashDumps => matches!(extension_lower(name).as_str(), "dmp" | "mdmp" | "hdmp"),
-            Filter::PrefetchOld => {
-                extension_lower(name) == "pf" && older_than(md, THIRTY_DAYS, now)
+            Filter::All => Verdict::Take,
+            Filter::Stale(age) => {
+                if stale(md, age, now) {
+                    Verdict::Take
+                } else {
+                    Verdict::Hold(HoldReason::TooNew)
+                }
+            }
+            // Age and keep-newest are applied per folder once all dumps are known.
+            Filter::Dumps => {
+                if is_dump_name(name) {
+                    Verdict::Take
+                } else {
+                    Verdict::Ignore
+                }
+            }
+            Filter::MemoryDump => {
+                if name.eq_ignore_ascii_case("memory.dmp") {
+                    Verdict::Take
+                } else {
+                    Verdict::Ignore
+                }
             }
             Filter::CbsLogsOld => {
-                extension_lower(name) == "log"
-                    && !name.eq_ignore_ascii_case("cbs.log")
-                    && older_than(md, THIRTY_DAYS, now)
+                if extension_lower(name) != "log" || name.eq_ignore_ascii_case("cbs.log") {
+                    Verdict::Ignore
+                } else if older_than(md, THIRTY_DAYS, now) {
+                    Verdict::Take
+                } else {
+                    Verdict::Hold(HoldReason::TooNew)
+                }
             }
             Filter::BrowserCache { allow_sqlite } => {
                 if rel.split('\\').any(is_protected_browser_component) {
-                    return false;
+                    return Verdict::Ignore;
                 }
                 let ext = extension_lower(name);
                 if !allow_sqlite && (ext == "sqlite" || ext == "sqlite-wal" || ext == "sqlite-shm")
                 {
-                    return false;
+                    return Verdict::Ignore;
                 }
-                true
+                Verdict::Take
             }
         }
     }
@@ -936,6 +1195,17 @@ impl Filter {
 pub struct Candidate {
     pub path: PathBuf,
     pub size: u64,
+    /// Last-write time, unix ms (for the audit log and the dump rules).
+    pub mtime: Option<u64>,
+}
+
+/// A file of the category that a rule keeps (too new, among the newest dumps, deny-listed).
+#[derive(Debug, Clone)]
+pub struct Held {
+    pub path: PathBuf,
+    pub size: u64,
+    pub mtime: Option<u64>,
+    pub reason: HoldReason,
 }
 
 #[derive(Debug, Clone)]
@@ -947,6 +1217,8 @@ pub struct RootPlan {
     root_norm: String,
     single_file: bool,
     pub files: Vec<Candidate>,
+    /// Files kept by a rule; never deleted, only logged.
+    pub held: Vec<Held>,
     /// Sub-directories (never the root), for bottom-up empty-dir removal.
     pub dirs: Vec<(usize, PathBuf)>,
 }
@@ -955,6 +1227,41 @@ impl RootPlan {
     pub fn total_bytes(&self) -> u64 {
         self.files.iter().map(|c| c.size).sum()
     }
+}
+
+/// Crash-dump retention (CONTRACT §3 rule 7), per folder: the `KEEP_NEWEST_DUMPS` newest by
+/// mtime are kept, and of the rest only files older than 30 days are deleted. An unknown mtime
+/// counts as brand new (fail closed).
+fn apply_dump_rules(files: Vec<Candidate>, now_ms: u64) -> (Vec<Candidate>, Vec<Held>) {
+    let mut files = files;
+    files.sort_by(|a, b| {
+        b.mtime
+            .unwrap_or(u64::MAX)
+            .cmp(&a.mtime.unwrap_or(u64::MAX))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    let cutoff = now_ms.saturating_sub(THIRTY_DAYS.as_millis() as u64);
+    let mut take = Vec::new();
+    let mut held = Vec::new();
+    for (i, c) in files.into_iter().enumerate() {
+        let reason = if i < KEEP_NEWEST_DUMPS {
+            Some(HoldReason::KeptNewest)
+        } else if c.mtime.map_or(true, |m| m >= cutoff) {
+            Some(HoldReason::TooNew)
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => held.push(Held {
+                path: c.path,
+                size: c.size,
+                mtime: c.mtime,
+                reason,
+            }),
+            None => take.push(c),
+        }
+    }
+    (take, held)
 }
 
 fn plan_root(spec: &RootSpec, deny: &DenyList, now: SystemTime) -> Option<RootPlan> {
@@ -984,9 +1291,10 @@ fn plan_root(spec: &RootSpec, deny: &DenyList, now: SystemTime) -> Option<RootPl
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        if !spec.filter.accepts(&name, &name.to_lowercase(), &md, now) {
+        if spec.filter.verdict(&name, &name.to_lowercase(), &md, now) != Verdict::Take {
             return None;
         }
+        let mtime = md.modified().ok().and_then(unix_ms);
         return Some(RootPlan {
             root: canon.clone(),
             root_norm: canon_norm,
@@ -994,7 +1302,9 @@ fn plan_root(spec: &RootSpec, deny: &DenyList, now: SystemTime) -> Option<RootPl
             files: vec![Candidate {
                 path: canon,
                 size: md.len(),
+                mtime,
             }],
+            held: Vec::new(),
             dirs: Vec::new(),
         });
     }
@@ -1004,6 +1314,7 @@ fn plan_root(spec: &RootSpec, deny: &DenyList, now: SystemTime) -> Option<RootPl
     }
 
     let mut files = Vec::new();
+    let mut held = Vec::new();
     let mut dirs = Vec::new();
     let mut stack: Vec<(PathBuf, usize)> = vec![(canon.clone(), 0)];
     while let Some((dir, depth)) = stack.pop() {
@@ -1022,7 +1333,19 @@ fn plan_root(spec: &RootSpec, deny: &DenyList, now: SystemTime) -> Option<RootPl
                 continue;
             }
             let pn = norm_path(&path);
-            if !is_strictly_under(&pn, &canon_norm) || deny.is_denied(&pn) {
+            if !is_strictly_under(&pn, &canon_norm) {
+                continue;
+            }
+            let mtime = emd.modified().ok().and_then(unix_ms);
+            if deny.is_denied(&pn) {
+                if emd.is_file() {
+                    held.push(Held {
+                        path,
+                        size: emd.len(),
+                        mtime,
+                        reason: HoldReason::DenyList,
+                    });
+                }
                 continue;
             }
             let rel = &pn[canon_norm.len() + 1..];
@@ -1037,14 +1360,29 @@ fn plan_root(spec: &RootSpec, deny: &DenyList, now: SystemTime) -> Option<RootPl
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            if !spec.filter.accepts(&name, rel, &emd, now) {
-                continue;
+            match spec.filter.verdict(&name, rel, &emd, now) {
+                Verdict::Take => files.push(Candidate {
+                    path,
+                    size: emd.len(),
+                    mtime,
+                }),
+                Verdict::Hold(reason) => held.push(Held {
+                    path,
+                    size: emd.len(),
+                    mtime,
+                    reason,
+                }),
+                Verdict::Ignore => {}
             }
-            files.push(Candidate {
-                path,
-                size: emd.len(),
-            });
         }
+    }
+
+    if spec.filter == Filter::Dumps {
+        // Dump roots are non-recursive, so one root is one folder.
+        let now_ms = unix_ms(now).unwrap_or(0);
+        let (take, keep) = apply_dump_rules(files, now_ms);
+        files = take;
+        held.extend(keep);
     }
 
     Some(RootPlan {
@@ -1052,29 +1390,121 @@ fn plan_root(spec: &RootSpec, deny: &DenyList, now: SystemTime) -> Option<RootPl
         root_norm: canon_norm,
         single_file: false,
         files,
+        held,
         dirs,
     })
 }
 
-/// Enumerates every root of a file-based category, de-duplicating overlapping roots.
-fn plan_category(id: CategoryId, env: &Env, deny: &DenyList) -> Vec<RootPlan> {
+/// Why a whole root is skipped this time (CONTRACT §3 rules 8–9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockReason {
+    AppRunning(App),
+    UpdatePending,
+}
+
+impl BlockReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            BlockReason::AppRunning(_) => "appRunning",
+            BlockReason::UpdatePending => "updatePending",
+        }
+    }
+}
+
+/// The enumerated roots of one category: `active` ones are cleaned, `blocked` ones are only
+/// reported (and logged file by file at purge time).
+#[derive(Debug, Default)]
+struct CategoryPlan {
+    active: Vec<RootPlan>,
+    blocked: Vec<(RootPlan, BlockReason)>,
+    notes: Vec<String>,
+}
+
+impl CategoryPlan {
+    fn bytes(&self) -> u64 {
+        self.active.iter().map(RootPlan::total_bytes).sum()
+    }
+    fn files(&self) -> u64 {
+        self.active.iter().map(|p| p.files.len() as u64).sum()
+    }
+}
+
+/// `Skipped: Chrome is open.` / `Skipped: Chrome and Edge are open.` /
+/// `Skipped: Chrome, Edge and Firefox are open.`
+pub fn running_apps_note(apps: &[App]) -> Option<String> {
+    let names: Vec<&str> = apps.iter().map(|a| a.display_name()).collect();
+    match names.as_slice() {
+        [] => None,
+        [one] => Some(format!("Skipped: {one} is open.")),
+        [init @ .., last] => Some(format!("Skipped: {} and {last} are open.", init.join(", "))),
+    }
+}
+
+fn gate_block(gate: Gate, ctx: &Context) -> Option<BlockReason> {
+    match gate {
+        Gate::None => None,
+        Gate::App(app) if ctx.running.contains(&app) => Some(BlockReason::AppRunning(app)),
+        Gate::App(_) => None,
+        Gate::WuDownload if ctx.wu_pending => Some(BlockReason::UpdatePending),
+        Gate::WuDownload => None,
+    }
+}
+
+/// Enumerates the given roots, de-duplicating overlapping roots and splitting them into
+/// active and blocked ones. Notes name only blocked roots that actually exist.
+fn plan_specs(specs: Vec<RootSpec>, ctx: &Context) -> CategoryPlan {
     let now = SystemTime::now();
-    let mut plans: Vec<RootPlan> = Vec::new();
-    for spec in category_roots(id, env) {
-        if let Some(plan) = plan_root(&spec, deny, now) {
+    let mut plans: Vec<(RootPlan, Option<BlockReason>)> = Vec::new();
+    for spec in specs {
+        let block = gate_block(spec.gate, ctx);
+        if let Some(plan) = plan_root(&spec, &ctx.deny, now) {
             // Skip a root equal to / nested in an already planned root (e.g. %TEMP% = C:\Windows\Temp).
             if plans
                 .iter()
-                .any(|p| !p.single_file && is_same_or_under(&plan.root_norm, &p.root_norm))
+                .any(|(p, _)| !p.single_file && is_same_or_under(&plan.root_norm, &p.root_norm))
             {
                 continue;
             }
             // Drop previously planned roots that are nested inside this one.
-            plans.retain(|p| p.single_file || !is_strictly_under(&p.root_norm, &plan.root_norm));
-            plans.push(plan);
+            plans.retain(|(p, _)| {
+                p.single_file || !is_strictly_under(&p.root_norm, &plan.root_norm)
+            });
+            plans.push((plan, block));
         }
     }
-    plans
+
+    let mut out = CategoryPlan::default();
+    let mut apps: Vec<App> = Vec::new();
+    let mut update_blocked = false;
+    for (plan, block) in plans {
+        match block {
+            None => out.active.push(plan),
+            Some(reason) => {
+                match reason {
+                    BlockReason::AppRunning(app) => {
+                        if !apps.contains(&app) {
+                            apps.push(app);
+                        }
+                    }
+                    BlockReason::UpdatePending => update_blocked = true,
+                }
+                out.blocked.push((plan, reason));
+            }
+        }
+    }
+    apps.sort();
+    if let Some(note) = running_apps_note(&apps) {
+        out.notes.push(note);
+    }
+    if update_blocked {
+        out.notes.push(NOTE_UPDATE_PENDING.to_string());
+    }
+    out
+}
+
+/// Enumerates every root of a file-based category.
+fn plan_category(id: CategoryId, ctx: &Context) -> CategoryPlan {
+    plan_specs(category_roots(id, ctx), ctx)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1082,27 +1512,48 @@ fn plan_category(id: CategoryId, env: &Env, deny: &DenyList) -> Vec<RootPlan> {
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Debug)]
-#[allow(dead_code)] // payloads are diagnostic (Debug output in tests/logs)
 pub enum DeleteError {
-    Open(String),
+    /// The file could not be opened: Win32 error code (if known) and message.
+    Open(Option<u32>, String),
     NotAllowed(&'static str),
-    Failed(String),
+    /// Setting the delete disposition failed: Win32 error code (if known) and message.
+    Failed(Option<u32>, String),
 }
 
-fn to_wide(p: &Path) -> Vec<u16> {
-    OsStr::new(p.as_os_str())
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
+const ERR_FILE_NOT_FOUND: u32 = 2;
+const ERR_PATH_NOT_FOUND: u32 = 3;
+const ERR_ACCESS_DENIED: u32 = 5;
+const ERR_SHARING_VIOLATION: u32 = 32;
+const ERR_LOCK_VIOLATION: u32 = 33;
+
+fn win_err(e: &windows::core::Error) -> (Option<u32>, String) {
+    (win32_code(e.code().0), e.message().trim().to_string())
 }
 
-struct OwnedHandle(HANDLE);
-
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = CloseHandle(self.0);
-        }
+/// Audit-log `(result, reason)` for a failed delete. Locked, in-use and permission-denied
+/// files are "skipped" (rule 4); anything unexpected is "failed" with the OS error text.
+fn delete_outcome(err: &DeleteError) -> (&'static str, String) {
+    match err {
+        DeleteError::Open(code, msg) | DeleteError::Failed(code, msg) => match code {
+            Some(ERR_SHARING_VIOLATION) | Some(ERR_LOCK_VIOLATION) => {
+                ("skipped", "locked".to_string())
+            }
+            Some(ERR_ACCESS_DENIED) => ("skipped", "accessDenied".to_string()),
+            Some(ERR_FILE_NOT_FOUND) | Some(ERR_PATH_NOT_FOUND) => {
+                ("skipped", "file no longer exists".to_string())
+            }
+            _ => (
+                "failed",
+                if msg.is_empty() {
+                    "unknown error".to_string()
+                } else {
+                    msg.clone()
+                },
+            ),
+        },
+        DeleteError::NotAllowed("reparse point") => ("skipped", "reparsePoint".to_string()),
+        DeleteError::NotAllowed("deny-listed") => ("skipped", "denyList".to_string()),
+        DeleteError::NotAllowed(other) => ("skipped", (*other).to_string()),
     }
 }
 
@@ -1146,12 +1597,18 @@ fn verified_delete(
             HANDLE::default(),
         )
     }
-    .map_err(|e| DeleteError::Open(e.message().to_string()))?;
+    .map_err(|e| {
+        let (code, msg) = win_err(&e);
+        DeleteError::Open(code, msg)
+    })?;
     let handle = OwnedHandle(handle);
 
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     unsafe { GetFileInformationByHandle(handle.0, &mut info) }
-        .map_err(|e| DeleteError::Failed(e.message().to_string()))?;
+        .map_err(|e| {
+            let (code, msg) = win_err(&e);
+            DeleteError::Failed(code, msg)
+        })?;
     if info.dwFileAttributes & REPARSE_ATTR != 0 {
         return Err(DeleteError::NotAllowed("reparse point"));
     }
@@ -1212,7 +1669,10 @@ fn verified_delete(
                 std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
             )
         }
-        .map_err(|e| DeleteError::Failed(e.message().to_string()))?;
+        .map_err(|e| {
+            let (code, msg) = win_err(&e);
+            DeleteError::Failed(code, msg)
+        })?;
     }
     drop(handle); // closing the handle performs the delete
     Ok(size)
@@ -1225,16 +1685,61 @@ pub struct PurgeCounts {
     pub skipped: u64,
 }
 
+/// What happened to one file, for the audit log.
+pub struct FileOutcome<'a> {
+    pub path: &'a Path,
+    pub bytes: u64,
+    pub mtime: Option<u64>,
+    /// `"deleted" | "skipped" | "failed"`.
+    pub result: &'static str,
+    pub reason: Option<String>,
+}
+
 /// Deletes every candidate of a plan, then removes now-empty sub-directories bottom-up.
 pub fn purge_plan(plan: &RootPlan, deny: &DenyList) -> PurgeCounts {
+    purge_plan_with(plan, deny, &mut |_: FileOutcome<'_>| {})
+}
+
+/// [`purge_plan`] reporting every candidate's outcome (and every held file) to `report`.
+pub fn purge_plan_with(
+    plan: &RootPlan,
+    deny: &DenyList,
+    report: &mut dyn FnMut(FileOutcome<'_>),
+) -> PurgeCounts {
     let mut c = PurgeCounts::default();
+    for h in &plan.held {
+        report(FileOutcome {
+            path: &h.path,
+            bytes: h.size,
+            mtime: h.mtime,
+            result: "skipped",
+            reason: Some(h.reason.as_str().to_string()),
+        });
+    }
     for cand in &plan.files {
         match verified_delete(&cand.path, false, plan, deny) {
             Ok(size) => {
                 c.freed += size;
                 c.deleted += 1;
+                report(FileOutcome {
+                    path: &cand.path,
+                    bytes: size,
+                    mtime: cand.mtime,
+                    result: "deleted",
+                    reason: None,
+                });
             }
-            Err(_) => c.skipped += 1,
+            Err(e) => {
+                c.skipped += 1;
+                let (result, reason) = delete_outcome(&e);
+                report(FileOutcome {
+                    path: &cand.path,
+                    bytes: cand.size,
+                    mtime: cand.mtime,
+                    result,
+                    reason: Some(reason),
+                });
+            }
         }
     }
     if !plan.single_file {
@@ -1324,51 +1829,446 @@ fn empty_recycle_bin() -> PurgeCounts {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Skip conditions: running apps (rule 8), pending Windows updates (rule 9), GPU vendors
+// ---------------------------------------------------------------------------------------------
+
+/// Apps with at least one matching process. `owner` is `Some(true)` for the current user,
+/// `Some(false)` for another user (ignored) and `None` when unknown (counts: fail closed).
+pub fn apps_running<'a>(procs: impl IntoIterator<Item = (&'a str, Option<bool>)>) -> Vec<App> {
+    let mut out: Vec<App> = Vec::new();
+    for (name, owner) in procs {
+        if owner == Some(false) {
+            continue;
+        }
+        if let Some(app) = App::ALL
+            .into_iter()
+            .find(|a| a.process_name().eq_ignore_ascii_case(name.trim()))
+        {
+            if !out.contains(&app) {
+                out.push(app);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn detect_running_apps() -> Vec<App> {
+    let me = crate::procs::current_user_sid();
+    let entries = crate::procs::snapshot();
+    let matching: Vec<(&str, Option<bool>)> = entries
+        .iter()
+        .filter(|e| {
+            App::ALL
+                .iter()
+                .any(|a| a.process_name().eq_ignore_ascii_case(&e.name))
+        })
+        .map(|e| {
+            let owner = me
+                .as_deref()
+                .and_then(|sid| crate::procs::runs_as(e.pid, sid));
+            (e.name.as_str(), owner)
+        })
+        .collect();
+    apps_running(matching)
+}
+
+/// Signals that a Windows update is waiting for a restart or being installed. Each is
+/// `Some(true)`, `Some(false)` or `None` (could not tell).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WuSignals {
+    pub reboot_required: Option<bool>,
+    pub reboot_pending: Option<bool>,
+    pub pending_file_renames: Option<bool>,
+    pub trusted_installer_running: Option<bool>,
+    pub wuauserv_running: Option<bool>,
+}
+
+impl WuSignals {
+    /// Conservative: anything other than a clear "no" counts as pending.
+    pub fn update_pending(&self) -> bool {
+        [
+            self.reboot_required,
+            self.reboot_pending,
+            self.pending_file_renames,
+            self.trusted_installer_running,
+            self.wuauserv_running,
+        ]
+        .iter()
+        .any(|s| *s != Some(false))
+    }
+}
+
+const ERR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
+
+/// `Some(true)` unless the service is stopped; `Some(false)` when stopped or not installed;
+/// `None` when the service manager cannot be asked. Nexum never starts or stops services.
+fn service_running(name: &str) -> Option<bool> {
+    use windows::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_MANAGER_CONNECT,
+        SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOPPED,
+    };
+    let wname = to_wide(name);
+    // SAFETY: null machine/database names = local SCM; handles are closed below; `wname` is
+    // NUL-terminated and outlives the calls.
+    unsafe {
+        let scm = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT).ok()?;
+        let result = match OpenServiceW(scm, PCWSTR(wname.as_ptr()), SERVICE_QUERY_STATUS) {
+            Ok(svc) => {
+                let mut st = SERVICE_STATUS::default();
+                let r = QueryServiceStatus(svc, &mut st)
+                    .ok()
+                    .map(|_| st.dwCurrentState != SERVICE_STOPPED);
+                let _ = CloseServiceHandle(svc);
+                r
+            }
+            Err(e) if win32_code(e.code().0) == Some(ERR_SERVICE_DOES_NOT_EXIST) => Some(false),
+            Err(_) => None,
+        };
+        let _ = CloseServiceHandle(scm);
+        result
+    }
+}
+
+fn detect_wu_signals() -> WuSignals {
+    WuSignals {
+        reboot_required: hklm_key_state(
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired",
+        ),
+        reboot_pending: hklm_key_state(
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
+        ),
+        pending_file_renames: hklm_value_state(
+            r"SYSTEM\CurrentControlSet\Control\Session Manager",
+            "PendingFileRenameOperations",
+        ),
+        trusted_installer_running: service_running("TrustedInstaller"),
+        wuauserv_running: service_running("wuauserv"),
+    }
+}
+
+fn detect_wu_pending() -> bool {
+    let s = detect_wu_signals();
+    let pending = s.update_pending();
+    if pending {
+        eprintln!("[nexum] Windows Update download cache skipped: {s:?}");
+    }
+    pending
+}
+
+#[derive(Deserialize, Debug)]
+struct VideoControllerRow {
+    #[serde(rename = "PNPDeviceID", default)]
+    pnp_device_id: Option<String>,
+}
+
+fn detect_gpu_vendors() -> GpuVendors {
+    let conn = wmi_connection(NS_CIMV2).ok();
+    let rows: Vec<VideoControllerRow> = query_soft(
+        conn.as_ref(),
+        "SELECT PNPDeviceID FROM Win32_VideoController",
+    );
+    GpuVendors::from_pnp_ids(rows.iter().filter_map(|r| r.pnp_device_id.as_deref()))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Delivery Optimization (rule 10): Microsoft's cmdlet only, never direct deletes
+// ---------------------------------------------------------------------------------------------
+
+fn do_cache_dir(env: &Env) -> PathBuf {
+    env.windir.join(
+        r"ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache",
+    )
+}
+
+/// Read-only `(bytes, files)` of a folder tree; never follows links. `Some((0, 0))` when the
+/// folder does not exist, `None` when it cannot be read.
+fn folder_size(root: &Path) -> Option<(u64, u64)> {
+    let md = match std::fs::symlink_metadata(root) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some((0, 0)),
+        Err(_) => return None,
+    };
+    if is_reparse(&md) || !md.is_dir() {
+        return None;
+    }
+    let (mut bytes, mut files) = (0u64, 0u64);
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) if depth == 0 => return None,
+            Err(_) => continue,
+        };
+        for entry in rd.flatten() {
+            let Ok(emd) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if is_reparse(&emd) {
+                continue;
+            }
+            if emd.is_dir() {
+                if depth < MAX_DEPTH {
+                    stack.push((entry.path(), depth + 1));
+                }
+            } else if emd.is_file() {
+                bytes += emd.len();
+                files += 1;
+            }
+        }
+    }
+    Some((bytes, files))
+}
+
+/// Turns the cmdlet's error output into the `<reason>` of the DO note (no trailing period).
+pub fn do_failure_reason(stderr: &str, exit_code: Option<i32>) -> String {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("is not recognized") || lower.contains("commandnotfoundexception") {
+        return "the Delete-DeliveryOptimizationCache cmdlet is not available on this system"
+            .to_string();
+    }
+    let first = stderr.lines().map(str::trim).find(|l| !l.is_empty());
+    match first {
+        Some(line) => {
+            let line = line
+                .strip_prefix("Delete-DeliveryOptimizationCache :")
+                .unwrap_or(line)
+                .trim();
+            let short: String = line.chars().take(160).collect();
+            let short = short.trim().trim_end_matches('.').trim().to_string();
+            if short.is_empty() {
+                "the cmdlet failed".to_string()
+            } else {
+                short
+            }
+        }
+        None => match exit_code {
+            Some(c) => format!("the cmdlet failed (exit code {c})"),
+            None => "the cmdlet failed".to_string(),
+        },
+    }
+}
+
+/// Runs `Delete-DeliveryOptimizationCache -Force` through Windows PowerShell (System32 path,
+/// no window, 120 s limit).
+fn run_do_cmdlet() -> Result<(), String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let ps = windows_dir().join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    let mut child = crate::util::hidden_command(&ps)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "RemoteSigned",
+            "-Command",
+            "Delete-DeliveryOptimizationCache -Force",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Windows PowerShell could not be started ({e})"))?;
+    let stderr = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut s) = stderr {
+            let _ = s.read_to_string(&mut text);
+        }
+        text
+    });
+    let deadline = Instant::now() + DO_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let text = reader.join().unwrap_or_default();
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(do_failure_reason(&text, status.code()))
+                };
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // The reader thread ends when the pipe closes; it is not joined here.
+                return Err("the cmdlet did not finish within 120 seconds".to_string());
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(format!("the cmdlet could not be monitored ({e})"));
+            }
+        }
+    }
+}
+
+/// Clears the Delivery Optimization cache via the cmdlet and measures what it freed.
+fn clear_delivery_optimization(ctx: &Context, log: &mut PurgeLog) -> (PurgeCounts, Option<String>) {
+    let category = CategoryId::WuCache.as_str();
+    let dir = do_cache_dir(&ctx.env);
+    let before = folder_size(&dir);
+    if before == Some((0, 0)) {
+        log.action(category, DO_ACTION, "skipped", 0, "The cache is empty.");
+        return (PurgeCounts::default(), None);
+    }
+    match run_do_cmdlet() {
+        Ok(()) => {
+            let after = folder_size(&dir);
+            let counts = match (before, after) {
+                (Some((b0, f0)), Some((b1, f1))) => PurgeCounts {
+                    freed: b0.saturating_sub(b1),
+                    deleted: f0.saturating_sub(f1),
+                    skipped: 0,
+                },
+                _ => PurgeCounts::default(),
+            };
+            log.action(
+                category,
+                DO_ACTION,
+                "ok",
+                counts.freed,
+                &format!("Freed {}.", fmt_bytes(counts.freed)),
+            );
+            (counts, None)
+        }
+        Err(reason) => {
+            log.action(category, DO_ACTION, "failed", 0, &reason);
+            (
+                PurgeCounts::default(),
+                Some(format!("Delivery Optimization cache was not cleared: {reason}.")),
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Scan & purge orchestration
 // ---------------------------------------------------------------------------------------------
 
-fn make_category(id: CategoryId, bytes: u64, files: u64, include_browser: bool) -> TrashCategory {
-    let enabled = match id {
-        CategoryId::Browser => include_browser,
-        CategoryId::Standby => false,
-        _ => true,
-    };
+fn join_notes(notes: Vec<String>) -> Option<String> {
+    let notes: Vec<String> = notes.into_iter().filter(|n| !n.is_empty()).collect();
+    (!notes.is_empty()).then(|| notes.join(" "))
+}
+
+/// `Written by Windows after a system crash (<YYYY-MM-DD>, <size>). …`
+fn memory_dump_description(plan: &CategoryPlan) -> String {
+    let file = plan
+        .active
+        .iter()
+        .chain(plan.blocked.iter().map(|(p, _)| p))
+        .flat_map(|p| p.files.iter())
+        .next();
+    match file {
+        Some(f) => {
+            let date = f
+                .mtime
+                .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms as i64))
+                .map(|d| {
+                    d.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d")
+                        .to_string()
+                });
+            match date {
+                Some(date) => format!(
+                    "Written by Windows after a system crash ({date}, {}). {MEMORY_DUMP_TAIL}",
+                    fmt_bytes(f.size)
+                ),
+                None => format!(
+                    "Written by Windows after a system crash ({}). {MEMORY_DUMP_TAIL}",
+                    fmt_bytes(f.size)
+                ),
+            }
+        }
+        None => CategoryId::MemoryDump.base_description().to_string(),
+    }
+}
+
+/// Builds one scan row from what was measured.
+fn make_category(
+    id: CategoryId,
+    is_admin: bool,
+    bytes: u64,
+    files: u64,
+    description: String,
+    notes: Vec<String>,
+) -> TrashCategory {
+    let available = is_admin || !id.requires_admin();
     TrashCategory {
         id: id.as_str().to_string(),
         label: id.label().to_string(),
-        description: id.description().to_string(),
+        description,
         bytes,
         files,
-        enabled,
+        enabled: available && id.default_enabled(),
         optional: id.optional(),
         requires_admin: id.requires_admin(),
+        available,
+        unavailable_reason: (!available).then(|| "needsAdmin".to_string()),
+        note: if available {
+            join_notes(notes)
+        } else {
+            Some(NOTE_NEEDS_ADMIN.to_string())
+        },
     }
 }
 
 pub fn scan(include_browser: bool) -> TrashScan {
     let started = Instant::now();
-    let env = Env::current();
-    let deny = DenyList::build();
+    let ids: Vec<CategoryId> = CategoryId::ALL
+        .into_iter()
+        .filter(|c| *c != CategoryId::Browser || include_browser)
+        .collect();
+    let ctx = Context::current(&ids);
     let mut categories = Vec::new();
-    for id in CategoryId::ALL {
+    for id in ids {
+        let mut description = id.base_description().to_string();
+        let mut notes = Vec::new();
         let (bytes, files) = match id {
             CategoryId::Recycle => query_recycle_bin().unwrap_or((0, 0)),
-            CategoryId::Standby => (0, 0),
             _ => {
-                let plans = plan_category(id, &env, &deny);
-                (
-                    plans.iter().map(RootPlan::total_bytes).sum(),
-                    plans.iter().map(|p| p.files.len() as u64).sum(),
-                )
+                let plan = plan_category(id, &ctx);
+                let (mut bytes, mut files) = (plan.bytes(), plan.files());
+                if id == CategoryId::WuCache {
+                    if let Some((b, f)) = folder_size(&do_cache_dir(&ctx.env)) {
+                        bytes += b;
+                        files += f;
+                    }
+                }
+                if id == CategoryId::MemoryDump {
+                    description = memory_dump_description(&plan);
+                }
+                notes.extend(plan.notes);
+                (bytes, files)
             }
         };
-        categories.push(make_category(id, bytes, files, include_browser));
+        if id == CategoryId::Shader {
+            description = format!(
+                "{SHADER_DESCRIPTION} Folders: {}.",
+                shader_folder_names(ctx.gpus)
+            );
+        }
+        categories.push(make_category(
+            id,
+            ctx.is_admin,
+            bytes,
+            files,
+            description,
+            notes,
+        ));
     }
-    let total_bytes = categories.iter().map(|c| c.bytes).sum();
+    let total_bytes = categories
+        .iter()
+        .filter(|c| c.available)
+        .map(|c| c.bytes)
+        .sum();
     TrashScan {
         categories,
         total_bytes,
         duration_ms: started.elapsed().as_millis() as u64,
+        is_admin: ctx.is_admin,
     }
 }
 
@@ -1385,43 +2285,119 @@ fn emit_progress(app: &AppHandle, id: CategoryId, step: u32, total: u32, freed: 
     );
 }
 
-pub fn purge(app: &AppHandle, categories: &[String], flush_standby: bool) -> PurgeResult {
+/// Parses requested ids: unknown ids are an error; duplicates collapse; order follows
+/// [`CategoryId::ALL`].
+pub fn parse_categories(categories: &[String]) -> Result<Vec<CategoryId>, String> {
+    let mut requested: Vec<CategoryId> = Vec::new();
+    for c in categories {
+        match CategoryId::parse(c) {
+            Some(id) => {
+                if !requested.contains(&id) {
+                    requested.push(id);
+                }
+            }
+            None => return Err(format!("Unknown cleanup category '{}'", c.trim())),
+        }
+    }
+    requested.sort_by_key(|id| CategoryId::ALL.iter().position(|x| x == id));
+    Ok(requested)
+}
+
+/// Logs every file of a blocked root as skipped with the block reason.
+fn log_blocked(log: &mut PurgeLog, id: CategoryId, plan: &RootPlan, reason: BlockReason) {
+    for c in &plan.files {
+        log.file(
+            id.as_str(),
+            &c.path,
+            c.size,
+            c.mtime,
+            "skipped",
+            Some(reason.as_str()),
+        );
+    }
+    for h in &plan.held {
+        log.file(
+            id.as_str(),
+            &h.path,
+            h.size,
+            h.mtime,
+            "skipped",
+            Some(reason.as_str()),
+        );
+    }
+}
+
+pub fn purge(app: &AppHandle, categories: &[String]) -> Result<PurgeResult, String> {
     let started = Instant::now();
-    let env = Env::current();
-    let deny = DenyList::build();
+    let started_ts = now_ms();
+    let requested = parse_categories(categories)?;
 
-    let requested: Vec<CategoryId> = CategoryId::ALL
-        .into_iter()
-        .filter(|id| categories.iter().any(|c| CategoryId::parse(c) == Some(*id)))
-        .collect();
-    let do_standby = flush_standby || requested.contains(&CategoryId::Standby);
-    let file_steps: Vec<CategoryId> = requested
-        .iter()
-        .copied()
-        .filter(|c| *c != CategoryId::Standby)
-        .collect();
-    let total_steps = (file_steps.len() + usize::from(do_standby)) as u32;
+    // Rule 11: no log, no purge.
+    let dir = crate::purge_log::log_dir().ok_or_else(|| {
+        "Could not create the cleanup log: the local application data folder is unavailable"
+            .to_string()
+    })?;
+    let mut log = PurgeLog::create(&dir, &crate::util::file_timestamp())
+        .map_err(|e| format!("Could not create the cleanup log: {e}"))?;
 
+    let ctx = Context::current(&requested);
+    let ids: Vec<&str> = requested.iter().map(|c| c.as_str()).collect();
+    log.header(env!("CARGO_PKG_VERSION"), started_ts, ctx.is_admin, &ids);
+
+    let total_steps = requested.len() as u32;
     let mut per_category = Vec::new();
     let mut total = PurgeCounts::default();
-    let mut step = 0u32;
 
-    for id in file_steps {
-        step += 1;
+    for (i, id) in requested.into_iter().enumerate() {
+        let step = i as u32 + 1;
         // Start-of-category event: freedBytes = running total so far.
         emit_progress(app, id, step, total_steps, total.freed);
-        let counts = match id {
-            CategoryId::Recycle => empty_recycle_bin(),
-            _ => {
-                let mut c = PurgeCounts::default();
-                for plan in plan_category(id, &env, &deny) {
-                    let r = purge_plan(&plan, &deny);
-                    c.freed += r.freed;
-                    c.deleted += r.deleted;
-                    c.skipped += r.skipped;
-                }
-                c
+        let mut notes: Vec<String> = Vec::new();
+        let counts = if id.requires_admin() && !ctx.is_admin {
+            // Rule 12: an unavailable category is skipped, not an error.
+            notes.push(NOTE_NEEDS_ADMIN.to_string());
+            PurgeCounts::default()
+        } else if id == CategoryId::Recycle {
+            let c = empty_recycle_bin();
+            let (result, message) = if c.skipped > 0 {
+                ("failed", format!("{} items could not be removed.", c.skipped))
+            } else if c.deleted == 0 {
+                ("skipped", "The Recycle Bin is empty.".to_string())
+            } else {
+                ("ok", format!("Removed {} items.", c.deleted))
+            };
+            log.action(id.as_str(), RECYCLE_ACTION, result, c.freed, &message);
+            c
+        } else {
+            let plan = plan_category(id, &ctx);
+            let mut c = PurgeCounts::default();
+            for root in &plan.active {
+                let r = purge_plan_with(root, &ctx.deny, &mut |o: FileOutcome<'_>| {
+                    log.file(
+                        id.as_str(),
+                        o.path,
+                        o.bytes,
+                        o.mtime,
+                        o.result,
+                        o.reason.as_deref(),
+                    )
+                });
+                c.freed += r.freed;
+                c.deleted += r.deleted;
+                c.skipped += r.skipped;
             }
+            for (root, reason) in &plan.blocked {
+                log_blocked(&mut log, id, root, *reason);
+            }
+            notes.extend(plan.notes.iter().cloned());
+            if id == CategoryId::WuCache {
+                let (d, note) = clear_delivery_optimization(&ctx, &mut log);
+                c.freed += d.freed;
+                c.deleted += d.deleted;
+                c.skipped += d.skipped;
+                notes.extend(note);
+            }
+            c
         };
         total.freed += counts.freed;
         total.deleted += counts.deleted;
@@ -1432,46 +2408,23 @@ pub fn purge(app: &AppHandle, categories: &[String], flush_standby: bool) -> Pur
             freed_bytes: counts.freed,
             deleted: counts.deleted,
             skipped: counts.skipped,
+            note: join_notes(notes),
         });
         // End-of-category event: freedBytes = running total including this category.
         emit_progress(app, id, step, total_steps, total.freed);
     }
 
-    let (standby_flushed, standby_message) = if do_standby {
-        step += 1;
-        emit_progress(app, CategoryId::Standby, step, total_steps, total.freed);
-        let state = app.state::<AppState>();
-        let outcome = state.agent.request_ack(
-            &json!({ "cmd": "flushStandby" }),
-            "flushStandby",
-            STANDBY_TIMEOUT,
-        );
-        let (ok, msg) = match outcome {
-            Ok(ack) => (ack.ok, ack.message),
-            Err(e) => (false, e),
-        };
-        per_category.push(PurgeCategoryResult {
-            id: CategoryId::Standby.as_str().to_string(),
-            label: CategoryId::Standby.label().to_string(),
-            freed_bytes: 0,
-            deleted: 0,
-            skipped: 0,
-        });
-        emit_progress(app, CategoryId::Standby, step, total_steps, total.freed);
-        (Some(ok), Some(msg))
-    } else {
-        (None, None)
-    };
-
-    PurgeResult {
+    let result = PurgeResult {
         freed_bytes: total.freed,
         files_deleted: total.deleted,
         files_skipped: total.skipped,
         duration_ms: started.elapsed().as_millis() as u64,
         per_category,
-        standby_flushed,
-        standby_message,
-    }
+        log_path: crate::purge_log::display_path(log.path()),
+    };
+    log.summary(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null));
+    log.finish();
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1486,22 +2439,18 @@ pub async fn scan_trash(include_browser: bool) -> Result<TrashScan, String> {
 }
 
 #[tauri::command]
-pub async fn purge_trash(
-    app: AppHandle,
-    categories: Vec<String>,
-    flush_standby: bool,
-) -> Result<PurgeResult, String> {
+pub async fn purge_trash(app: AppHandle, categories: Vec<String>) -> Result<PurgeResult, String> {
     {
         let state = app.state::<AppState>();
         if state.purge_running.swap(true, Ordering::SeqCst) {
-            return Err("A purge is already running".to_string());
+            return Err("A cleanup is already running".to_string());
         }
     }
     let worker = app.clone();
-    let result =
-        tauri::async_runtime::spawn_blocking(move || purge(&worker, &categories, flush_standby))
-            .await
-            .map_err(|e| format!("Purge failed: {e}"));
+    let result = tauri::async_runtime::spawn_blocking(move || purge(&worker, &categories))
+        .await
+        .map_err(|e| format!("Cleanup failed: {e}"))
+        .and_then(|r| r);
     app.state::<AppState>()
         .purge_running
         .store(false, Ordering::SeqCst);
@@ -1784,8 +2733,18 @@ mod tests {
         assert_eq!(plan.files.len(), 2);
     }
 
+    fn set_mtime(path: &Path, age: Duration) {
+        use std::os::windows::fs::FileTimesExt;
+        let when = SystemTime::now() - age;
+        let f = fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(when).set_created(when))
+            .unwrap();
+    }
+
+    const DAY: Duration = Duration::from_secs(24 * 3600);
+
     #[test]
-    fn crash_dump_filter_and_single_file_root() {
+    fn recent_dumps_are_kept() {
         let t = TempTree::new("dumps");
         let root = t.base.join("Minidump");
         fs::create_dir_all(&root).unwrap();
@@ -1795,24 +2754,428 @@ mod tests {
         fs::write(root.join("keep.txt"), b"1").unwrap();
         let deny = DenyList::build();
         let plan = plan_root(
-            &RootSpec::dir(root.clone(), false, Filter::CrashDumps),
+            &RootSpec::dir(root.clone(), false, Filter::Dumps),
             &deny,
             SystemTime::now(),
         )
         .unwrap();
-        assert_eq!(plan.files.len(), 3);
+        // Fresh dumps: all among the newest 5 and under 30 days. keep.txt is not a dump.
+        assert!(plan.files.is_empty());
+        assert_eq!(plan.held.len(), 3);
+        assert!(plan
+            .held
+            .iter()
+            .all(|h| h.reason == HoldReason::KeptNewest));
+        let c = purge_plan(&plan, &deny);
+        assert_eq!(c.deleted, 0);
+        assert!(root.join("a.dmp").exists());
+    }
 
-        let single = root.join("a.dmp");
+    #[test]
+    fn dumps_keep_newest_five_and_anything_under_30_days() {
+        let t = TempTree::new("dumps-rule");
+        let root = t.base.join("Minidump");
+        fs::create_dir_all(&root).unwrap();
+        // 9 dumps: 2 recent (5 and 10 days), 7 old (40..100 days).
+        let ages = [5u64, 10, 40, 50, 60, 70, 80, 90, 100];
+        for (i, days) in ages.iter().enumerate() {
+            let p = root.join(format!("d{i}.dmp"));
+            fs::write(&p, vec![0u8; 10]).unwrap();
+            set_mtime(&p, DAY * (*days as u32));
+        }
+        let deny = DenyList::build();
         let plan = plan_root(
-            &RootSpec::file(single.clone(), Filter::CrashDumps),
+            &RootSpec::dir(root.clone(), false, Filter::Dumps),
             &deny,
             SystemTime::now(),
         )
         .unwrap();
+        // Newest 5 (5, 10, 40, 50, 60 days) are kept; 70, 80, 90, 100 days are deleted.
+        let mut doomed: Vec<String> = plan
+            .files
+            .iter()
+            .map(|c| c.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        doomed.sort();
+        assert_eq!(doomed, vec!["d5.dmp", "d6.dmp", "d7.dmp", "d8.dmp"]);
+        assert_eq!(
+            plan.held
+                .iter()
+                .filter(|h| h.reason == HoldReason::KeptNewest)
+                .count(),
+            5
+        );
+        let c = purge_plan(&plan, &deny);
+        assert_eq!(c.deleted, 4);
+        assert!(root.join("d0.dmp").exists());
+        assert!(root.join("d4.dmp").exists());
+        assert!(!root.join("d8.dmp").exists());
+
+        // Only 7 dumps, 3 of them recent: the newest 5 are kept, the 2 oldest (old) go,
+        // a recent one outside the newest 5 cannot exist, but a recent one is never deleted.
+        let now_ms = unix_ms(SystemTime::now()).unwrap();
+        let mk = |name: &str, days: u64| Candidate {
+            path: PathBuf::from(name),
+            size: 1,
+            mtime: Some(now_ms - days * 86_400_000),
+        };
+        let files: Vec<Candidate> = (0..8).map(|i| mk(&format!("r{i}"), i)).collect();
+        // 8 dumps all younger than 30 days: nothing is deleted.
+        let (take, held) = apply_dump_rules(files, now_ms);
+        assert!(take.is_empty());
+        assert_eq!(held.iter().filter(|h| h.reason == HoldReason::TooNew).count(), 3);
+        // Unknown mtime counts as newest and is kept.
+        let mut files: Vec<Candidate> = (0..6).map(|i| mk(&format!("o{i}"), 100 + i)).collect();
+        files.push(Candidate {
+            path: PathBuf::from("unknown"),
+            size: 1,
+            mtime: None,
+        });
+        let (take, _) = apply_dump_rules(files, now_ms);
+        assert_eq!(take.len(), 2);
+        assert!(take.iter().all(|c| c.path != Path::new("unknown")));
+    }
+
+    #[test]
+    fn memory_dump_is_a_single_file_opt_in() {
+        let t = TempTree::new("memdump");
+        let root = t.base.join("Win");
+        fs::create_dir_all(&root).unwrap();
+        let single = root.join("MEMORY.DMP");
+        fs::write(&single, b"1234").unwrap();
+        fs::write(root.join("other.dmp"), b"1").unwrap();
+        let deny = DenyList::build();
+        // No age guard: a brand-new MEMORY.DMP is a candidate.
+        let plan = plan_root(
+            &RootSpec::file(single.clone(), Filter::MemoryDump),
+            &deny,
+            SystemTime::now(),
+        )
+        .unwrap();
+        assert_eq!(plan.files.len(), 1);
+        // Any other file name is refused as a MEMORY.DMP root.
+        assert!(plan_root(
+            &RootSpec::file(root.join("other.dmp"), Filter::MemoryDump),
+            &deny,
+            SystemTime::now()
+        )
+        .is_none());
         let c = purge_plan(&plan, &deny);
         assert_eq!(c.deleted, 1);
+        assert_eq!(c.freed, 4);
         assert!(!single.exists());
-        assert!(root.join("keep.txt").exists());
+        assert!(root.join("other.dmp").exists());
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn cbs_logs_only_old_and_never_cbs_log() {
+        let t = TempTree::new("cbs");
+        let root = t.base.join("CBS");
+        fs::create_dir_all(&root).unwrap();
+        for (name, days) in [("CBS.log", 90u32), ("CbsPersist_1.log", 90), ("new.log", 1), ("x.cab", 90)] {
+            let p = root.join(name);
+            fs::write(&p, b"1").unwrap();
+            set_mtime(&p, DAY * days);
+        }
+        let deny = DenyList::build();
+        let plan = plan_root(
+            &RootSpec::dir(root.clone(), false, Filter::CbsLogsOld),
+            &deny,
+            SystemTime::now(),
+        )
+        .unwrap();
+        assert_eq!(plan.files.len(), 1);
+        assert!(norm_path(&plan.files[0].path).ends_with("cbspersist_1.log"));
+        assert_eq!(plan.held.len(), 1, "new.log is held as tooNew");
+        assert_eq!(plan.held[0].reason, HoldReason::TooNew);
+    }
+
+    fn test_context(running: Vec<App>, wu_pending: bool) -> Context {
+        Context {
+            env: Env::current(),
+            deny: DenyList::build(),
+            is_admin: false,
+            running,
+            wu_pending,
+            gpus: GpuVendors::default(),
+        }
+    }
+
+    #[test]
+    fn running_apps_and_pending_updates_block_their_roots() {
+        let t = TempTree::new("gates");
+        let chrome = t.base.join("chrome-cache");
+        let discord = t.base.join("discord-cache");
+        let wu = t.base.join("Download");
+        let plain = t.base.join("plain");
+        for d in [&chrome, &discord, &wu, &plain] {
+            fs::create_dir_all(d).unwrap();
+            let f = d.join("f.bin");
+            fs::write(&f, b"12345").unwrap();
+            set_mtime(&f, DAY * 3);
+        }
+        let browser = Filter::BrowserCache {
+            allow_sqlite: false,
+        };
+        let specs = || {
+            vec![
+                RootSpec::dir(chrome.clone(), true, browser).gated(Gate::App(App::Chrome)),
+                RootSpec::dir(discord.clone(), true, browser).gated(Gate::App(App::Discord)),
+                RootSpec::dir(wu.clone(), true, Filter::Stale(RECENT_GUARD)).gated(Gate::WuDownload),
+                RootSpec::dir(plain.clone(), true, Filter::All),
+                // A gated root that does not exist never produces a note.
+                RootSpec::dir(t.base.join("missing"), true, browser).gated(Gate::App(App::Edge)),
+            ]
+        };
+
+        let ctx = test_context(vec![App::Discord, App::Chrome, App::Edge], true);
+        let plan = plan_specs(specs(), &ctx);
+        assert_eq!(plan.active.len(), 1);
+        assert_eq!(plan.blocked.len(), 3);
+        assert_eq!(plan.bytes(), 5, "blocked roots are not counted");
+        assert_eq!(
+            plan.notes,
+            vec![
+                "Skipped: Chrome and Discord are open.".to_string(),
+                NOTE_UPDATE_PENDING.to_string()
+            ]
+        );
+        assert!(plan
+            .blocked
+            .iter()
+            .any(|(_, r)| *r == BlockReason::UpdatePending));
+
+        // Purging the active part leaves the blocked roots untouched.
+        for p in &plan.active {
+            purge_plan(p, &ctx.deny);
+        }
+        assert!(chrome.join("f.bin").exists());
+        assert!(discord.join("f.bin").exists());
+        assert!(wu.join("f.bin").exists());
+        assert!(!plain.join("f.bin").exists());
+
+        // Nothing running, no update pending: everything is active, no notes.
+        let ctx = test_context(Vec::new(), false);
+        let plan = plan_specs(specs(), &ctx);
+        assert_eq!(plan.active.len(), 4, "chrome, discord, wu and the (now empty) plain root");
+        assert_eq!(plan.bytes(), 15);
+        assert!(plan.blocked.is_empty());
+        assert!(plan.notes.is_empty());
+    }
+
+    #[test]
+    fn running_app_detection_and_notes() {
+        assert_eq!(
+            apps_running([
+                ("chrome.exe", Some(true)),
+                ("msedgewebview2.exe", Some(true)),
+                ("firefox.exe", Some(false)),
+                ("Discord.exe", None),
+                ("CHROME.EXE", Some(true)),
+            ]),
+            vec![App::Chrome, App::Discord]
+        );
+        assert!(apps_running([("msedgewebview2.exe", None)]).is_empty());
+        assert_eq!(apps_running([("msedge.exe", None)]), vec![App::Edge]);
+        assert_eq!(running_apps_note(&[]), None);
+        assert_eq!(
+            running_apps_note(&[App::Firefox]).unwrap(),
+            "Skipped: Firefox is open."
+        );
+        assert_eq!(
+            running_apps_note(&[App::Chrome, App::Edge]).unwrap(),
+            "Skipped: Chrome and Edge are open."
+        );
+        assert_eq!(
+            running_apps_note(&[App::Chrome, App::Edge, App::Discord]).unwrap(),
+            "Skipped: Chrome, Edge and Discord are open."
+        );
+        // Live detection never panics.
+        let _ = detect_running_apps();
+    }
+
+    #[test]
+    fn update_pending_is_conservative() {
+        let clear = WuSignals {
+            reboot_required: Some(false),
+            reboot_pending: Some(false),
+            pending_file_renames: Some(false),
+            trusted_installer_running: Some(false),
+            wuauserv_running: Some(false),
+        };
+        assert!(!clear.update_pending());
+        assert!(WuSignals {
+            reboot_required: Some(true),
+            ..clear
+        }
+        .update_pending());
+        assert!(WuSignals {
+            trusted_installer_running: Some(true),
+            ..clear
+        }
+        .update_pending());
+        assert!(WuSignals {
+            pending_file_renames: None,
+            ..clear
+        }
+        .update_pending(), "unknown counts as pending");
+        assert!(WuSignals::default().update_pending());
+        // Live probes never panic (read-only).
+        let _ = detect_wu_signals();
+    }
+
+    #[test]
+    fn gpu_vendor_detection_and_shader_folders() {
+        let v = GpuVendors::from_pnp_ids([
+            r"PCI\VEN_1002&DEV_73BF&SUBSYS_23181458&REV_C1\6&1",
+            r"ROOT\BASICDISPLAY\0000",
+        ]);
+        assert_eq!(
+            v,
+            GpuVendors {
+                nvidia: false,
+                amd: true,
+                intel: false
+            }
+        );
+        assert_eq!(
+            shader_folder_names(v),
+            r"D3DSCache, AMD\DxCache, AMD\DxcCache, AMD\VkCache, AMD\GLCache"
+        );
+        assert_eq!(shader_folder_names(GpuVendors::default()), "D3DSCache");
+        let n = GpuVendors::from_pnp_ids([r"pci\ven_10de&dev_2704"]);
+        assert!(n.nvidia);
+        assert!(shader_folder_names(n).contains(r"NVIDIA Corporation\NV_Cache"));
+    }
+
+    #[test]
+    fn delivery_optimization_failure_reasons() {
+        assert_eq!(
+            do_failure_reason(
+                "Delete-DeliveryOptimizationCache : The term 'Delete-DeliveryOptimizationCache' is not recognized as the name of a cmdlet",
+                Some(1)
+            ),
+            "the Delete-DeliveryOptimizationCache cmdlet is not available on this system"
+        );
+        assert_eq!(
+            do_failure_reason(
+                "\r\nDelete-DeliveryOptimizationCache : Access is denied.\r\nAt line:1 char:1",
+                Some(1)
+            ),
+            "Access is denied"
+        );
+        assert_eq!(do_failure_reason("", Some(5)), "the cmdlet failed (exit code 5)");
+        let note = format!(
+            "Delivery Optimization cache was not cleared: {}.",
+            do_failure_reason("", None)
+        );
+        assert_eq!(note, "Delivery Optimization cache was not cleared: the cmdlet failed.");
+    }
+
+    #[test]
+    fn folder_size_is_read_only_and_skips_links() {
+        let t = TempTree::new("size");
+        let root = t.base.join("root");
+        let outside = t.base.join("outside");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join("a"), vec![0u8; 100]).unwrap();
+        fs::write(root.join("sub").join("b"), vec![0u8; 20]).unwrap();
+        fs::write(outside.join("big"), vec![0u8; 1000]).unwrap();
+        let _ = make_junction(&root.join("link"), &outside);
+        assert_eq!(folder_size(&root), Some((120, 2)));
+        assert!(root.join("a").exists());
+        assert_eq!(folder_size(&t.base.join("nope")), Some((0, 0)));
+    }
+
+    #[test]
+    fn delete_errors_map_to_log_reasons() {
+        assert_eq!(
+            delete_outcome(&DeleteError::Open(Some(32), "in use".into())),
+            ("skipped", "locked".to_string())
+        );
+        assert_eq!(
+            delete_outcome(&DeleteError::Failed(Some(5), "denied".into())),
+            ("skipped", "accessDenied".to_string())
+        );
+        assert_eq!(
+            delete_outcome(&DeleteError::NotAllowed("reparse point")),
+            ("skipped", "reparsePoint".to_string())
+        );
+        assert_eq!(
+            delete_outcome(&DeleteError::Failed(Some(1117), "I/O device error".into())),
+            ("failed", "I/O device error".to_string())
+        );
+    }
+
+    #[test]
+    fn categories_defaults_and_availability() {
+        let ids: Vec<&str> = CategoryId::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["temp", "wu-cache", "logs", "dumps", "memory-dump", "shader", "recycle", "browser"]
+        );
+        assert_eq!(CategoryId::parse("standby"), None, "standby is removed");
+        for id in CategoryId::ALL {
+            let on = matches!(id, CategoryId::Temp | CategoryId::WuCache | CategoryId::Logs);
+            assert_eq!(id.default_enabled(), on, "{}", id.as_str());
+            assert_eq!(id.optional(), !on, "{}", id.as_str());
+        }
+        // Not elevated: admin-only categories are unavailable, switched off, noted.
+        let c = make_category(CategoryId::Logs, false, 500, 3, "d".into(), vec![]);
+        assert!(!c.available);
+        assert!(!c.enabled);
+        assert_eq!(c.unavailable_reason.as_deref(), Some("needsAdmin"));
+        assert_eq!(c.note.as_deref(), Some(NOTE_NEEDS_ADMIN));
+        assert_eq!(c.bytes, 500, "best-effort estimate is still reported");
+        let c = make_category(CategoryId::Temp, false, 1, 1, "d".into(), vec![]);
+        assert!(c.available && c.enabled && c.note.is_none());
+        let c = make_category(
+            CategoryId::Shader,
+            true,
+            1,
+            1,
+            "d".into(),
+            vec!["a.".into(), "b.".into()],
+        );
+        assert!(c.available && !c.enabled);
+        assert_eq!(c.note.as_deref(), Some("a. b."));
+        let v = serde_json::to_value(&c).unwrap();
+        assert!(v["unavailableReason"].is_null());
+        assert_eq!(v["requiresAdmin"], false);
+    }
+
+    #[test]
+    fn purge_rejects_unknown_ids() {
+        assert!(parse_categories(&["temp".into(), "standby".into()]).is_err());
+        assert_eq!(
+            parse_categories(&["browser".into(), "temp".into(), "TEMP".into()]).unwrap(),
+            vec![CategoryId::Temp, CategoryId::Browser]
+        );
+    }
+
+    #[test]
+    fn scan_never_counts_unavailable_bytes() {
+        let scan = scan(false);
+        assert!(scan.categories.iter().all(|c| c.id != "browser"));
+        let available: u64 = scan
+            .categories
+            .iter()
+            .filter(|c| c.available)
+            .map(|c| c.bytes)
+            .sum();
+        assert_eq!(scan.total_bytes, available);
+        let shader = scan.categories.iter().find(|c| c.id == "shader").unwrap();
+        assert!(shader
+            .description
+            .starts_with("Only clear if a game shows corrupted graphics."));
+        assert!(shader.description.contains("Folders: D3DSCache"));
+        let ids: Vec<&str> = scan.categories.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["temp", "wu-cache", "logs", "dumps", "memory-dump", "shader", "recycle"]
+        );
     }
 
     #[test]
@@ -2087,13 +3450,57 @@ mod tests {
         {
             assert!(p.is_absolute(), "{}", p.display());
         }
-        // Every planned root of every file category passes the shape check.
-        let deny = DenyList::build();
-        for id in CategoryId::ALL {
-            for plan in plan_category(id, &env, &deny) {
-                assert!(root_shape_ok(&plan.root_norm), "{}", plan.root_norm);
-                assert!(!deny.is_denied(&plan.root_norm), "{}", plan.root_norm);
+        // Every planned root of every file category passes the shape check (as admin and not,
+        // with every vendor's shader folders and every gate both open and closed).
+        for is_admin in [false, true] {
+            for gated in [false, true] {
+                let ctx = Context {
+                    env: Env::current(),
+                    deny: DenyList::build(),
+                    is_admin,
+                    running: if gated { App::ALL.to_vec() } else { Vec::new() },
+                    wu_pending: gated,
+                    gpus: GpuVendors {
+                        nvidia: true,
+                        amd: true,
+                        intel: true,
+                    },
+                };
+                for id in CategoryId::ALL {
+                    let plan = plan_category(id, &ctx);
+                    let roots = plan
+                        .active
+                        .iter()
+                        .chain(plan.blocked.iter().map(|(p, _)| p));
+                    for p in roots {
+                        assert!(root_shape_ok(&p.root_norm), "{}", p.root_norm);
+                        assert!(!ctx.deny.is_denied(&p.root_norm), "{}", p.root_norm);
+                        // Prefetch is never a root.
+                        assert!(!p.root_norm.ends_with(r"\prefetch"), "{}", p.root_norm);
+                        // Delivery Optimization files are never a file root (cmdlet only).
+                        assert!(!p.root_norm.contains("deliveryoptimization"), "{}", p.root_norm);
+                    }
+                    if gated && id == CategoryId::Browser {
+                        assert!(plan.active.is_empty(), "browsers are open: nothing active");
+                    }
+                }
+                // Not elevated: Windows\Temp is not a temp root.
+                if !is_admin {
+                    let wtemp = norm_path(&windows_dir().join("Temp"));
+                    let plan = plan_category(CategoryId::Temp, &ctx);
+                    assert!(plan.active.iter().all(|p| p.root_norm != wtemp));
+                }
             }
         }
+    }
+
+    #[test]
+    fn nexum_folders_are_deny_listed() {
+        let deny = DenyList::build();
+        if let Some(pd) = crate::util::program_data_dir() {
+            assert!(deny.is_denied(&norm_path(&pd.join(r"Nexum\fan-manual.flag"))));
+        }
+        let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        assert!(deny.is_denied(&norm_path(&exe_dir.join("nexum-agent.exe"))));
     }
 }

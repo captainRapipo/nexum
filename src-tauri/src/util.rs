@@ -140,6 +140,162 @@ pub fn documents_nexum_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// Current wall-clock time as unix milliseconds.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// `SystemTime` → unix milliseconds (`None` before 1970).
+pub fn unix_ms(t: std::time::SystemTime) -> Option<u64> {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+}
+
+/// Bytes as `"512 B"`, `"1.5 KB"`, `"2.3 GB"` (1024-based, one decimal; same as the UI's fmtBytes).
+pub fn fmt_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    format!("{v:.1} {}", UNITS[i])
+}
+
+/// `%ProgramData%` from the known-folder API (never from the environment).
+pub fn program_data_dir() -> Option<PathBuf> {
+    known_folder(&windows::Win32::UI::Shell::FOLDERID_ProgramData)
+}
+
+/// `%LOCALAPPDATA%` from the known-folder API, falling back to `dirs`.
+pub fn local_appdata_dir() -> Option<PathBuf> {
+    known_folder(&windows::Win32::UI::Shell::FOLDERID_LocalAppData).or_else(dirs::data_local_dir)
+}
+
+/// NUL-terminated UTF-16 copy of an OS string.
+pub fn to_wide(s: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    s.as_ref()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+/// The Win32 error code inside an `HRESULT_FROM_WIN32` value (facility 7), if any.
+pub fn win32_code(hresult: i32) -> Option<u32> {
+    let h = hresult as u32;
+    if (h >> 16) & 0x7FF == 7 {
+        Some(h & 0xFFFF)
+    } else {
+        None
+    }
+}
+
+/// Closes a kernel handle on drop.
+pub struct OwnedHandle(pub windows::Win32::Foundation::HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            // SAFETY: the handle was returned by a successful open call and is closed once.
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+const ERROR_FILE_NOT_FOUND_CODE: u32 = 2;
+const ERROR_PATH_NOT_FOUND_CODE: u32 = 3;
+
+/// Whether an `HKLM` key exists (64-bit view): `Some(true)` / `Some(false)` when the registry
+/// answered clearly, `None` when it could not tell (e.g. access denied).
+pub fn hklm_key_state(subkey: &str) -> Option<bool> {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY,
+    };
+    let wide = to_wide(subkey);
+    let mut key = HKEY::default();
+    // SAFETY: `wide` is NUL-terminated and outlives the call; `key` is a valid out pointer.
+    let rc = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            windows::core::PCWSTR(wide.as_ptr()),
+            0,
+            KEY_READ | KEY_WOW64_64KEY,
+            &mut key,
+        )
+    };
+    match rc.0 {
+        0 => {
+            // SAFETY: the key was opened above and is closed once.
+            unsafe {
+                let _ = RegCloseKey(key);
+            }
+            Some(true)
+        }
+        ERROR_FILE_NOT_FOUND_CODE | ERROR_PATH_NOT_FOUND_CODE => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether a value exists under an `HKLM` key and holds more than an empty string / empty
+/// multi-string. Same tri-state convention as [`hklm_key_state`].
+pub fn hklm_value_state(subkey: &str, value: &str) -> Option<bool> {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
+        KEY_WOW64_64KEY,
+    };
+    let wkey = to_wide(subkey);
+    let wval = to_wide(value);
+    let mut key = HKEY::default();
+    // SAFETY: as in `hklm_key_state`.
+    let rc = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            windows::core::PCWSTR(wkey.as_ptr()),
+            0,
+            KEY_READ | KEY_WOW64_64KEY,
+            &mut key,
+        )
+    };
+    match rc.0 {
+        0 => {}
+        ERROR_FILE_NOT_FOUND_CODE | ERROR_PATH_NOT_FOUND_CODE => return Some(false),
+        _ => return None,
+    }
+    let mut size: u32 = 0;
+    // SAFETY: size-only query (no data buffer); `key` is open.
+    let rc = unsafe {
+        RegQueryValueExW(
+            key,
+            windows::core::PCWSTR(wval.as_ptr()),
+            None,
+            None,
+            None,
+            Some(&mut size as *mut u32),
+        )
+    };
+    // SAFETY: closes the key opened above exactly once.
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
+    match rc.0 {
+        // An empty REG_MULTI_SZ is 2 or 4 bytes of terminators.
+        0 => Some(size > 4),
+        ERROR_FILE_NOT_FOUND_CODE => Some(false),
+        _ => None,
+    }
+}
+
 /// Trims a WMI string, mapping `None`/blank to `""`.
 pub fn clean(s: &Option<String>) -> String {
     s.as_deref().map(str::trim).unwrap_or("").to_string()
@@ -288,6 +444,37 @@ mod tests {
         assert!(w.to_string_lossy().to_ascii_uppercase().starts_with(&d));
         use windows::Win32::UI::Shell::FOLDERID_ProgramData;
         assert!(known_folder(&FOLDERID_ProgramData).is_some_and(|p| p.is_dir()));
+    }
+
+    #[test]
+    fn byte_formatting_matches_ui() {
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(1023), "1023 B");
+        assert_eq!(fmt_bytes(1024), "1.0 KB");
+        assert_eq!(fmt_bytes(1536), "1.5 KB");
+        assert_eq!(fmt_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn win32_codes_from_hresults() {
+        assert_eq!(win32_code(0x8007_0020u32 as i32), Some(32));
+        assert_eq!(win32_code(0x8007_0005u32 as i32), Some(5));
+        assert_eq!(win32_code(0x8000_4005u32 as i32), None);
+    }
+
+    #[test]
+    fn registry_probe_is_tri_state() {
+        // A key that always exists and one that never does.
+        assert_eq!(hklm_key_state(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"), Some(true));
+        assert_eq!(hklm_key_state(r"SOFTWARE\Nexum-Test-Nonexistent-Key-7f3a"), Some(false));
+        assert_eq!(
+            hklm_value_state(r"SOFTWARE\Nexum-Test-Nonexistent-Key-7f3a", "X"),
+            Some(false)
+        );
+        assert_eq!(
+            hklm_value_state(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "CurrentBuildNumber"),
+            Some(true)
+        );
     }
 
     #[test]

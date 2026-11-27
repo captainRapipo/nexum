@@ -3,14 +3,19 @@
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
+use std::collections::HashMap;
+
 use crate::state::AppState;
 use crate::system_info::{query_soft, wmi_connection, NS_CIMV2};
 use crate::util::{
-    clean, documents_nexum_dir, file_timestamp, hidden_command, lock, parse_cim_date, system32_exe,
+    clean, documents_nexum_dir, file_timestamp, flex, hidden_command, lock, parse_cim_date,
+    system32_exe,
 };
 
-const OUTDATED_DAYS: i64 = 1095; // 3 years
 const MAX_BACKUP_OUTPUT: usize = 64 * 1024;
+/// ConfigManagerErrorCode values shown neutrally, not as problems: 22 = disabled by the user,
+/// 45 = device not connected (CONTRACT §2.7).
+const NEUTRAL_CODES: [u32; 2] = [22, 45];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,8 +31,14 @@ pub struct DriverInfo {
     pub signer: String,
     pub inf_name: String,
     pub device_id: String,
+    /// Neutral information only; never drives status.
     pub age_days: Option<i64>,
+    /// `"ok" | "unsigned" | "problem"` (CONTRACT §2.7).
     pub status: String,
+    /// `Win32_PnPEntity.ConfigManagerErrorCode` when ≠ 0.
+    pub problem_code: Option<u32>,
+    /// The INF is not an `oemNN.inf` (ships with Windows).
+    pub is_inbox: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,6 +71,52 @@ struct PnpSignedDriverRow {
     inf_name: Option<String>,
     #[serde(rename = "DeviceID", default)]
     device_id: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct PnpEntityRow {
+    #[serde(rename = "DeviceID", default)]
+    device_id: Option<String>,
+    #[serde(
+        rename = "ConfigManagerErrorCode",
+        default,
+        deserialize_with = "flex::opt_u64"
+    )]
+    config_manager_error_code: Option<u64>,
+}
+
+/// Join key for PnP device instance ids (case-insensitive).
+fn device_key(id: &str) -> String {
+    id.trim().to_ascii_uppercase()
+}
+
+/// `DeviceID` → `ConfigManagerErrorCode` for every PnP entity.
+fn error_codes(rows: Vec<PnpEntityRow>) -> HashMap<String, u32> {
+    rows.into_iter()
+        .filter_map(|r| {
+            let id = device_key(r.device_id.as_deref()?);
+            let code = u32::try_from(r.config_manager_error_code?).ok()?;
+            (!id.is_empty()).then_some((id, code))
+        })
+        .collect()
+}
+
+/// `^oem\d+\.inf$` (case-insensitive): a third-party driver package staged by pnputil/setup.
+fn is_oem_inf(inf: &str) -> bool {
+    let lower = inf.trim().to_ascii_lowercase();
+    lower
+        .strip_prefix("oem")
+        .and_then(|rest| rest.strip_suffix(".inf"))
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Status precedence: problem > unsigned > ok (CONTRACT §2.7).
+fn driver_status(code: Option<u32>, signed: bool) -> &'static str {
+    match code {
+        Some(c) if c != 0 && !NEUTRAL_CODES.contains(&c) => "problem",
+        _ if !signed => "unsigned",
+        _ => "ok",
+    }
 }
 
 const CATEGORY_ORDER: [&str; 11] = [
@@ -166,7 +223,11 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
     false
 }
 
-fn to_driver(row: PnpSignedDriverRow, today: chrono::NaiveDate) -> Option<DriverInfo> {
+fn to_driver(
+    row: PnpSignedDriverRow,
+    today: chrono::NaiveDate,
+    codes: &HashMap<String, u32>,
+) -> Option<DriverInfo> {
     let device_name = clean(&row.device_name);
     if device_name.is_empty() {
         return None;
@@ -178,14 +239,13 @@ fn to_driver(row: PnpSignedDriverRow, today: chrono::NaiveDate) -> Option<Driver
     let date = row.driver_date.as_deref().and_then(parse_cim_date);
     let age_days = date.map(|d| (today - d).num_days().max(0));
     let signed = row.is_signed.unwrap_or(false);
-    let status = if !signed {
-        "unsigned"
-    } else if age_days.is_some_and(|a| a > OUTDATED_DAYS) {
-        "outdated"
-    } else {
-        "ok"
-    };
+    let device_id = clean(&row.device_id);
+    let code = codes.get(&device_key(&device_id)).copied();
+    let inf_name = clean(&row.inf_name);
     Some(DriverInfo {
+        status: driver_status(code, signed).to_string(),
+        problem_code: code.filter(|c| *c != 0),
+        is_inbox: !is_oem_inf(&inf_name),
         category: categorize(&device_class, &device_name, &provider, &manufacturer).to_string(),
         device_name,
         device_class,
@@ -197,10 +257,9 @@ fn to_driver(row: PnpSignedDriverRow, today: chrono::NaiveDate) -> Option<Driver
             .unwrap_or_default(),
         signed,
         signer,
-        inf_name: clean(&row.inf_name),
-        device_id: clean(&row.device_id),
+        inf_name,
+        device_id,
         age_days,
-        status: status.to_string(),
     })
 }
 
@@ -210,10 +269,16 @@ pub fn scan_drivers() -> Result<Vec<DriverInfo>, String> {
         Some(&conn),
         "SELECT DeviceName, DeviceClass, DriverProviderName, Manufacturer, DriverVersion, DriverDate, IsSigned, Signer, InfName, DeviceID FROM Win32_PnPSignedDriver",
     );
+    // A failed entity query leaves every code unknown (status falls back to signed/unsigned).
+    let entities: Vec<PnpEntityRow> = query_soft(
+        Some(&conn),
+        "SELECT DeviceID, ConfigManagerErrorCode FROM Win32_PnPEntity",
+    );
+    let codes = error_codes(entities);
     let today = chrono::Local::now().date_naive();
     let mut drivers: Vec<DriverInfo> = rows
         .into_iter()
-        .filter_map(|r| to_driver(r, today))
+        .filter_map(|r| to_driver(r, today, &codes))
         .collect();
     drivers.sort_by(|a, b| {
         category_rank(&a.category)
@@ -267,6 +332,8 @@ pub fn to_csv(drivers: &[DriverInfo]) -> String {
         "Device ID",
         "Age (days)",
         "Status",
+        "Problem code",
+        "Inbox",
     ];
     out.push_str(
         &header
@@ -291,6 +358,8 @@ pub fn to_csv(drivers: &[DriverInfo]) -> String {
             d.device_id.clone(),
             d.age_days.map(|a| a.to_string()).unwrap_or_default(),
             d.status.clone(),
+            d.problem_code.map(|c| c.to_string()).unwrap_or_default(),
+            if d.is_inbox { "Yes".into() } else { "No".into() },
         ];
         out.push_str(
             &row.iter()
@@ -499,30 +568,91 @@ mod tests {
     #[test]
     fn status_rules() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let none = HashMap::new();
         let d = to_driver(
             row("A", "NET", "20250101000000.000000-000", Some(true)),
             today,
+            &none,
         )
         .unwrap();
         assert_eq!(d.status, "ok");
         assert_eq!(d.age_days, Some(365));
         assert_eq!(d.date, "2025-01-01");
+        assert_eq!(d.problem_code, None);
+        assert!(d.is_inbox, "machine.inf ships with Windows");
+        // Age alone is never a status any more.
         let d = to_driver(
             row("B", "NET", "20060621000000.******+000", Some(true)),
             today,
+            &none,
         )
         .unwrap();
-        assert_eq!(d.status, "outdated");
+        assert_eq!(d.status, "ok");
+        assert!(d.age_days.unwrap() > 3650);
         let d = to_driver(
             row("C", "NET", "20250101000000.000000-000", Some(false)),
             today,
+            &none,
         )
         .unwrap();
         assert_eq!(d.status, "unsigned");
-        let d = to_driver(row("D", "NET", "", Some(true)), today).unwrap();
+        let d = to_driver(row("D", "NET", "", Some(true)), today, &none).unwrap();
         assert_eq!(d.age_days, None);
         assert_eq!(d.date, "");
-        assert!(to_driver(row("  ", "NET", "", Some(true)), today).is_none());
+        assert!(to_driver(row("  ", "NET", "", Some(true)), today, &none).is_none());
+    }
+
+    #[test]
+    fn problem_codes_join_by_device_id() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let entities: Vec<PnpEntityRow> = serde_json::from_value(serde_json::json!([
+            { "DeviceID": "root\\x", "ConfigManagerErrorCode": 28 },
+            { "DeviceID": "PCI\\VEN_1", "ConfigManagerErrorCode": 22 },
+            { "DeviceID": "USB\\DEV_2", "ConfigManagerErrorCode": "45" },
+            { "DeviceID": "PCI\\OK", "ConfigManagerErrorCode": 0 },
+            { "DeviceID": null, "ConfigManagerErrorCode": 1 },
+        ]))
+        .unwrap();
+        let codes = error_codes(entities);
+        assert_eq!(codes.len(), 4);
+
+        // Code 28 on an unsigned driver: problem wins.
+        let d = to_driver(row("X", "NET", "", Some(false)), today, &codes).unwrap();
+        assert_eq!(d.status, "problem");
+        assert_eq!(d.problem_code, Some(28));
+
+        let mut r = row("Y", "NET", "", Some(true));
+        r.device_id = Some("PCI\\VEN_1".into());
+        let d = to_driver(r, today, &codes).unwrap();
+        assert_eq!(d.status, "ok", "disabled by the user is neutral");
+        assert_eq!(d.problem_code, Some(22));
+
+        let mut r = row("Z", "NET", "", Some(false));
+        r.device_id = Some("usb\\dev_2".into());
+        let d = to_driver(r, today, &codes).unwrap();
+        assert_eq!(d.status, "unsigned", "not connected is neutral");
+        assert_eq!(d.problem_code, Some(45));
+
+        let mut r = row("W", "NET", "", Some(true));
+        r.device_id = Some("PCI\\OK".into());
+        let d = to_driver(r, today, &codes).unwrap();
+        assert_eq!(d.status, "ok");
+        assert_eq!(d.problem_code, None);
+    }
+
+    #[test]
+    fn inbox_detection() {
+        assert!(is_oem_inf("oem12.inf"));
+        assert!(is_oem_inf("OEM0.INF"));
+        assert!(is_oem_inf(" oem7.inf "));
+        assert!(!is_oem_inf("oem.inf"));
+        assert!(!is_oem_inf("oemx1.inf"));
+        assert!(!is_oem_inf("machine.inf"));
+        assert!(!is_oem_inf("oem12.inf.bak"));
+        assert!(!is_oem_inf(""));
+        assert_eq!(driver_status(Some(10), true), "problem");
+        assert_eq!(driver_status(Some(0), false), "unsigned");
+        assert_eq!(driver_status(None, true), "ok");
     }
 
     #[test]
@@ -536,6 +666,7 @@ mod tests {
                 Some(true),
             ),
             today,
+            &HashMap::new(),
         )
         .unwrap();
         d.provider = "Prov".into();

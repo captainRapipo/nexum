@@ -1,6 +1,7 @@
 //! User settings: JSON persistence under the app config dir, plus side effects
 //! (Task Scheduler autostart, sidecar poll interval).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -17,6 +18,23 @@ pub const TRAY_POLL_MS: u64 = 5_000;
 
 const TASK_NAME: &str = "Nexum";
 
+/// Re-match data stored with each user label (CONTRACT §2.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SensorLabelMeta {
+    pub default_name: String,
+    pub hardware_name: String,
+}
+
+pub const MAX_LABEL_CHARS: usize = 64;
+pub const MAX_LABELS: usize = 2000;
+pub const MAX_HIDDEN: usize = 2000;
+pub const MAX_PINNED: usize = 12;
+pub const MAX_DISMISSED: usize = 200;
+/// Sensor ids are LHM identifiers ("/lpc/it8688e/0/temperature/4"); anything longer is junk.
+const MAX_ID_CHARS: usize = 512;
+const MAX_META_CHARS: usize = 256;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -26,9 +44,22 @@ pub struct Settings {
     pub poll_interval_ms: u64,
     pub include_browser_caches: bool,
     pub confirm_before_purge: bool,
-    pub flush_standby_on_purge: bool,
+    // `flushStandbyOnPurge` (0.x) is gone: unknown fields in old files are ignored.
     pub temp_unit: String,
     pub start_minimized: bool,
+    #[serde(deserialize_with = "de_labels")]
+    pub sensor_labels: BTreeMap<String, String>,
+    #[serde(deserialize_with = "de_label_meta")]
+    pub sensor_label_meta: BTreeMap<String, SensorLabelMeta>,
+    #[serde(deserialize_with = "de_string_list")]
+    pub hidden_sensors: Vec<String>,
+    #[serde(deserialize_with = "de_opt_string_list")]
+    pub pinned_sensors: Option<Vec<String>>,
+    pub hide_unused_sensors: bool,
+    #[serde(deserialize_with = "de_string_list")]
+    pub dismissed_alerts: Vec<String>,
+    #[serde(deserialize_with = "de_choice")]
+    pub sensor_driver_choice: String,
 }
 
 impl Default for Settings {
@@ -39,15 +70,21 @@ impl Default for Settings {
             poll_interval_ms: 1000,
             include_browser_caches: false,
             confirm_before_purge: true,
-            flush_standby_on_purge: false,
             temp_unit: "C".to_string(),
             start_minimized: false,
+            sensor_labels: BTreeMap::new(),
+            sensor_label_meta: BTreeMap::new(),
+            hidden_sensors: Vec::new(),
+            pinned_sensors: None,
+            hide_unused_sensors: true,
+            dismissed_alerts: Vec::new(),
+            sensor_driver_choice: "undecided".to_string(),
         }
     }
 }
 
 impl Settings {
-    /// Clamps/normalizes values coming from disk or the frontend.
+    /// Clamps/normalizes values coming from disk or the frontend (CONTRACT §2.2).
     pub fn sanitized(mut self) -> Self {
         self.poll_interval_ms = clamp_poll(self.poll_interval_ms);
         self.temp_unit = if self.temp_unit.trim().eq_ignore_ascii_case("F") {
@@ -55,8 +92,90 @@ impl Settings {
         } else {
             "C".to_string()
         };
+
+        // Labels: trimmed, non-empty, at most 64 characters, at most 2000 entries.
+        let mut labels = BTreeMap::new();
+        for (id, label) in std::mem::take(&mut self.sensor_labels) {
+            let id = id.trim().to_string();
+            let label = truncate_chars(label.trim(), MAX_LABEL_CHARS);
+            if id.is_empty() || id.chars().count() > MAX_ID_CHARS || label.is_empty() {
+                continue;
+            }
+            if labels.len() >= MAX_LABELS && !labels.contains_key(&id) {
+                continue;
+            }
+            labels.insert(id, label);
+        }
+        self.sensor_labels = labels;
+
+        // Meta only for labelled ids.
+        let meta = std::mem::take(&mut self.sensor_label_meta);
+        let mut kept = BTreeMap::new();
+        for (id, m) in meta {
+            let id = id.trim().to_string();
+            if self.sensor_labels.contains_key(&id) {
+                kept.insert(
+                    id,
+                    SensorLabelMeta {
+                        default_name: truncate_chars(&m.default_name, MAX_META_CHARS),
+                        hardware_name: truncate_chars(&m.hardware_name, MAX_META_CHARS),
+                    },
+                );
+            }
+        }
+        self.sensor_label_meta = kept;
+
+        self.hidden_sensors =
+            dedupe_ids(std::mem::take(&mut self.hidden_sensors), MAX_HIDDEN, false);
+        self.pinned_sensors = self
+            .pinned_sensors
+            .take()
+            .map(|p| dedupe_ids(p, MAX_PINNED, false));
+        self.dismissed_alerts =
+            dedupe_ids(std::mem::take(&mut self.dismissed_alerts), MAX_DISMISSED, true);
+
+        if !matches!(
+            self.sensor_driver_choice.as_str(),
+            "undecided" | "pawnio" | "none"
+        ) {
+            self.sensor_driver_choice = "undecided".to_string();
+        }
         self
     }
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// Trims, drops empty/oversized entries and duplicates, then caps the list at `max` entries:
+/// the first `max` (first occurrence wins), or the most recent `max` when `keep_last` (the
+/// last occurrence of a duplicate counts as its position).
+fn dedupe_ids(items: Vec<String>, max: usize, keep_last: bool) -> Vec<String> {
+    let cleaned: Vec<String> = items
+        .into_iter()
+        .map(|i| i.trim().to_string())
+        .filter(|t| !t.is_empty() && t.chars().count() <= MAX_ID_CHARS)
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    if keep_last {
+        for t in cleaned.into_iter().rev() {
+            if seen.insert(t.clone()) {
+                out.push(t);
+            }
+        }
+        out.truncate(max);
+        out.reverse();
+    } else {
+        for t in cleaned {
+            if seen.insert(t.clone()) {
+                out.push(t);
+            }
+        }
+        out.truncate(max);
+    }
+    out
 }
 
 pub fn clamp_poll(ms: u64) -> u64 {
@@ -80,6 +199,69 @@ fn de_ms<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
         _ => None,
     };
     Ok(ms.unwrap_or(1000))
+}
+
+/// `Record<string,string>`; non-string values and non-object input are dropped.
+fn de_labels<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<String, String>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    let mut out = BTreeMap::new();
+    if let serde_json::Value::Object(map) = v {
+        for (k, v) in map {
+            if let serde_json::Value::String(s) = v {
+                out.insert(k, s);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `Record<string,{defaultName,hardwareName}>`; malformed entries are dropped.
+fn de_label_meta<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<String, SensorLabelMeta>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    let mut out = BTreeMap::new();
+    if let serde_json::Value::Object(map) = v {
+        for (k, v) in map {
+            if let Ok(m) = serde_json::from_value::<SensorLabelMeta>(v) {
+                out.insert(k, m);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn string_list(v: serde_json::Value) -> Option<Vec<String>> {
+    match v {
+        serde_json::Value::Array(items) => Some(
+            items
+                .into_iter()
+                .filter_map(|i| match i {
+                    serde_json::Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// `string[]`; anything else becomes `[]`.
+fn de_string_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Ok(string_list(serde_json::Value::deserialize(d)?).unwrap_or_default())
+}
+
+/// `string[] | null`; anything that is not an array becomes `null` (= default pin rule).
+fn de_opt_string_list<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+    Ok(string_list(serde_json::Value::deserialize(d)?))
+}
+
+/// `"undecided" | "pawnio" | "none"`; anything else becomes `"undecided"` (via `sanitized`).
+fn de_choice<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => s,
+        _ => "undecided".to_string(),
+    })
 }
 
 /// Reads settings from disk (defaults when missing or unreadable).
@@ -446,9 +628,104 @@ mod tests {
         assert_eq!(v["pollIntervalMs"], 1000);
         assert_eq!(v["includeBrowserCaches"], false);
         assert_eq!(v["confirmBeforePurge"], true);
-        assert_eq!(v["flushStandbyOnPurge"], false);
+        assert!(v.get("flushStandbyOnPurge").is_none());
         assert_eq!(v["tempUnit"], "C");
         assert_eq!(v["startMinimized"], false);
+        assert_eq!(v["sensorLabels"], serde_json::json!({}));
+        assert_eq!(v["sensorLabelMeta"], serde_json::json!({}));
+        assert_eq!(v["hiddenSensors"], serde_json::json!([]));
+        assert!(v["pinnedSensors"].is_null());
+        assert_eq!(v["hideUnusedSensors"], true);
+        assert_eq!(v["dismissedAlerts"], serde_json::json!([]));
+        assert_eq!(v["sensorDriverChoice"], "undecided");
+    }
+
+    #[test]
+    fn old_settings_files_migrate() {
+        // A 0.x file: has flushStandbyOnPurge, lacks every new field.
+        let old = r#"{"launchOnStartup":true,"minimizeToTray":false,"pollIntervalMs":2000,
+            "includeBrowserCaches":true,"confirmBeforePurge":false,"flushStandbyOnPurge":true,
+            "tempUnit":"F","startMinimized":true}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        let s = s.sanitized();
+        assert!(s.launch_on_startup);
+        assert!(!s.minimize_to_tray);
+        assert_eq!(s.poll_interval_ms, 2000);
+        assert_eq!(s.temp_unit, "F");
+        assert!(s.sensor_labels.is_empty());
+        assert_eq!(s.pinned_sensors, None);
+        assert!(s.hide_unused_sensors);
+        assert_eq!(s.sensor_driver_choice, "undecided");
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v.get("flushStandbyOnPurge").is_none(), "removed field is not written back");
+    }
+
+    #[test]
+    fn wrongly_typed_new_fields_do_not_reset_the_file() {
+        let s: Settings = serde_json::from_str(
+            r#"{"pollIntervalMs":500,"sensorLabels":["x"],"hiddenSensors":"a",
+                "pinnedSensors":5,"dismissedAlerts":{"a":1},"sensorDriverChoice":7,
+                "sensorLabelMeta":{"/a":{"defaultName":1}}}"#,
+        )
+        .unwrap();
+        let s = s.sanitized();
+        assert_eq!(s.poll_interval_ms, 500);
+        assert!(s.sensor_labels.is_empty());
+        assert!(s.hidden_sensors.is_empty());
+        assert_eq!(s.pinned_sensors, None);
+        assert!(s.dismissed_alerts.is_empty());
+        assert_eq!(s.sensor_driver_choice, "undecided");
+        assert!(s.sensor_label_meta.is_empty());
+    }
+
+    #[test]
+    fn sensor_settings_are_sanitized() {
+        let long = "x".repeat(100);
+        let json = serde_json::json!({
+            "sensorLabels": {
+                "/lpc/it8688e/0/fan/1": "  CPU cooler  ",
+                "/lpc/it8688e/0/fan/2": "   ",
+                "": "nameless",
+                "/lpc/it8688e/0/fan/3": long,
+            },
+            "sensorLabelMeta": {
+                "/lpc/it8688e/0/fan/1": { "defaultName": "Fan #2", "hardwareName": "ITE IT8688E" },
+                "/lpc/it8688e/0/fan/9": { "defaultName": "Fan #9", "hardwareName": "ITE IT8688E" },
+            },
+            "hiddenSensors": ["/a", " /a ", "", "/b"],
+            "pinnedSensors": ["/1","/2","/3","/4","/5","/6","/7","/8","/9","/10","/11","/12","/13","/1"],
+            "dismissedAlerts": ["k1", "k2", "k1"],
+            "sensorDriverChoice": "pawnio",
+            "hideUnusedSensors": false,
+        });
+        let s: Settings = serde_json::from_value(json).unwrap();
+        let s = s.sanitized();
+        assert_eq!(s.sensor_labels.len(), 2);
+        assert_eq!(s.sensor_labels["/lpc/it8688e/0/fan/1"], "CPU cooler");
+        assert_eq!(s.sensor_labels["/lpc/it8688e/0/fan/3"].chars().count(), MAX_LABEL_CHARS);
+        assert_eq!(s.sensor_label_meta.len(), 1, "meta without a label is dropped");
+        assert_eq!(s.hidden_sensors, vec!["/a", "/b"]);
+        let pinned = s.pinned_sensors.clone().unwrap();
+        assert_eq!(pinned.len(), MAX_PINNED);
+        assert_eq!(pinned[0], "/1");
+        assert_eq!(s.dismissed_alerts, vec!["k2", "k1"], "most recent occurrence wins");
+        assert_eq!(s.sensor_driver_choice, "pawnio");
+        assert!(!s.hide_unused_sensors);
+
+        let mut many = Vec::new();
+        for i in 0..250 {
+            many.push(format!("alert-{i}"));
+        }
+        let s = Settings {
+            dismissed_alerts: many,
+            sensor_driver_choice: "bogus".into(),
+            ..Settings::default()
+        }
+        .sanitized();
+        assert_eq!(s.dismissed_alerts.len(), MAX_DISMISSED);
+        assert_eq!(s.dismissed_alerts[0], "alert-50");
+        assert_eq!(s.dismissed_alerts[199], "alert-249");
+        assert_eq!(s.sensor_driver_choice, "undecided");
     }
 
     #[test]

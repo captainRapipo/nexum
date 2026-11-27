@@ -6,6 +6,7 @@ use std::sync::Mutex;
 
 use crate::agent::AgentManager;
 use crate::drivers::DriverInfo;
+use crate::failsafe::Tracker;
 use crate::settings::Settings;
 
 pub struct AppState {
@@ -13,17 +14,20 @@ pub struct AppState {
     pub settings: Mutex<Settings>,
     /// Absolute path of `settings.json` (resolved in `setup`).
     pub settings_path: Mutex<Option<PathBuf>>,
-    /// Sidecar lifecycle + stdin writer + status.
+    /// Sidecar lifecycle + stdin writer + status + sensor/spec bridge.
     pub agent: AgentManager,
+    /// Fan fail-safe banner state (CONTRACT §2.4).
+    pub failsafe: Mutex<Tracker>,
     /// ISO-8601 timestamp of the last successful driver scan.
     pub last_driver_scan: Mutex<Option<String>>,
     /// Result of the last driver scan (used by `export_drivers`).
     pub driver_cache: Mutex<Option<Vec<DriverInfo>>>,
-    /// True while the main window is hidden in the tray (telemetry is throttled).
+    /// True while the main window is hidden in the tray (telemetry is throttled, the sensor
+    /// stream and the self-usage readout pause).
     pub in_tray: AtomicBool,
     /// True once the user chose "Quit" (close must not be intercepted anymore).
     pub quitting: AtomicBool,
-    /// Prevents two purges from running at the same time.
+    /// Prevents two cleanups from running at the same time.
     pub purge_running: AtomicBool,
 }
 
@@ -33,6 +37,7 @@ impl Default for AppState {
             settings: Mutex::new(Settings::default()),
             settings_path: Mutex::new(None),
             agent: AgentManager::default(),
+            failsafe: Mutex::new(Tracker::default()),
             last_driver_scan: Mutex::new(None),
             driver_cache: Mutex::new(None),
             in_tray: AtomicBool::new(false),

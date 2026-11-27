@@ -99,6 +99,18 @@ pub async fn open_external(target: String) -> Result<(), String> {
         .map_err(|e| format!("Could not launch Explorer: {e}"))
 }
 
+/// `open_reliability_monitor`: `%SystemRoot%\System32\perfmon.exe /rel` (fixed path, no user
+/// arguments).
+#[tauri::command]
+pub async fn open_reliability_monitor() -> Result<(), String> {
+    let perfmon = windows_dir().join("System32").join("perfmon.exe");
+    std::process::Command::new(&perfmon)
+        .arg("/rel")
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Could not open Reliability Monitor: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

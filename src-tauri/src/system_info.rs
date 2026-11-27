@@ -74,9 +74,31 @@ pub struct SystemInfo {
     pub secure_boot: Option<bool>,
     pub tpm: Option<TpmInfo>,
     pub uptime_secs: u64,
+    /// Unix ms of the last boot (`Win32_OperatingSystem.LastBootUpTime`).
+    pub boot_ts: u64,
     pub is_admin: bool,
     pub ram_total_gb: f64,
     pub last_driver_scan: Option<String>,
+}
+
+/// Rust-owned part of `SystemSpec` (CONTRACT §2.6).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OsSpec {
+    pub caption: String,
+    pub display_version: String,
+    pub build: String,
+    pub architecture: String,
+    pub install_date: String,
+    pub boot_ts: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecuritySpec {
+    pub secure_boot: Option<bool>,
+    pub tpm: Option<TpmInfo>,
+    pub bios_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -103,6 +125,10 @@ pub struct PhysicalDisk {
     pub health_status: String,
     pub operational_status: String,
     pub serial: String,
+    /// Drive letters on this disk (`"C:"`), sorted, from `MSFT_Partition`.
+    pub volumes: Vec<String>,
+    /// True when `%SystemDrive%` is on this disk.
+    pub is_system_disk: bool,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -338,8 +364,31 @@ struct OperatingSystemRow {
     #[serde(rename = "InstallDate", default)]
     install_date: Option<String>,
     #[serde(rename = "LastBootUpTime", default)]
-    #[allow(dead_code)]
     last_boot_up_time: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct MsftPartitionRow {
+    #[serde(rename = "DiskNumber", default, deserialize_with = "flex::opt_u64")]
+    disk_number: Option<u64>,
+    #[serde(rename = "DriveLetter", default, deserialize_with = "de_drive_letter")]
+    drive_letter: Option<char>,
+}
+
+/// `MSFT_Partition.DriveLetter` is a CIM `char16`: the wmi crate yields a one-character string,
+/// raw COM a number. `'\0'`/blank (no letter) and anything that is not A–Z become `None`.
+fn de_drive_letter<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<char>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    let c = match v {
+        serde_json::Value::String(s) => s.chars().next(),
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .and_then(char::from_u32),
+        _ => None,
+    };
+    Ok(c.map(|c| c.to_ascii_uppercase())
+        .filter(|c| c.is_ascii_uppercase()))
 }
 
 #[derive(Deserialize, Debug)]
@@ -443,10 +492,7 @@ pub fn collect_system_info(last_driver_scan: Option<String>) -> SystemInfo {
         c,
         "SELECT Manufacturer, SMBIOSBIOSVersion, ReleaseDate FROM Win32_BIOS",
     );
-    let oses: Vec<OperatingSystemRow> = query_soft(
-        c,
-        "SELECT Caption, Version, BuildNumber, OSArchitecture, InstallDate, LastBootUpTime FROM Win32_OperatingSystem",
-    );
+    let (os, boot_ts) = collect_os(c);
 
     let hostname = std::env::var("COMPUTERNAME")
         .ok()
@@ -508,12 +554,75 @@ pub fn collect_system_info(last_driver_scan: Option<String>) -> SystemInfo {
             mode: mode.to_string(),
         });
 
-    const CV: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+    SystemInfo {
+        hostname,
+        cpu_name,
+        gpu_names,
+        motherboard,
+        bios,
+        os,
+        secure_boot: secure_boot(mode),
+        tpm: tpm_info(),
+        uptime_secs: uptime_secs(),
+        boot_ts,
+        is_admin: is_admin(),
+        ram_total_gb,
+        last_driver_scan,
+    }
+}
+
+/// Parses a CIM datetime with its UTC offset (`yyyymmddHHMMSS.ffffff±UUU`, offset in minutes)
+/// into unix milliseconds. `None` for anything malformed.
+pub fn parse_cim_datetime_ms(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    let b = s.as_bytes();
+    if b.len() < 14 || !b[..14].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r).and_then(|x| x.parse::<u32>().ok());
+    let date = chrono::NaiveDate::from_ymd_opt(num(0..4)? as i32, num(4..6)?, num(6..8)?)?;
+    let time = date.and_hms_opt(num(8..10)?, num(10..12)?, num(12..14)?)?;
+    let mut ms = time.and_utc().timestamp_millis();
+    // Fractional seconds: ".ffffff" (may be "******" when unknown).
+    if b.get(14) == Some(&b'.') {
+        if let Some(frac) = s.get(15..18).and_then(|f| f.parse::<i64>().ok()) {
+            ms += frac;
+        }
+    }
+    // Offset: the last four characters, "+060" / "-300" (minutes east of UTC).
+    if b.len() >= 25 {
+        let sign = b[21];
+        if let Some(off) = s.get(22..25).and_then(|o| o.parse::<i64>().ok()) {
+            match sign {
+                b'+' => ms -= off * 60_000,
+                b'-' => ms += off * 60_000,
+                _ => {}
+            }
+        }
+    }
+    u64::try_from(ms).ok()
+}
+
+/// Boot time as unix ms: `LastBootUpTime`, else now − `GetTickCount64`.
+fn boot_ts_from(last_boot: Option<&str>) -> u64 {
+    last_boot
+        .and_then(parse_cim_datetime_ms)
+        .unwrap_or_else(|| crate::util::now_ms().saturating_sub(unsafe { GetTickCount64() }))
+}
+
+const CV: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+
+/// OS section shared by `get_system_info` and `get_system_spec`: (OsInfo, bootTs).
+fn collect_os(c: Option<&WMIConnection>) -> (OsInfo, u64) {
+    let oses: Vec<OperatingSystemRow> = query_soft(
+        c,
+        "SELECT Caption, Version, BuildNumber, OSArchitecture, InstallDate, LastBootUpTime FROM Win32_OperatingSystem",
+    );
     let display_version = reg_string(CV, "DisplayVersion")
         .or_else(|| reg_string(CV, "ReleaseId"))
         .unwrap_or_default();
-    let os = oses
-        .first()
+    let row = oses.first();
+    let os = row
         .map(|o| OsInfo {
             caption: clean_or(&o.caption, "Windows"),
             version: clean(&o.version),
@@ -534,21 +643,36 @@ pub fn collect_system_info(last_driver_scan: Option<String>) -> SystemInfo {
             },
             install_date: String::new(),
         });
+    let boot_ts = boot_ts_from(row.and_then(|o| o.last_boot_up_time.as_deref()));
+    (os, boot_ts)
+}
 
-    SystemInfo {
-        hostname,
-        cpu_name,
-        gpu_names,
-        motherboard,
-        bios,
-        os,
+/// `os` and `security` sections of `SystemSpec`, plus section errors (CONTRACT §2.6).
+pub fn collect_os_security() -> (OsSpec, SecuritySpec, Vec<String>) {
+    let mut errors = Vec::new();
+    let conn = match wmi_connection(NS_CIMV2) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            errors.push(format!("Operating system query failed: {e}"));
+            None
+        }
+    };
+    let (os, boot_ts) = collect_os(conn.as_ref());
+    let mode = bios_mode();
+    let os = OsSpec {
+        caption: os.caption,
+        display_version: os.display_version,
+        build: os.build,
+        architecture: os.architecture,
+        install_date: os.install_date,
+        boot_ts,
+    };
+    let security = SecuritySpec {
         secure_boot: secure_boot(mode),
         tpm: tpm_info(),
-        uptime_secs: uptime_secs(),
-        is_admin: is_admin(),
-        ram_total_gb,
-        last_driver_scan,
-    }
+        bios_mode: mode.to_string(),
+    };
+    (os, security, errors)
 }
 
 fn drive_type_name(t: Option<u64>) -> &'static str {
@@ -689,16 +813,66 @@ fn operational_status_name(codes: &Option<Vec<u64>>) -> String {
     }
 }
 
+/// Drive letters grouped by disk number: `"C:"` strings, sorted and de-duplicated
+/// (CONTRACT §2.8). Partitions without a letter or disk number are skipped.
+fn letters_by_disk(rows: &[MsftPartitionRow]) -> std::collections::BTreeMap<u64, Vec<String>> {
+    let mut map: std::collections::BTreeMap<u64, Vec<String>> = Default::default();
+    for r in rows {
+        if let (Some(disk), Some(letter)) = (r.disk_number, r.drive_letter) {
+            let v = map.entry(disk).or_default();
+            let s = format!("{letter}:");
+            if !v.contains(&s) {
+                v.push(s);
+            }
+        }
+    }
+    for v in map.values_mut() {
+        v.sort();
+    }
+    map
+}
+
+/// `volumes` / `isSystemDisk` for one disk (`device_id` = disk number as a string).
+fn disk_volumes(
+    device_id: &str,
+    letters: &std::collections::BTreeMap<u64, Vec<String>>,
+    system_drive: &str,
+) -> (Vec<String>, bool) {
+    let volumes = device_id
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| letters.get(&n).cloned())
+        .unwrap_or_default();
+    let is_system = volumes
+        .iter()
+        .any(|v| v.eq_ignore_ascii_case(system_drive.trim()));
+    (volumes, is_system)
+}
+
 pub fn collect_physical_disks() -> Vec<PhysicalDisk> {
     let conn = wmi_connection(NS_STORAGE).ok();
     let rows: Vec<MsftPhysicalDiskRow> = query_soft(
         conn.as_ref(),
         "SELECT DeviceId, FriendlyName, Model, MediaType, BusType, Size, HealthStatus, OperationalStatus, SerialNumber FROM MSFT_PhysicalDisk",
     );
+    let partitions: Vec<MsftPartitionRow> = query_soft(
+        conn.as_ref(),
+        "SELECT DiskNumber, DriveLetter FROM MSFT_Partition",
+    );
+    let letters = letters_by_disk(&partitions);
+    let sys = system_drive();
     let mut out: Vec<PhysicalDisk> = rows
         .into_iter()
-        .map(|r| PhysicalDisk {
-            device_id: clean(&r.device_id),
+        .map(|r| {
+            let device_id = clean(&r.device_id);
+            let (volumes, is_system_disk) = disk_volumes(&device_id, &letters, &sys);
+            (r, device_id, volumes, is_system_disk)
+        })
+        .map(|(r, device_id, volumes, is_system_disk)| PhysicalDisk {
+            volumes,
+            is_system_disk,
+            device_id,
             model: {
                 let f = clean(&r.friendly_name);
                 if f.is_empty() {
@@ -771,11 +945,66 @@ mod tests {
     }
 
     #[test]
+    fn cim_datetimes_with_offsets() {
+        // 2026-11-27 08:30:15.500 at UTC+60 min = 07:30:15.500 UTC.
+        let expect = chrono::NaiveDate::from_ymd_opt(2026, 11, 27)
+            .unwrap()
+            .and_hms_milli_opt(7, 30, 15, 500)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis() as u64;
+        assert_eq!(parse_cim_datetime_ms("20261127083015.500000+060"), Some(expect));
+        // UTC-300 (US Eastern): local 02:30:15 = 07:30:15 UTC.
+        assert_eq!(
+            parse_cim_datetime_ms("20261127023015.500000-300"),
+            Some(expect)
+        );
+        // Unknown fraction, no offset.
+        assert_eq!(
+            parse_cim_datetime_ms("20261127073015.******"),
+            Some(expect - 500)
+        );
+        assert_eq!(parse_cim_datetime_ms("garbage"), None);
+        assert_eq!(parse_cim_datetime_ms("20261399000000.000000+000"), None);
+        // Fallback is "now − uptime": in the past and after 2000.
+        let b = boot_ts_from(None);
+        assert!(b > 946_684_800_000 && b <= crate::util::now_ms());
+    }
+
+    #[test]
+    fn partition_letters_group_by_disk() {
+        let rows: Vec<MsftPartitionRow> = serde_json::from_value(serde_json::json!([
+            { "DiskNumber": 0, "DriveLetter": "C" },
+            { "DiskNumber": 0, "DriveLetter": "\u{0}" },
+            { "DiskNumber": 0, "DriveLetter": "e" },
+            { "DiskNumber": 1, "DriveLetter": 68 },
+            { "DiskNumber": 1, "DriveLetter": 0 },
+            { "DiskNumber": 1, "DriveLetter": "D" },
+            { "DiskNumber": null, "DriveLetter": "F" },
+            { "DiskNumber": 2 },
+        ]))
+        .unwrap();
+        let letters = letters_by_disk(&rows);
+        assert_eq!(letters[&0], vec!["C:", "E:"]);
+        assert_eq!(letters[&1], vec!["D:"]);
+        assert!(!letters.contains_key(&2));
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        assert_eq!(disk_volumes("0", &letters, "C:"), (s(&["C:", "E:"]), true));
+        assert_eq!(disk_volumes("1", &letters, "C:"), (s(&["D:"]), false));
+        assert_eq!(disk_volumes("7", &letters, "C:"), (s(&[]), false));
+        assert_eq!(disk_volumes("x", &letters, "C:"), (s(&[]), false));
+    }
+
+    #[test]
     fn live_queries_fail_soft() {
         // Runs against the real machine; must never panic, whatever the environment.
         let info = collect_system_info(None);
         assert!(!info.hostname.is_empty());
+        assert!(info.boot_ts > 0);
         let _ = collect_volumes();
         let _ = collect_physical_disks();
+        let (os, security, _errors) = collect_os_security();
+        assert!(os.boot_ts > 0);
+        assert!(matches!(security.bios_mode.as_str(), "UEFI" | "Legacy" | "Unknown"));
     }
 }

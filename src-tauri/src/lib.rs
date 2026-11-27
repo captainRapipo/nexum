@@ -3,8 +3,14 @@
 mod agent;
 mod cleaner;
 mod drivers;
+mod elevation;
 mod external;
+mod failsafe;
+mod procs;
+mod purge_log;
+mod self_usage;
 mod settings;
+mod spec;
 mod state;
 mod system_info;
 mod util;
@@ -21,8 +27,27 @@ use util::lock;
 const MAIN_WINDOW: &str = "main";
 const TRAY_ID: &str = "nexum-tray";
 
-/// Shows, restores and focuses the main window; restores the normal poll interval if the
-/// window was hidden in the tray.
+/// Tray entries that open a view: (menu id = `navigate` payload = ViewId, label).
+const TRAY_VIEWS: [(&str, &str); 6] = [
+    ("dashboard", "Dashboard"),
+    ("sensors", "Sensors"),
+    ("system", "System"),
+    ("storage", "Storage"),
+    ("cooling", "Cooling"),
+    ("drivers", "Drivers"),
+];
+
+/// `navigate` payload for a tray menu id (CONTRACT §2 tray menu), or `None` for ids that do
+/// not navigate.
+fn tray_navigation(id: &str) -> Option<&'static str> {
+    if id == "clean-caches" {
+        return Some("quick-clean");
+    }
+    TRAY_VIEWS.iter().find(|(v, _)| *v == id).map(|(v, _)| *v)
+}
+
+/// Shows, restores and focuses the main window; restores the normal poll interval, the
+/// sensor stream and the self-usage readout if the window was hidden in the tray.
 pub(crate) fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
         let _ = window.unminimize();
@@ -32,10 +57,12 @@ pub(crate) fn show_main_window(app: &AppHandle) {
     let state = app.state::<AppState>();
     if state.in_tray.swap(false, Ordering::SeqCst) {
         agent::apply_interval(app);
+        agent::sync_sensor_stream(app, false);
     }
 }
 
-/// Hides the main window to the tray and throttles telemetry (>= 5 s).
+/// Hides the main window to the tray: telemetry throttled (>= 5 s), sensor stream off,
+/// self-usage paused (CONTRACT §2, minimized to tray).
 pub(crate) fn hide_to_tray(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
         let _ = window.hide();
@@ -43,6 +70,7 @@ pub(crate) fn hide_to_tray(app: &AppHandle) {
     let state = app.state::<AppState>();
     if !state.in_tray.swap(true, Ordering::SeqCst) {
         agent::apply_interval(app);
+        agent::sync_sensor_stream(app, false);
     }
 }
 
@@ -51,9 +79,9 @@ fn has_tray(app: &AppHandle) -> bool {
     app.tray_by_id(TRAY_ID).is_some()
 }
 
-fn navigate(app: &AppHandle, view: &str) {
+fn navigate(app: &AppHandle, target: &str) {
     show_main_window(app);
-    let _ = app.emit("navigate", view.to_string());
+    let _ = app.emit("navigate", target.to_string());
 }
 
 fn quit(app: &AppHandle) {
@@ -65,30 +93,43 @@ fn quit(app: &AppHandle) {
 
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show Nexum", true, None::<&str>)?;
-    let dashboard = MenuItem::with_id(app, "dashboard", "Dashboard", true, None::<&str>)?;
-    let drivers = MenuItem::with_id(app, "drivers", "Drivers", true, None::<&str>)?;
-    let clean = MenuItem::with_id(app, "quick-clean", "Quick Clean", true, None::<&str>)?;
+    let mut views = Vec::with_capacity(TRAY_VIEWS.len());
+    for (id, label) in TRAY_VIEWS {
+        views.push(MenuItem::with_id(app, id, label, true, None::<&str>)?);
+    }
+    let clean = MenuItem::with_id(app, "clean-caches", "Clean caches…", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
+    let sep3 = PredefinedMenuItem::separator(app)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(
-        app,
-        &[
-            &show, &sep1, &dashboard, &drivers, &clean, &sep2, &quit_item,
-        ],
-    )?;
+
+    let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = Vec::new();
+    items.push(&show);
+    items.push(&sep1);
+    for v in &views {
+        items.push(v);
+    }
+    items.push(&sep2);
+    items.push(&clean);
+    items.push(&sep3);
+    items.push(&quit_item);
+    let menu = Menu::with_items(app, &items)?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("Nexum")
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .on_menu_event(|app, event| match event.id().as_ref() {
-            "show" => show_main_window(app),
-            "dashboard" => navigate(app, "dashboard"),
-            "drivers" => navigate(app, "drivers"),
-            "quick-clean" => navigate(app, "cleaner"),
-            "quit" => quit(app),
-            _ => {}
+        .on_menu_event(|app, event| {
+            let id = event.id().as_ref();
+            match id {
+                "show" => show_main_window(app),
+                "quit" => quit(app),
+                other => {
+                    if let Some(target) = tray_navigation(other) {
+                        navigate(app, target);
+                    }
+                }
+            }
         })
         .on_tray_icon_event(|tray, event| match event {
             TrayIconEvent::Click {
@@ -110,6 +151,10 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 }
 
 pub fn run() {
+    // Started by `restart_as_admin`: let the previous (non-elevated) instance exit first, or
+    // the single-instance plugin would hand this launch back to it.
+    elevation::wait_for_previous_instance();
+
     let launched_minimized = std::env::args()
         .skip(1)
         .any(|a| a.eq_ignore_ascii_case("--minimized"));
@@ -139,12 +184,19 @@ pub fn run() {
             agent::set_poll_interval,
             agent::set_fan_preset,
             agent::set_fan_control,
-            agent::flush_standby,
             settings::get_settings,
             settings::save_settings,
             agent::get_agent_status,
             agent::restart_agent,
             external::open_external,
+            agent::get_sensor_tree,
+            agent::set_sensor_stream,
+            agent::reset_sensor_stats,
+            spec::get_system_spec,
+            failsafe::get_fan_failsafe_state,
+            failsafe::dismiss_fan_failsafe,
+            elevation::restart_as_admin,
+            external::open_reliability_monitor,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -163,7 +215,14 @@ pub fn run() {
                 show_main_window(&handle);
             }
 
+            // MF-13: a fan write-ahead flag left by an earlier run means fans may be stuck at a
+            // manual speed. Warn before the agent starts; its `hello` settles the state.
+            let flag = failsafe::flag_exists();
+            failsafe::update(&handle, |t, now| t.on_app_start(flag, now));
+
             agent::start(&handle);
+            agent::start_watchdog(&handle);
+            self_usage::start(&handle);
             settings::refresh_autostart_in_background(&handle);
             Ok(())
         })
@@ -189,4 +248,25 @@ pub fn run() {
             agent::shutdown(app);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tray_ids_map_to_navigate_targets() {
+        for (id, _) in TRAY_VIEWS {
+            assert_eq!(tray_navigation(id), Some(id));
+        }
+        assert_eq!(tray_navigation("clean-caches"), Some("quick-clean"));
+        assert_eq!(tray_navigation("show"), None);
+        assert_eq!(tray_navigation("quit"), None);
+        assert_eq!(tray_navigation("fans"), None, "the old view id is gone");
+        let ids: Vec<&str> = TRAY_VIEWS.iter().map(|(v, _)| *v).collect();
+        assert_eq!(
+            ids,
+            vec!["dashboard", "sensors", "system", "storage", "cooling", "drivers"]
+        );
+    }
 }

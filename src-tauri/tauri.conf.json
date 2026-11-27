@@ -37,8 +37,8 @@
     "publisher": "Nexum",
     "copyright": "Copyright (c) 2026 Nexum",
     "category": "Utility",
-    "shortDescription": "PC telemetry, drivers and safe cleanup",
-    "longDescription": "Nexum is a BIOS-style Windows 10/11 command center: real-time CPU/GPU/RAM/fan telemetry, storage and S.M.A.R.T. health, a full driver and BIOS inventory with export and backup, and a safe 1-click Deep Purge cleaner.",
+    "shortDescription": "PC telemetry, drivers and cache cleanup",
+    "longDescription": "Nexum is a BIOS-style Windows 10/11 command center: real-time CPU/GPU/RAM/fan telemetry, storage and S.M.A.R.T. health, a full driver and BIOS inventory with export and backup, and a conservative cache cleanup with an audit log. Nexum sends no data anywhere.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -46,6 +46,12 @@
       "icons/icon.ico"
     ],
     "externalBin": ["binaries/nexum-agent"],
+    "resources": {
+      "../build/agent/MonoPosixHelper.dll": "MonoPosixHelper.dll",
+      "../build/agent/libMonoPosixHelper.dll": "libMonoPosixHelper.dll",
+      "../LICENSE": "LICENSE",
+      "../licenses/": "licenses/"
+    },
     "windows": {
       "nsis": {
         "installMode": "perMachine",
