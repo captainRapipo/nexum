@@ -19,7 +19,10 @@ use crate::util::lock;
 const SIDECAR_NAME: &str = "nexum-agent";
 const MAX_RESTARTS: usize = 5;
 const RESTART_WINDOW: Duration = Duration::from_secs(60);
-const SHUTDOWN_GRACE: Duration = Duration::from_millis(800);
+// The sidecar restores BIOS fan control before closing hardware, but may first have to
+// wait for an in-flight sensor tick to release its lock. A hard kill skips the restore,
+// so give it generous time.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(3000);
 const MAX_LINE_BUFFER: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize)]
