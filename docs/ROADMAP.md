@@ -275,6 +275,18 @@ Each item names its evidence. The **release gate** is all of MF-1 to MF-13 merge
 | **GPU tuning step 0: probe + read-only panel** | See §5. Cooling → "GPU tuning" tab shows ranges, current values, factory/custom state, power mode and the VPU-recovery count. | Proves whether ADL OD8 works on RDNA4 before any write code is written. | S–M | – | NDJSON in `{cmd:"tuningGet"}`, `{cmd:"tuningProbe", write:false\|true}`; out `tuningState` (§5.3). Tauri `get_tuning_state`, `run_tuning_probe {write}` |
 | **Cleaner extras** | Drill-down showing the top 50 files per category (path, size, age, "Open folder"); a Recycle Bin age filter. | Visible proof that the dry run matches the real run; follows the Storage Sense model ([Microsoft](https://support.microsoft.com/en-us/help/5000679)) | S | MF-4 | Tauri `scan_trash_details {categoryId, limit}` → `{path, bytes, modifiedTs}[]`. `scan_trash {includeBrowser, recycleMinAgeDays: number\|null}` |
 
+**v1.1 status (CONTRACT 1.1.0, 2026-11-27).** One line per row above; the decisions in the table are unchanged.
+"In v1.1" means implemented in the 1.1.0 round and checked by CI; the release still waits for the §4.3 on-rig gates.
+
+- **FPS capture + Gaming view (F8):** in v1.1. Opt-in, Intel-signed PresentMon 2.6.0 pinned in `.github/presentmon.json` (SHA-256 re-verified against the GitHub asset digest and a local download on 2026-11-27: `b2a706bc…88f1af`, Authenticode Valid, `CN=Intel Corporation`), shipped via `bundle.resources`, never re-signed. The 6th Dashboard KPI is in. §4.3 gates 1 (overhead), 2 (anti-cheat matrix: every title "not tested yet" in the README) and 3 on the reference rig are still open; CI covers gate 3 on a runner and gate 4 by design. Overlay and benchmarks stay in v1.2.
+- **CSV sensor logging:** in v1.1 (CONTRACT §2.9; adds 100 MiB rotation and a tray menu item).
+- **Alert engine + notifications + tray:** in v1.1 (sustained evaluation, per-model CPU limits re-checked on amd.com 2026-11-27, see [`TJMAX-CHECK.md`](TJMAX-CHECK.md); opt-in notifications; tray tooltip with up to 4 pinned sensors). Deferred: the optional tray-icon temperature digits (not in v1.1). Not added on purpose: `alerts.enabled` and `alerts.driveLifePct` (CONTRACT §2.2 explains why).
+- **Drive wear ledger + forecast:** in v1.1 (CONTRACT §2.11).
+- **Kernel-driver and platform security audit:** deferred, blocked on Q13 (whether SignPath counts it as a vulnerability-identification feature). Not started.
+- **System view, full:** in v1.1. Live DDR4 timings under the `Global\Access_PCI` mutex that LHM 0.9.6 itself uses (confirmed in the 0.9.6 binary), SPD JEDEC fallback labelled as such, MEMCLK/FCLK/UCLK, codename, GPU PCIe and drive links, Save report (.txt/.html). Still to confirm on the reference rig: the LHM ADL link lines and the "Fabric Clock"/"Uncore Clock" sensor names (`nexum-agent --dump`).
+- **GPU tuning step 0: probe + read-only panel:** in v1.1, read-only only (`tuningGet`, `tuningProbe write:false`, Cooling → GPU tuning tab; CI blocks any ADL `_Set` entry point). Deferred: the probe's `write:true` path, waiting for the owner's consent (Q5); both the agent and Rust reject it.
+- **Cleaner extras:** in v1.1 (top-50 drill-down per category; Recycle Bin age filter 1/14/30/60 days, default 30, current user's bin only).
+
 ### v1.2+
 
 | Item | What | Why | Effort | Depends on | Contract changes |

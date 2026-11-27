@@ -1,23 +1,32 @@
-// Authoritative frontend mirror of CONTRACT.md — contract version 1.0.0-gate.
+// Authoritative frontend mirror of CONTRACT.md — contract version 1.1.0.
 // Field names, unions and defaults here are binding for all three layers (C# sidecar,
 // Rust core, React frontend). Do not rename fields. Change this file only together with
 // CONTRACT.md. Owner: implementer C (frontend core).
 //
-// Legend used in comments:  [NEW] added in 1.0.0-gate · [BREAKING] removed/renamed/re-typed
-// in 1.0.0-gate · [CHANGED] same type, new semantics.
+// Legend used in comments:  [NEW 1.1] added in 1.1.0 · [BREAKING 1.1] removed/renamed/re-typed
+// in 1.1.0 · [CHANGED 1.1] same type, new semantics in 1.1.0. Unsuffixed [NEW] / [BREAKING] /
+// [CHANGED] markers are historical (1.0.0-gate).
 
-export const CONTRACT_VERSION = "1.0.0-gate";
-/** [NEW] Value of `hello.protocol` sent by a sidecar that implements this contract. */
-export const AGENT_PROTOCOL = 2;
+export const CONTRACT_VERSION = "1.1.0";
+/** [BREAKING 1.1] Value of `hello.protocol` sent by a sidecar that implements this contract (was 2). */
+export const AGENT_PROTOCOL = 3;
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Navigation & keymap (CONTRACT §4.6)
 // ───────────────────────────────────────────────────────────────────────────────
 
-/** [BREAKING] "fans" → "cooling"; "sensors" and "system" added. "gaming" arrives in v1.1. */
-export type ViewId = "dashboard" | "sensors" | "system" | "storage" | "cooling" | "drivers" | "cleaner";
+/** [BREAKING 1.1] "gaming" added (F8). */
+export type ViewId =
+  | "dashboard"
+  | "sensors"
+  | "system"
+  | "storage"
+  | "cooling"
+  | "drivers"
+  | "gaming"
+  | "cleaner";
 
-/** Order of the top-bar tabs and of the Ctrl+1..7 aliases (index + 1). */
+/** Order of the top-bar tabs and of the Ctrl+1..8 aliases (index + 1). [BREAKING 1.1] Ctrl+7 = Gaming, Ctrl+8 = Cleaner. */
 export const VIEW_ORDER: readonly ViewId[] = [
   "dashboard",
   "sensors",
@@ -25,6 +34,7 @@ export const VIEW_ORDER: readonly ViewId[] = [
   "storage",
   "cooling",
   "drivers",
+  "gaming",
   "cleaner",
 ] as const;
 
@@ -35,6 +45,7 @@ export const VIEW_LABELS: Record<ViewId, string> = {
   storage: "Storage",
   cooling: "Cooling",
   drivers: "Drivers",
+  gaming: "Gaming",
   cleaner: "Cleaner",
 };
 
@@ -43,7 +54,7 @@ export type KeyAction =
   | { type: "rescan" }
   | { type: "cleanCaches" };
 
-/** Function-key map. F8 is reserved for "gaming" (v1.1) and must stay unbound; F10 is never bound. */
+/** Function-key map. [CHANGED 1.1] F8 = Gaming. F10 is never bound. */
 export const FKEY_MAP: Readonly<Record<string, KeyAction>> = {
   F1: { type: "view", view: "dashboard" },
   F2: { type: "view", view: "sensors" },
@@ -52,8 +63,29 @@ export const FKEY_MAP: Readonly<Record<string, KeyAction>> = {
   F5: { type: "rescan" },
   F6: { type: "view", view: "cooling" },
   F7: { type: "view", view: "drivers" },
+  F8: { type: "view", view: "gaming" },
   F9: { type: "cleanCaches" },
 };
+
+/** [NEW 1.1] Every event name Rust emits (CONTRACT §2). Use these constants with api.onEvent/subscribe. */
+export const EVENTS = {
+  telemetry: "telemetry",
+  agentStatus: "agent-status",
+  agentAck: "agent-ack",
+  purgeProgress: "purge-progress",
+  navigate: "navigate",
+  sensorTree: "sensor-tree",
+  sensorValues: "sensor-values",
+  fanFailsafe: "fan-failsafe",
+  selfUsage: "self-usage",
+  frameSession: "frame-session",
+  frameTarget: "frame-target",
+  frameStats: "frame-stats",
+  sensorLog: "sensor-log",
+  healthAlerts: "health-alerts",
+  tuningState: "tuning-state",
+} as const;
+export type EventName = (typeof EVENTS)[keyof typeof EVENTS];
 
 /** Payload of the Rust `navigate` event (tray menu). */
 export type NavTarget = ViewId | "quick-clean" | "settings";
@@ -107,6 +139,8 @@ export interface GpuTelemetry {
   powerW: number | null;
   fanRpm: number | null;
   fanPct: number | null;
+  /** [NEW 1.1] "GPU Memory Junction" (NVIDIA) or "GPU Memory" (AMD) temperature, °C. Input of the gpu-mem-temp alert. */
+  memJunctionTempC: number | null;
 }
 
 export interface RamTelemetry {
@@ -277,7 +311,7 @@ export type FanFlagState = "none" | "interrupted" | "previousBoot";
 export interface AgentHello {
   type: "hello";
   version: string;
-  /** [NEW] Always AGENT_PROTOCOL (2). */
+  /** Always AGENT_PROTOCOL ([BREAKING 1.1] 3; was 2). `version` is "1.1.0". */
   protocol: number;
   isAdmin: boolean;
   pid: number;
@@ -512,6 +546,85 @@ export interface DimmSpec {
   voltage: number | null;
   /** "DIMM" | "SODIMM" | other SMBIOS form-factor names. */
   formFactor: string;
+  /** [NEW 1.1] SPD JEDEC data from LHM DimmMemory (needs admin + PawnIO); null when unavailable or unmatched (CONTRACT §1.4.1). */
+  spd: SpdInfo | null;
+}
+
+/** [NEW 1.1] DDR4 timings in clock cycles (CONTRACT §1.4.1). Every member null when not read. */
+export interface MemoryTimings {
+  cl: number | null;
+  rcdRd: number | null;
+  rcdWr: number | null;
+  rp: number | null;
+  ras: number | null;
+  rc: number | null;
+  rfc: number | null;
+  rrds: number | null;
+  rrdl: number | null;
+  faw: number | null;
+  wtrs: number | null;
+  wtrl: number | null;
+  wr: number | null;
+  rtp: number | null;
+  cwl: number | null;
+  /** null for SPD-derived timings. */
+  commandRate: "1T" | "2T" | null;
+  /** Gear-down mode; null for SPD-derived timings. */
+  gearDown: boolean | null;
+}
+
+/**
+ * [NEW 1.1] "umc" = live, read from the AMD memory controller; "spd" = JEDEC minimums from the first
+ * DIMM's SPD converted to cycles (UI label "SPD JEDEC (not the running timings)"); "unavailable".
+ */
+export type TimingsSource = "umc" | "spd" | "unavailable";
+
+/** [NEW 1.1] Keys of SpdInfo.timingsNs (LHM DimmMemory Timing sensor names without spaces). */
+export type SpdTimingKey =
+  | "tAA"
+  | "tRCD"
+  | "tRP"
+  | "tRAS"
+  | "tRC"
+  | "tRFC1"
+  | "tRFC2"
+  | "tRFC4"
+  | "tFAW"
+  | "tRRD_S"
+  | "tRRD_L"
+  | "tCCD_L"
+  | "tWR"
+  | "tWTR_S"
+  | "tWTR_L";
+
+/** [NEW 1.1] JEDEC timings in cycles at jedecSpeedMts: cycles = ceil(ns / (2000 / jedecSpeedMts) − 0.025). */
+export interface SpdCycles {
+  cl: number | null;
+  rcd: number | null;
+  rp: number | null;
+  ras: number | null;
+  rc: number | null;
+  rfc: number | null;
+  faw: number | null;
+  rrds: number | null;
+  rrdl: number | null;
+  wr: number | null;
+  wtrs: number | null;
+  wtrl: number | null;
+}
+
+/** [NEW 1.1] One DIMM's SPD data (CONTRACT §1.4.1). Never contains serial numbers. */
+export interface SpdInfo {
+  source: "jedec";
+  /** = DimmSpec.speedMts; null → cycles members are null. */
+  jedecSpeedMts: number | null;
+  /** JEDEC minimum times in ns, keyed by SpdTimingKey (null when the sensor is absent). */
+  timingsNs: Record<SpdTimingKey, number | null>;
+  cycles: SpdCycles;
+  /** Module thermal sensor at capture time; null when the module has none. */
+  tempC: number | null;
+  /** How the LHM DIMM node was matched to this slot. */
+  matchedBy: "order" | "partNumber";
 }
 
 export interface MemorySpec {
@@ -523,12 +636,31 @@ export interface MemorySpec {
   slotsUsed: number;
   slotsTotal: number | null;
   dimms: DimmSpec[];
-  /** v1.0: always null (live timings arrive in v1.1). */
-  timings: null;
-  /** v1.0: always "unavailable". */
-  timingsSource: "unavailable";
-  /** v1.0: always null (XMP parsing is v1.3+). */
+  /** [BREAKING 1.1] was always null. Live (umc) or SPD-derived (spd) timings; null when unavailable. */
+  timings: MemoryTimings | null;
+  /** [BREAKING 1.1] was always "unavailable". */
+  timingsSource: TimingsSource;
+  /** [NEW 1.1] Exact display sentence why live timings are not shown (CONTRACT §1.4.1 table); null when timingsSource === "umc". */
+  timingsNote: string | null;
+  /** [NEW 1.1] Memory clock MHz (DDR4-3200 → 1600). */
+  memclkMhz: number | null;
+  /** [NEW 1.1] Infinity Fabric clock MHz (LHM "Fabric Clock"); null when not reported. */
+  fclkMhz: number | null;
+  /** [NEW 1.1] Memory-controller clock MHz (LHM "Uncore Clock"); null when not reported. */
+  uclkMhz: number | null;
+  /** Always null (XMP parsing is v1.3+). */
   xmp: null;
+}
+
+/** [NEW 1.1] PCIe link (CONTRACT §1.4.1). */
+export interface PcieLink {
+  gen: number | null;
+  width: number | null;
+  maxGen: number | null;
+  maxWidth: number | null;
+  source: "adl" | "devpkey" | "unknown";
+  /** Display-ready caveat (Radeon on-board switch), or null. */
+  note: string | null;
 }
 
 export interface GpuSpec {
@@ -538,6 +670,22 @@ export interface GpuSpec {
   driverVersion: string | null;
   /** "YYYY-MM-DD" or null. */
   driverDate: string | null;
+  /** [NEW 1.1] null when nothing readable. */
+  link: PcieLink | null;
+}
+
+/** [NEW 1.1] Storage link per Windows disk (CONTRACT §1.4.1). Join diskNumber ↔ PhysicalDisk.deviceId. */
+export interface DiskLink {
+  diskNumber: number;
+  model: string;
+  bus: "nvme" | "sata" | "usb" | "other";
+  /** PCIe generation/width (NVMe only). */
+  gen: number | null;
+  width: number | null;
+  maxGen: number | null;
+  maxWidth: number | null;
+  /** SATA generation (1/2/3) when reported. */
+  sataGen: number | null;
 }
 
 export interface OsSpec {
@@ -565,10 +713,12 @@ export interface AgentSpec {
   board: BoardSpec | null;
   memory: MemorySpec | null;
   gpus: GpuSpec[];
+  /** [NEW 1.1] */
+  diskLinks: DiskLink[];
   errors: string[];
 }
 
-/** Returned by `get_system_spec`. cpu/board/memory/gpus come from the sidecar; os/security from Rust. */
+/** Returned by `get_system_spec`. cpu/board/memory/gpus/diskLinks come from the sidecar; os/security from Rust. */
 export interface SystemSpec {
   capturedTs: number;
   cpu: CpuSpec | null;
@@ -577,9 +727,14 @@ export interface SystemSpec {
   gpus: GpuSpec[];
   os: OsSpec;
   security: SecuritySpec;
+  /** [NEW 1.1] Copied from AgentSpec.diskLinks; [] when the agent is down. */
+  diskLinks: DiskLink[];
   /** Section-level failures, display-ready ("Hardware agent is not running", "Memory query failed: …"). */
   errors: string[];
 }
+
+/** [NEW 1.1] `save_report` format (CONTRACT §2.12). */
+export type ReportFormat = "txt" | "html";
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Rust-gathered inventory (CONTRACT §2.1)
@@ -758,6 +913,416 @@ export interface DriverBackupResult {
   output: string;
 }
 
+/** [NEW 1.1] One row of `scan_trash_details` (CONTRACT §3.3): exactly what a purge would delete now. */
+export interface TrashDetailItem {
+  /** Absolute path; for recycle rows the item's ORIGINAL path (from $I). */
+  path: string;
+  bytes: number;
+  /** Last-write time (unix ms); recycle rows: deletion time; null for "group" rows. */
+  modifiedTs: number | null;
+  /** "group" = one summary row for content Nexum does not delete file by file (Delivery Optimization). */
+  kind: "file" | "folder" | "group";
+}
+
+/** [NEW 1.1] Max and default `limit` of scan_trash_details. */
+export const TRASH_DETAILS_LIMIT = 50;
+
+/** [NEW 1.1] Allowed Settings.recycleMinAgeDays values; null = every item (v1.0 behaviour). */
+export const RECYCLE_AGE_OPTIONS: readonly (number | null)[] = [null, 1, 14, 30, 60] as const;
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Frame capture / Gaming (CONTRACT §1.6, §2.13) [NEW 1.1]
+// ───────────────────────────────────────────────────────────────────────────────
+
+export type FrameSessionState = "stopped" | "starting" | "running" | "error";
+
+export type FrameSessionCode =
+  | "notElevated"
+  | "exeMissing"
+  | "signatureInvalid"
+  | "spawnFailed"
+  | "unsupportedOutput"
+  | "exited";
+
+export interface FrameSignature {
+  /** notChecked until the first trust check of this agent process. */
+  status: "valid" | "invalid" | "untrusted" | "notChecked";
+  /** Leaf signer subject CN, e.g. "Intel Corporation"; null when not checked/unreadable. */
+  signer: string | null;
+  /** SHA-256 equals the pinned PresentMon 2.6.0 hash; null when not checked. */
+  sha256Match: boolean | null;
+}
+
+/** Sidecar `frameSession` line, forwarded verbatim as event `frame-session`. */
+export interface FrameSession {
+  type: "frameSession";
+  state: FrameSessionState;
+  /** Set only when state === "error". */
+  code: FrameSessionCode | null;
+  /** Exact display text (CONTRACT §1.6.6). */
+  message: string;
+  backend: "presentmon-console";
+  backendVersion: string;
+  sessionName: "NexumFrames";
+  signature: FrameSignature;
+  /** PresentMon child pid while starting/running. */
+  childPid: number | null;
+  /** Unix ms of entering this state. */
+  sinceTs: number;
+}
+
+export type FrameTargetReason = "foreground" | "manual" | "none";
+
+/** Sidecar `frameTarget` line (event `frame-target`); emitted when pid or reason changes. */
+export interface FrameTarget {
+  type: "frameTarget";
+  pid: number | null;
+  process: string | null;
+  /** Top-level window title (≤ 120 chars) or null. */
+  windowTitle: string | null;
+  reason: FrameTargetReason;
+  /** PresentMon PresentRuntime ("DXGI", "D3D9", "Other"). */
+  runtime: string | null;
+  /** PresentMon PresentMode verbatim, e.g. "Hardware: Independent Flip". */
+  presentMode: string | null;
+  /** presentMode starts with "Hardware: Legacy". */
+  fullscreenExclusive: boolean | null;
+}
+
+/** [NEW 1.1] CONTRACT §1.6.5 boundBy rule. */
+export type FrameBoundBy = "gpu" | "cpu" | "balanced" | "capped";
+
+/** Sidecar `frameStats` line (event `frame-stats`), 1 Hz while a target exists. Definitions in CONTRACT §1.6.5. */
+export interface FrameStats {
+  type: "frameStats";
+  /** Unix ms at emission. */
+  ts: number;
+  pid: number;
+  process: string;
+  windowSec: number;
+  /** Valid frames in the window. */
+  frames: number;
+  /** 1000 × n / Σ frametime (time-weighted). null if n < 2. */
+  fpsAvg: number | null;
+  /** 1000 × displayed / Σ displayedTime. null if no display data or < 2 displayed. */
+  fpsDisplayedAvg: number | null;
+  /** "P1" = 1000 / P99 frametime. null if n < 100. */
+  fpsLow1: number | null;
+  /** "P0.1" = 1000 / P99.9 frametime. null if n < 1000. */
+  fpsLow01: number | null;
+  frametimeAvgMs: number | null;
+  /** Nearest-rank percentile: sorted[ceil(q/100 × n) − 1]. */
+  frametimeP99Ms: number | null;
+  frametimeP999Ms: number | null;
+  frametimeMaxMs: number | null;
+  cpuBusyMs: number | null;
+  gpuBusyMs: number | null;
+  boundBy: FrameBoundBy | null;
+  displayLatencyMs: number | null;
+  droppedPct: number | null;
+  presentMode: string | null;
+  runtime: string | null;
+  allowsTearing: boolean | null;
+  syncInterval: number | null;
+  /** Frametimes (ms, 2 decimals) received since the previous frameStats, oldest first, ≤ 1000. */
+  frametimes: number[];
+  /** Frames not included in `frametimes` because of the 1000 cap. */
+  frametimesOmitted: number;
+}
+
+/** One row of `presentingList` / `list_presenting_processes`. */
+export interface PresentingProcess {
+  pid: number;
+  process: string;
+  windowTitle: string | null;
+  /** Over the last 2 s, 1 decimal. */
+  fps: number;
+  runtime: string;
+  presentMode: string;
+  isForeground: boolean;
+  isTarget: boolean;
+}
+
+/** Sidecar `presentingList` line (reply to {cmd:"presentingList"}; Rust returns `items`). */
+export interface PresentingList {
+  type: "presentingList";
+  ts: number;
+  items: PresentingProcess[];
+}
+
+/** `get_frame_state`: Rust's cached latest lines (stats returned with frametimes: []). */
+export interface FrameState {
+  session: FrameSession | null;
+  target: FrameTarget | null;
+  stats: FrameStats | null;
+}
+
+/** Frametime chart reference lines (ms → label), ROADMAP §6.3. */
+export const FRAMETIME_BANDS_MS: readonly { ms: number; label: string }[] = [
+  { ms: 16.7, label: "60 Hz" },
+  { ms: 8.3, label: "120 Hz" },
+  { ms: 6.9, label: "144 Hz" },
+] as const;
+
+/** Stats window bounds (s) and the Segmented options of the Gaming view. */
+export const FPS_WINDOW_MIN_SEC = 5;
+export const FPS_WINDOW_MAX_SEC = 120;
+export const FPS_WINDOW_OPTIONS: readonly number[] = [10, 30, 60, 120] as const;
+
+/** Always excluded by the agent's CLI arguments; never stored in Settings.fpsExcludes. */
+export const FIXED_FRAME_EXCLUDES: readonly string[] = [
+  "dwm.exe",
+  "msedgewebview2.exe",
+  "Nexum.exe",
+  "nexum-agent.exe",
+] as const;
+
+/** User exclude entry rule (Rust and agent sanitize with the same pattern; max FPS_EXCLUDES_MAX entries). */
+export const FPS_EXCLUDE_PATTERN = /^[A-Za-z0-9 _.()-]{1,60}\.exe$/i;
+export const FPS_EXCLUDES_MAX = 50;
+
+// ───────────────────────────────────────────────────────────────────────────────
+// CSV sensor logging (CONTRACT §2.9) [NEW 1.1]
+// ───────────────────────────────────────────────────────────────────────────────
+
+export const SENSOR_LOG_INTERVALS_MS: readonly number[] = [1000, 2000, 5000, 10000] as const;
+
+export interface SensorLogStatus {
+  active: boolean;
+  /** Current (or last) CSV file; null before the first log of this app session. */
+  path: string | null;
+  /** <Documents>\Nexum\Logs — for "Open folder". */
+  folder: string;
+  /** Rows in the current file (restarts at 0 after a 100 MiB rotation). */
+  rows: number;
+  totalRows: number;
+  startedTs: number | null;
+  intervalMs: number;
+  sensorCount: number;
+  /** Display-ready error that stopped the log, or null. */
+  error: string | null;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Rust alert engine (CONTRACT §2.10) [NEW 1.1]
+// ───────────────────────────────────────────────────────────────────────────────
+
+/** Sources of Rust-evaluated alerts. Frontend-owned conditions keep using HealthSource. */
+export type HealthAlertSource = "cpu" | "gpu" | "drive" | "space";
+
+export interface HealthAlert {
+  /** "cpu-temp" | "gpu-temp:<i>" | "gpu-mem-temp:<i>" | "drive:<tele.id>" | "drive-temp:<tele.id>" | "space:<letter>". */
+  id: string;
+  severity: "warn" | "crit";
+  source: HealthAlertSource;
+  /** Display-ready texts (CONTRACT §2.10.3); temperatures already in Settings.tempUnit. */
+  title: string;
+  detail: string;
+  short: string;
+  group: string;
+  rule: string;
+  /** "<id>:<health.state>" for drive:*, else "<id>:<severity>". */
+  dismissKey: string;
+  /** Unix ms the alert entered its current severity. */
+  sinceTs: number;
+  /** Latest reading (°C, or free % for space). */
+  value: number | null;
+  /** Threshold of the current severity (°C, or %). */
+  threshold: number | null;
+  /** DiskTelemetry.id (drive, drive-temp), drive letter "C:" (space), GPU index as string (gpu), null (cpu). */
+  subjectId: string | null;
+  /** LHM sensor id when Rust can resolve it from the cached tree, else null. */
+  sensorId: string | null;
+}
+
+export interface CpuLimitInfo {
+  /** Model token matched from cpu.name ("5700X3D"), null when none matched. */
+  model: string | null;
+  /** Crit threshold °C. */
+  limitC: number;
+  /** limitC − 5. */
+  warnC: number;
+  source: "table" | "user" | "default";
+}
+
+export interface HealthAlertsSnapshot {
+  /** False until Rust evaluated one telemetry packet and one volume scan; false while the agent is down. */
+  ready: boolean;
+  evaluatedTs: number | null;
+  /** Sorted crit first, then rule order, then subjectId. */
+  alerts: HealthAlert[];
+  /** Seven Rust rule texts (drive crit, drive warn, cpu, gpu, gpu-mem, drive-temp, space). */
+  rules: string[];
+  cpuLimit: CpuLimitInfo;
+}
+
+export const EMPTY_ALERTS_SNAPSHOT: HealthAlertsSnapshot = {
+  ready: false,
+  evaluatedTs: null,
+  alerts: [],
+  rules: [],
+  cpuLimit: { model: null, limitC: 90, warnC: 85, source: "default" },
+};
+
+export interface AlertSettings {
+  /** Opt-in Windows notifications. */
+  desktopNotifications: boolean;
+  /** CPU limit override °C (60..105); null = per-model table, else 90. */
+  cpuTempC: number | null;
+  /** GPU hot-spot crit override °C (70..115); null = 110. Warn = crit − 10. */
+  gpuHotspotC: number | null;
+  /** GPU memory-junction crit override °C (70..115); null = 105. Warn = crit − 10. */
+  gpuMemJunctionC: number | null;
+  /** Low-space warn threshold % (1..50); crit = max(1, floor(freeSpacePct / 2)). */
+  freeSpacePct: number;
+  /** Sustained window, seconds (10..600). */
+  sustainSec: number;
+}
+
+export const DEFAULT_ALERT_SETTINGS: AlertSettings = {
+  desktopNotifications: false,
+  cpuTempC: null,
+  gpuHotspotC: null,
+  gpuMemJunctionC: null,
+  freeSpacePct: 10,
+  sustainSec: 60,
+};
+
+/**
+ * Per-model CPU limits (AMD "Max. Operating Temperature (Tjmax)", CONTRACT §2.10.2). Mirror of the
+ * Rust table for the mock and the Settings UI; Rust is authoritative. Re-check on amd.com before release.
+ */
+export const CPU_TJMAX_TABLE: Readonly<Record<string, number>> = {
+  "5600X": 95,
+  "5800X": 90,
+  "5900X": 90,
+  "5950X": 90,
+  "5800X3D": 90,
+  "5700X3D": 90,
+  "7800X3D": 89,
+  "7950X": 95,
+  "9800X3D": 95,
+};
+export const CPU_DEFAULT_LIMIT_C = 90;
+export const GPU_HOTSPOT_CRIT_DEFAULT_C = 110;
+export const GPU_EDGE_WARN_C = 85;
+export const GPU_EDGE_CRIT_C = 95;
+export const GPU_MEM_JUNCTION_CRIT_DEFAULT_C = 105;
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Drive wear ledger (CONTRACT §2.11) [NEW 1.1]
+// ───────────────────────────────────────────────────────────────────────────────
+
+export interface DriveHistoryPoint {
+  /** Local date "YYYY-MM-DD" (one point per day). */
+  date: string;
+  healthPct: number | null;
+  /** = DiskTelemetry.tbw on that day. */
+  dataWrittenTb: number | null;
+  powerOnHours: number | null;
+}
+
+export type DriveForecastStatus = "ok" | "notEnoughData" | "noWear" | "noLifeData" | "beyondHorizon";
+
+export interface DriveForecast {
+  /** OLS slope of dataWrittenTb × 30.4375, 2 decimals, ≥ 0. */
+  tbPerMonth: number | null;
+  /** Months until healthPct reaches 10 (OLS), 1 decimal; 0 when already ≤ 10. */
+  monthsTo10Pct: number | null;
+  /** Span of the basis points (last 365 days), days. */
+  basisDays: number;
+  /** Number of basis points. Forecast needs ≥ 7 points and ≥ 14 days. */
+  points: number;
+  status: DriveForecastStatus;
+}
+
+export interface DriveHistory {
+  serial: string;
+  points: DriveHistoryPoint[];
+  forecast: DriveForecast;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// GPU tuning, read-only (CONTRACT §1.7, §2.14) [NEW 1.1]
+// ───────────────────────────────────────────────────────────────────────────────
+
+export type TuningUnsupportedReason = "notElevated" | "noAmdGpu" | "adlMissing" | "odUnsupported" | "adlError";
+
+export interface TuningRange {
+  min: number;
+  max: number;
+  step: number;
+  default: number | null;
+}
+
+export interface FanCurvePoint {
+  tempC: number;
+  pct: number;
+}
+
+export interface TuningCaps {
+  powerLimit: boolean;
+  autoUndervolt: boolean;
+  fanCurve: boolean;
+  zeroRpm: boolean;
+  voltageOffset: boolean;
+  gfxClockMax: boolean;
+  memClockMax: boolean;
+}
+
+export interface TuningRanges {
+  powerPct: TuningRange | null;
+  voltageOffsetMv: TuningRange | null;
+  gfxClockMaxMhz: TuningRange | null;
+  memClockMaxMhz: TuningRange | null;
+  fanCurveTempC: TuningRange | null;
+  fanCurvePct: TuningRange | null;
+}
+
+export interface TuningCurrent {
+  powerPct: number | null;
+  autoUndervolt: boolean | null;
+  zeroRpm: boolean | null;
+  voltageOffsetMv: number | null;
+  gfxClockMaxMhz: number | null;
+  memClockMaxMhz: number | null;
+  /** Five OD8 points in order, or null. */
+  fanCurve: FanCurvePoint[] | null;
+}
+
+/** Sidecar `tuningState` line (event `tuning-state`, `get_tuning_state`). Read-only data. */
+export interface TuningState {
+  type: "tuningState";
+  ts: number;
+  gpuIndex: number;
+  adapterName: string | null;
+  backend: "adl-od8";
+  supported: boolean;
+  reason: TuningUnsupportedReason | null;
+  /** Exact display text (CONTRACT §1.7.3). */
+  message: string;
+  odVersion: number | null;
+  caps: TuningCaps;
+  ranges: TuningRanges;
+  current: TuningCurrent;
+  /** Every capped current value equals its default; null when unsupported. */
+  isFactory: boolean | null;
+  mode: "factory" | "custom" | "autoUndervolt" | "unknown";
+  /** Raw OD8 optimized-power-mode value (undocumented), or null. */
+  powerMode: string | null;
+  vpuRecoveryCount: number | null;
+}
+
+/** `run_tuning_probe` result. v1.1 never sends write:true (Rust rejects it). */
+export interface TuningProbeSummary {
+  ranTs: number;
+  write: false;
+  ok: boolean;
+  message: string;
+  /** %LOCALAPPDATA%\Nexum\tuning-probe-<ts>.json, or null when nothing was written. */
+  path: string | null;
+}
+
 // ───────────────────────────────────────────────────────────────────────────────
 // Fan fail-safe (MF-13, CONTRACT §2.4) and self-usage (CONTRACT §2.5)
 // ───────────────────────────────────────────────────────────────────────────────
@@ -825,6 +1390,18 @@ export interface Settings {
   dismissedAlerts: string[];
   /** [NEW] First-run PawnIO consent result (MF-3). */
   sensorDriverChoice: SensorDriverChoice;
+  /** [NEW 1.1] Opt-in frame capture (CONTRACT §1.6). Change through set_frame_capture. */
+  fpsCaptureEnabled: boolean;
+  /** [NEW 1.1] Stats window, integer seconds 5..120. Change through set_frame_window. */
+  fpsWindowSec: number;
+  /** [NEW 1.1] User excludes ("obs64.exe"), FPS_EXCLUDE_PATTERN, max 50. Change through set_frame_excludes. */
+  fpsExcludes: string[];
+  /** [NEW 1.1] One of SENSOR_LOG_INTERVALS_MS. */
+  sensorLogIntervalMs: number;
+  /** [NEW 1.1] Alert thresholds and notification opt-in (CONTRACT §2.2, §2.10). */
+  alerts: AlertSettings;
+  /** [NEW 1.1] Recycle Bin age filter: one of RECYCLE_AGE_OPTIONS (null = every item). */
+  recycleMinAgeDays: number | null;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -842,10 +1419,18 @@ export const DEFAULT_SETTINGS: Settings = {
   hideUnusedSensors: true,
   dismissedAlerts: [],
   sensorDriverChoice: "undecided",
+  fpsCaptureEnabled: false,
+  fpsWindowSec: 30,
+  fpsExcludes: [],
+  sensorLogIntervalMs: 1000,
+  alerts: DEFAULT_ALERT_SETTINGS,
+  recycleMinAgeDays: 30,
 };
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Frontend-derived health (MF-6, CONTRACT §5). Not on the wire in v1.0.
+// Health derivation (MF-6, CONTRACT §5). [CHANGED 1.1] Conditions drive:*, cpu-temp, gpu-temp:*,
+// gpu-mem-temp:*, drive-temp:*, space:* come from Rust (HealthAlert → alertToCondition, §5.0);
+// fan-failsafe, agent-offline, fan-override, limited-mode, drive-unknown:* stay frontend-derived.
 // ───────────────────────────────────────────────────────────────────────────────
 
 export type HealthSeverity = "crit" | "warn" | "info";
@@ -874,11 +1459,12 @@ export interface HealthCondition {
   action: HealthAction | null;
 }
 
-export type SystemHealthLevel = "optimal" | "attention" | "critical" | "partial";
+/** [BREAKING 1.1] "checking" added: agent online, Rust alerts not ready yet, no other condition (pill tone unknown). */
+export type SystemHealthLevel = "optimal" | "attention" | "critical" | "partial" | "checking";
 
 export interface SystemHealth {
   level: SystemHealthLevel;
-  /** "Optimal" | "Attention" | "Critical" | "Partial sensors". */
+  /** "Optimal" | "Attention" | "Critical" | "Partial sensors" | "Checking". */
   label: string;
   /** Text after the label, e.g. "1 drive worn"; null for optimal/partial without detail. */
   summary: string | null;
@@ -888,7 +1474,12 @@ export interface SystemHealth {
   rules: string[];
 }
 
-/** v1.0 fixed thresholds (°C / %). v1.1 moves evaluation to Rust with per-model CPU limits. */
+/**
+ * v1.0 fixed thresholds (°C / %). [CHANGED 1.1] Temperature and space conditions are evaluated in Rust
+ * (per-model CPU limits, Settings.alerts, sustainSec); the cpu/gpu/drive/space members below are no
+ * longer used for conditions — free-space colours use spaceThresholds(settings) (lib/status.ts).
+ * staleMinMs still defines "offline" for the frontend rules.
+ */
 export const HEALTH_THRESHOLDS = {
   cpuWarnC: 90,
   cpuCritC: 95,
