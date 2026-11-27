@@ -103,6 +103,23 @@ pub fn csv_field(s: &str) -> String {
     }
 }
 
+/// A text cell that a spreadsheet app could read as a formula (OWASP "CSV injection": a cell
+/// starting with `=`, `+`, `-`, `@`, tab or CR, also after leading spaces, or with their
+/// full-width forms) gets a leading `'`, so it is shown as text. Header cells carry hardware
+/// names (firmware strings) and user labels; data cells are numbers Nexum formats itself and
+/// never go through this.
+pub fn csv_text(s: &str) -> String {
+    let first = s.trim_start_matches(' ').chars().next();
+    if matches!(
+        first,
+        Some('=' | '+' | '-' | '@' | '\t' | '\r' | '\u{FF1D}' | '\u{FF0B}' | '\u{FF0D}' | '\u{FF20}')
+    ) {
+        format!("'{s}")
+    } else {
+        s.to_string()
+    }
+}
+
 /// `<HardwareNode.name> | <label> [<unit>]` (` [<unit>]` omitted for an empty unit).
 pub fn column_header(hardware: &str, label: &str, unit: &str) -> String {
     if unit.is_empty() {
@@ -133,7 +150,7 @@ pub fn header_line(columns: &[Column]) -> String {
     let mut line = String::from("Date,Time");
     for c in columns {
         line.push(',');
-        line.push_str(&csv_field(&c.header));
+        line.push_str(&csv_field(&csv_text(&c.header)));
     }
     line.push_str("\r\n");
     line
@@ -248,10 +265,11 @@ pub fn select_columns(
                 if out.len() >= MAX_IDS {
                     break;
                 }
-                if out.iter().any(|c| &c.id == id) {
+                let id = id.trim();
+                if out.iter().any(|c| c.id == id) {
                     continue;
                 }
-                if let Some(s) = by_id.get(id.trim()) {
+                if let Some(s) = by_id.get(id) {
                     out.push(make(*s));
                 }
             }
@@ -629,6 +647,45 @@ mod tests {
         assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
         assert_eq!(csv_field("two\nlines"), "\"two\nlines\"");
         assert_eq!(csv_field("cr\r"), "\"cr\r\"");
+    }
+
+    #[test]
+    fn formula_like_headers_are_neutralised() {
+        for bad in [
+            "=HYPERLINK(\"x\")",
+            "+1",
+            "-2+3",
+            "@SUM(A1)",
+            "\tx",
+            "\rx",
+            "  =1+1",
+            "\u{FF1D}1",
+        ] {
+            assert!(csv_text(bad).starts_with('\''), "{bad:?}");
+        }
+        assert_eq!(csv_text("AMD Ryzen 7"), "AMD Ryzen 7");
+        assert_eq!(csv_text(""), "");
+        let cols = vec![Column {
+            id: "/x".into(),
+            header: column_header("=cmd|' /C calc'!A0", "Fan, \"1\"", "RPM"),
+            decimals: 0,
+        }];
+        assert_eq!(
+            header_line(&cols),
+            "Date,Time,\"'=cmd|' /C calc'!A0 | Fan, \"\"1\"\" [RPM]\"\r\n"
+        );
+        // Numbers are never prefixed: a negative reading stays a number.
+        assert_eq!(fmt_value(Some(-3.0), 0), "-3");
+    }
+
+    #[test]
+    fn explicit_ids_are_trimmed_before_dedupe() {
+        let ids = vec![
+            "/amdcpu/0/temperature/2".to_string(),
+            " /amdcpu/0/temperature/2 ".to_string(),
+        ];
+        let cols = select_columns(&tree(), Some(&ids), &[], &BTreeMap::new());
+        assert_eq!(cols.len(), 1);
     }
 
     #[test]

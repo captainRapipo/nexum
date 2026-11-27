@@ -6,7 +6,7 @@
 //! reports.
 
 use std::collections::{BTreeMap, HashSet};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -28,6 +28,9 @@ const MIN_DAYS: i64 = 14;
 const HORIZON_MONTHS: f64 = 600.0;
 /// A slope at or above this (%/day) counts as "no measurable wear".
 const NO_WEAR_SLOPE: f64 = -0.001;
+/// At most this much of the ledger is read (its tail): ~70 KB per drive per year, so 16 MiB
+/// covers decades of several drives.
+const MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Default)]
 pub struct DriveLedger {
@@ -278,24 +281,42 @@ fn open_dir() -> io::Result<crate::safe_fs::PinnedDir> {
     crate::safe_fs::open_local_appdata(&["Nexum", "history"])
 }
 
-/// The ledger text (empty when the file does not exist yet).
+/// Reads ledger text from `r` (`len` bytes long): only the last `max` bytes, starting at the
+/// first whole line of that tail when it is cut; non-UTF-8 lines are skipped as corrupt.
+fn read_tail<R: Read + Seek>(mut r: R, len: u64, max: u64) -> io::Result<String> {
+    let cut = len > max;
+    if cut {
+        r.seek(SeekFrom::Start(len - max))?;
+    }
+    let mut reader = BufReader::new(r.take(max));
+    if cut {
+        let mut partial = Vec::new();
+        reader.read_until(b'\n', &mut partial)?;
+    }
+    let mut text = String::new();
+    for line in reader.lines() {
+        match line {
+            Ok(l) => {
+                text.push_str(&l);
+                text.push('\n');
+            }
+            // A non-UTF-8 line is corrupt: skip it.
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(text)
+}
+
+/// The ledger text (empty when the file does not exist yet). The file sits in a folder the
+/// standard user can write to, so a planted or runaway file is read only up to its last
+/// [`MAX_READ_BYTES`].
 fn read_all() -> io::Result<String> {
     let dir = open_dir()?;
     match dir.open_read(FILE_NAME) {
         Ok(f) => {
-            let mut text = String::new();
-            for line in BufReader::new(f).lines() {
-                match line {
-                    Ok(l) => {
-                        text.push_str(&l);
-                        text.push('\n');
-                    }
-                    // A non-UTF-8 line is corrupt: skip it.
-                    Err(e) if e.kind() == io::ErrorKind::InvalidData => continue,
-                    Err(e) => return Err(e),
-                }
-            }
-            Ok(text)
+            let len = f.metadata()?.len();
+            read_tail(f, len, MAX_READ_BYTES)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
         Err(e) => Err(e),
@@ -368,6 +389,10 @@ fn snapshot(app: &AppHandle, packet: &Value) {
 pub fn on_telemetry(app: &AppHandle, packet: &Value) {
     let state = app.state::<AppState>();
     let ledger = &state.drive_history;
+    // The worker holds `inner` during file I/O: never wait for it on the reader thread.
+    if ledger.busy.load(Ordering::SeqCst) {
+        return;
+    }
     {
         let mut inner = lock(&ledger.inner);
         if inner
@@ -436,6 +461,19 @@ mod tests {
 
     fn today(n: i64) -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 1, 1).unwrap() + chrono::Duration::days(n)
+    }
+
+    #[test]
+    fn only_the_tail_of_a_huge_ledger_is_read() {
+        let data = b"{\"a\":1}\n\xFF\xFEbad\n{\"b\":2}\n{\"c\":3}\n".to_vec();
+        let len = data.len() as u64;
+        assert_eq!(len, 30);
+        // Whole file: the non-UTF-8 line is skipped.
+        let all = read_tail(std::io::Cursor::new(data.clone()), len, 1024).unwrap();
+        assert_eq!(all, "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n");
+        // The last 12 bytes start inside the `b` line: that partial line is dropped.
+        let tail = read_tail(std::io::Cursor::new(data), len, 12).unwrap();
+        assert_eq!(tail, "{\"c\":3}\n");
     }
 
     #[test]

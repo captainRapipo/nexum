@@ -1234,6 +1234,23 @@ impl Notifier {
     }
 }
 
+/// Ids of the snapshot's alerts whose current `dismissKey` is not dismissed: the held
+/// notifications that may still be sent.
+pub fn notifiable_ids(
+    snapshot: Option<&HealthAlertsSnapshot>,
+    dismissed: &[String],
+) -> HashSet<String> {
+    snapshot
+        .map(|s| {
+            s.alerts
+                .iter()
+                .filter(|a| !dismissed.iter().any(|d| d == &a.dismiss_key))
+                .map(|a| a.id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Hidden, minimized or not focused.
 fn window_in_background(app: &AppHandle) -> bool {
     let state = app.state::<AppState>();
@@ -1350,6 +1367,15 @@ pub fn fmt_sensor(v: Option<f64>, decimals: u32, unit: &str, temp_unit: &str) ->
     }
 }
 
+/// A user label or sensor name as one tooltip line: control characters become spaces (a label
+/// must not add lines of its own), bidirectional override/isolate marks are dropped.
+fn tooltip_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 /// Tray sensor lines (`<label>: <value>`), at most four; ids not in the tree are skipped.
 pub fn tray_sensor_lines(
     ids: &[String],
@@ -1399,7 +1425,8 @@ pub fn tray_sensor_lines(
         let decimals = meta.get("decimals").and_then(Value::as_u64).unwrap_or(1) as u32;
         let unit = meta.get("unit").and_then(Value::as_str).unwrap_or("");
         out.push(format!(
-            "{label}: {}",
+            "{}: {}",
+            tooltip_text(label),
             fmt_sensor(v, decimals, unit, temp_unit)
         ));
     }
@@ -1612,18 +1639,17 @@ pub fn start(app: &AppHandle) {
                 if stale {
                     publish(&app);
                 }
-                // Held notifications.
+                // Held notifications: only alerts that are still active and not dismissed in
+                // the meantime, and only while every send condition still holds (§2.10.4).
+                let dismissed = lock(&state.settings).dismissed_alerts.clone();
                 let out = {
                     let mut e = lock(&state.alerts.inner);
-                    let active: HashSet<String> = e
-                        .snapshot
-                        .as_ref()
-                        .map(|s| s.alerts.iter().map(|a| a.id.clone()).collect())
-                        .unwrap_or_default();
+                    let active = notifiable_ids(e.snapshot.as_ref(), &dismissed);
                     e.notifier.tick(&active, now_ms())
                 };
                 if let Some(o) = out {
-                    if lock(&state.settings).alerts.desktop_notifications {
+                    let enabled = lock(&state.settings).alerts.desktop_notifications;
+                    if enabled && window_in_background(&app) {
                         show(&app, o);
                     }
                 }
@@ -2164,6 +2190,55 @@ mod tests {
         assert!(n
             .offer("cpu-temp", "CPU", "d", false, t0 + 31 * 60_000 + 200_000)
             .is_some());
+    }
+
+    #[test]
+    fn held_notifications_skip_dismissed_and_cleared_alerts() {
+        let mut e = Engine {
+            volumes_seen: true,
+            ..Engine::default()
+        };
+        e.volumes = vec![vol("D:", 4, 100), vol("C:", 8, 100)];
+        let p = Params {
+            alerts: AlertSettings::default(),
+            unit: "C".into(),
+            cpu: cpu_limit(None, None),
+        };
+        let alerts = build_alerts(&mut e, &p, None, 1);
+        let snap = HealthAlertsSnapshot {
+            ready: false,
+            evaluated_ts: Some(1),
+            alerts,
+            rules: p.rules(),
+            cpu_limit: p.cpu.clone(),
+        };
+        let all = notifiable_ids(Some(&snap), &[]);
+        assert_eq!(all.len(), 2);
+        // D: is dismissed at its current severity after being held: it is never sent.
+        let ids = notifiable_ids(Some(&snap), &["space:D:crit".to_string()]);
+        assert!(ids.contains("space:C:") && !ids.contains("space:D:"));
+        // A dismissal of the other severity does not apply.
+        assert_eq!(
+            notifiable_ids(Some(&snap), &["space:D:warn".to_string()]).len(),
+            2
+        );
+        assert!(notifiable_ids(None, &[]).is_empty());
+        let mut n = Notifier::default();
+        assert!(n.offer("space:C:", "C:", "d", false, 0).is_some());
+        assert_eq!(n.offer("space:D:", "D:", "d", false, 1_000), None);
+        assert_eq!(n.tick(&ids, 61_000), None, "the held D: alert was dismissed");
+    }
+
+    #[test]
+    fn tray_labels_cannot_break_lines() {
+        let tree = json!({ "rev": 1, "hardware": [{ "name": "CPU", "sensors": [
+            { "id": "/a", "idx": 0, "name": "Core", "unit": "°C", "decimals": 0 }
+        ] }] });
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("/a".to_string(), "two\nlines\tand\u{202E}rtl".to_string());
+        let values = json!({ "rev": 1, "value": [50.0] });
+        let lines = tray_sensor_lines(&["/a".to_string()], &tree, Some(&values), &labels, "C");
+        assert_eq!(lines, vec!["two lines andrtl: 50 °C".to_string()]);
     }
 
     #[test]
