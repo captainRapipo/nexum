@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Nexum",
   "mainBinaryName": "Nexum",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "identifier": "net.nexum.monitor",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -38,7 +38,7 @@
     "copyright": "Copyright (c) 2026 Nexum",
     "category": "Utility",
     "shortDescription": "PC telemetry, drivers and cache cleanup",
-    "longDescription": "Nexum is a BIOS-style Windows 10/11 command center: real-time CPU/GPU/RAM/fan telemetry, storage and S.M.A.R.T. health, a full driver and BIOS inventory with export and backup, and a conservative cache cleanup with an audit log. Nexum sends no data anywhere.",
+    "longDescription": "Nexum is a BIOS-style Windows 10/11 command center: real-time CPU/GPU/RAM/fan telemetry, storage and S.M.A.R.T. health, a full driver and BIOS inventory with export and backup, opt-in frame-rate capture with Intel PresentMon, sensor logging to CSV, and a conservative cache cleanup with an audit log. Nexum sends no data anywhere.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -49,6 +49,7 @@
     "resources": {
       "../build/agent/MonoPosixHelper.dll": "MonoPosixHelper.dll",
       "../build/agent/libMonoPosixHelper.dll": "libMonoPosixHelper.dll",
+      "../build/presentmon/PresentMon-2.6.0-x64.exe": "presentmon/PresentMon-2.6.0-x64.exe",
       "../LICENSE": "LICENSE",
       "../licenses/": "licenses/"
     },

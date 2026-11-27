@@ -910,17 +910,22 @@ pub async fn get_system_info(app: AppHandle) -> Result<SystemInfo, String> {
 }
 
 #[tauri::command]
-pub async fn get_volumes() -> Result<Vec<Volume>, String> {
-    tauri::async_runtime::spawn_blocking(collect_volumes)
+pub async fn get_volumes(app: AppHandle) -> Result<Vec<Volume>, String> {
+    let volumes = tauri::async_runtime::spawn_blocking(collect_volumes)
         .await
-        .map_err(|e| format!("Volume query failed: {e}"))
+        .map_err(|e| format!("Volume query failed: {e}"))?;
+    // The alert engine's space rule uses the same data (CONTRACT §2.10.3).
+    crate::alerts::on_volumes(&app, volumes.clone());
+    Ok(volumes)
 }
 
 #[tauri::command]
-pub async fn get_physical_disks() -> Result<Vec<PhysicalDisk>, String> {
-    tauri::async_runtime::spawn_blocking(collect_physical_disks)
+pub async fn get_physical_disks(app: AppHandle) -> Result<Vec<PhysicalDisk>, String> {
+    let disks = tauri::async_runtime::spawn_blocking(collect_physical_disks)
         .await
-        .map_err(|e| format!("Disk query failed: {e}"))
+        .map_err(|e| format!("Disk query failed: {e}"))?;
+    crate::alerts::on_physical(&app, disks.clone());
+    Ok(disks)
 }
 
 #[cfg(test)]

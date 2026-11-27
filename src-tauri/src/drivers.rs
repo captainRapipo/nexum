@@ -8,8 +8,7 @@ use std::collections::HashMap;
 use crate::state::AppState;
 use crate::system_info::{query_soft, wmi_connection, NS_CIMV2};
 use crate::util::{
-    clean, documents_nexum_dir, file_timestamp, flex, hidden_command, lock, parse_cim_date,
-    system32_exe,
+    clean, file_timestamp, flex, hidden_command, lock, parse_cim_date, system32_exe,
 };
 
 const MAX_BACKUP_OUTPUT: usize = 64 * 1024;
@@ -373,7 +372,7 @@ pub fn to_csv(drivers: &[DriverInfo]) -> String {
 }
 
 fn export_to(drivers: &[DriverInfo], format: &str) -> Result<String, String> {
-    let dir = documents_nexum_dir()?;
+    use std::io::Write;
     let (ext, content) = match format {
         "json" => (
             "json",
@@ -382,10 +381,16 @@ fn export_to(drivers: &[DriverInfo], format: &str) -> Result<String, String> {
         "csv" => ("csv", to_csv(drivers)),
         other => return Err(format!("Unsupported export format '{other}'")),
     };
-    let path = dir.join(format!("drivers-{}.{ext}", file_timestamp()));
-    std::fs::write(&path, content)
+    // CONTRACT §0: an elevated write into the user's Documents goes through PinnedDir only.
+    let dir = crate::safe_fs::open_documents(&["Nexum"])
+        .map_err(|e| format!("Could not open Documents\\Nexum: {e}"))?;
+    let (mut file, path) = dir
+        .create_unique(&format!("drivers-{}", file_timestamp()), ext)
+        .map_err(|e| format!("Could not create the export file: {e}"))?;
+    file.write_all(content.as_bytes())
+        .and_then(|_| file.sync_all())
         .map_err(|e| format!("Could not write {}: {e}", path.display()))?;
-    Ok(path.to_string_lossy().to_string())
+    Ok(crate::purge_log::display_path(&path))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -421,30 +426,28 @@ fn truncate_output(s: String) -> String {
 }
 
 pub fn backup() -> DriverBackupResult {
-    let dir = match documents_nexum_dir() {
-        Ok(d) => d.join(format!("DriverBackup-{}", file_timestamp())),
+    // CONTRACT §0: the folder the elevated pnputil writes into is created and held through
+    // PinnedDir, so no folder of the chain can be swapped for a link while pnputil runs.
+    let name = format!("DriverBackup-{}", file_timestamp());
+    let pinned = match crate::safe_fs::open_documents(&["Nexum", name.as_str()]) {
+        Ok(p) => p,
         Err(e) => {
             return DriverBackupResult {
                 path: String::new(),
                 success: false,
-                output: e,
+                output: format!("Could not create backup folder: {e}"),
             }
         }
     };
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        return DriverBackupResult {
-            path: dir.to_string_lossy().to_string(),
-            success: false,
-            output: format!("Could not create backup folder: {e}"),
-        };
-    }
-    let path = dir.to_string_lossy().to_string();
-    match hidden_command(system32_exe("pnputil.exe"))
+    let dir = pinned.path().to_path_buf();
+    let path = crate::purge_log::display_path(&dir);
+    let result = hidden_command(system32_exe("pnputil.exe"))
         .arg("/export-driver")
         .arg("*")
         .arg(&dir)
-        .output()
-    {
+        .output();
+    drop(pinned);
+    match result {
         Ok(out) => {
             let mut text = decode_console(&out.stdout);
             let err = decode_console(&out.stderr);

@@ -28,8 +28,11 @@ const RESTART_WINDOW: Duration = Duration::from_secs(60);
 // restore leaves the fans at their manual duty, so the grace must exceed those waits.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(6000);
 const MAX_LINE_BUFFER: usize = 8 * 1024 * 1024;
-/// `hello.protocol` of an agent that implements CONTRACT 1.0.0-gate.
-pub const AGENT_PROTOCOL: u64 = 2;
+/// `hello.protocol` of an agent that implements CONTRACT 1.1.0 (was 2 in 1.0.0-gate).
+pub const AGENT_PROTOCOL: u64 = 3;
+/// Error texts of request/reply commands (CONTRACT §2.13, §2.14).
+pub const ERR_NOT_RUNNING: &str = "Hardware agent is not running";
+pub const ERR_NO_ANSWER: &str = "Hardware agent did not answer";
 /// Hang detection (CONTRACT §2.4 item 2): no stdout line for max(15 s, 3 × interval).
 const HANG_MIN_MS: u64 = 15_000;
 /// Before the first line, LHM `Open()` (driver load, storage enumeration) may take a while.
@@ -191,6 +194,15 @@ struct AckWaiter {
     tx: mpsc::Sender<AgentAck>,
 }
 
+/// Waits for a reply line of type `reply_type` (e.g. `presentingList`); an `ack` with
+/// `cmd == ack_cmd` and `ok:false` answers it with an error instead.
+struct ReplyWaiter {
+    id: u64,
+    reply_type: &'static str,
+    ack_cmd: &'static str,
+    tx: mpsc::Sender<Result<Value, String>>,
+}
+
 pub struct AgentManager {
     child: Mutex<Option<CommandChild>>,
     status: Mutex<AgentStatus>,
@@ -204,6 +216,7 @@ pub struct AgentManager {
     shutting_down: AtomicBool,
     restart_times: Mutex<VecDeque<Instant>>,
     waiters: Mutex<Vec<AckWaiter>>,
+    reply_waiters: Mutex<Vec<ReplyWaiter>>,
     next_waiter_id: AtomicU64,
     /// Monotonic base for `last_line_ms`.
     clock: Instant,
@@ -244,6 +257,7 @@ impl Default for AgentManager {
             shutting_down: AtomicBool::new(false),
             restart_times: Mutex::new(VecDeque::new()),
             waiters: Mutex::new(Vec::new()),
+            reply_waiters: Mutex::new(Vec::new()),
             next_waiter_id: AtomicU64::new(1),
             clock: Instant::now(),
             last_line_ms: AtomicU64::new(0),
@@ -280,6 +294,13 @@ impl AgentManager {
     /// The cached sensor tree (verbatim `sensorTree` line).
     pub fn sensor_tree(&self) -> Option<Value> {
         lock(&self.sensor_tree).clone()
+    }
+
+    /// Runs `f` on the cached sensor tree without cloning it (keep `f` short: the reader
+    /// waits for this lock).
+    pub fn with_sensor_tree<R>(&self, f: impl FnOnce(Option<&Value>) -> R) -> R {
+        let guard = lock(&self.sensor_tree);
+        f(guard.as_ref())
     }
 
     fn elapsed_ms(&self) -> u64 {
@@ -354,6 +375,73 @@ impl AgentManager {
         result.map_err(|_| NO_ANSWER.to_string())
     }
 
+    /// Sends a command and waits (up to `timeout`) for its ack with the contract's error texts:
+    /// agent down → `Hardware agent is not running`, timeout → `Hardware agent did not answer`,
+    /// `ok:false` → the agent's message (or `fallback` when it is empty).
+    pub fn request_ack_checked(
+        &self,
+        value: &Value,
+        cmd: &str,
+        timeout: Duration,
+        fallback: &str,
+    ) -> Result<AgentAck, String> {
+        if !self.is_running() {
+            return Err(ERR_NOT_RUNNING.to_string());
+        }
+        match self.request_ack(value, cmd, timeout) {
+            Ok(ack) if ack.ok => Ok(ack),
+            Ok(ack) if ack.message.is_empty() => Err(fallback.to_string()),
+            Ok(ack) => Err(ack.message),
+            Err(e) if e.starts_with("Timed out") => Err(ERR_NO_ANSWER.to_string()),
+            Err(_) => Err(ERR_NOT_RUNNING.to_string()),
+        }
+    }
+
+    /// Sends a command and waits (up to `timeout`) for the next line of type `reply_type`.
+    /// An `ack` for `ack_cmd` with `ok:false` ends the wait with its message. Blocking.
+    pub fn request_reply(
+        &self,
+        value: &Value,
+        reply_type: &'static str,
+        ack_cmd: &'static str,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        if !self.is_running() {
+            return Err(ERR_NOT_RUNNING.to_string());
+        }
+        let (tx, rx) = mpsc::channel();
+        let id = self.next_waiter_id.fetch_add(1, Ordering::SeqCst);
+        lock(&self.reply_waiters).push(ReplyWaiter {
+            id,
+            reply_type,
+            ack_cmd,
+            tx,
+        });
+        if self.send(value).is_err() {
+            lock(&self.reply_waiters).retain(|w| w.id != id);
+            return Err(ERR_NOT_RUNNING.to_string());
+        }
+        let result = rx.recv_timeout(timeout);
+        lock(&self.reply_waiters).retain(|w| w.id != id);
+        match result {
+            Ok(r) => r,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ERR_NO_ANSWER.to_string()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ERR_NOT_RUNNING.to_string()),
+        }
+    }
+
+    /// Hands a reply line to every waiter for its type.
+    fn resolve_replies(&self, reply_type: &str, value: &Value) {
+        lock(&self.reply_waiters).retain(|w| {
+            if w.reply_type == reply_type {
+                let _ = w.tx.send(Ok(value.clone()));
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     fn resolve_waiters(&self, ack: &AgentAck) {
         let mut waiters = lock(&self.waiters);
         waiters.retain(|w| {
@@ -364,6 +452,22 @@ impl AgentManager {
                 true
             }
         });
+        drop(waiters);
+        if !ack.ok {
+            lock(&self.reply_waiters).retain(|w| {
+                if w.ack_cmd.eq_ignore_ascii_case(&ack.cmd) {
+                    let message = if ack.message.is_empty() {
+                        "The hardware agent could not run this command".to_string()
+                    } else {
+                        ack.message.clone()
+                    };
+                    let _ = w.tx.send(Err(message));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
     }
 
     fn fail_all_waiters(&self, message: &str) {
@@ -374,6 +478,10 @@ impl AgentManager {
                 ok: false,
                 message: message.to_string(),
             });
+        }
+        drop(waiters);
+        for w in lock(&self.reply_waiters).drain(..) {
+            let _ = w.tx.send(Err(ERR_NOT_RUNNING.to_string()));
         }
         // Dropping the sender wakes a pending spec request.
         lock(&self.spec_waiter).take();
@@ -402,14 +510,31 @@ pub fn apply_interval(app: &AppHandle) {
     }
 }
 
-/// Sends `sensorStream` when the effective value (UI wish ∧ window visible ∧ agent running)
-/// differs from what the current process last received, or always when `force`.
+/// Effective sensor stream (CONTRACT §2.9, §2.10.5):
+/// `((wish ∧ visible) ∨ logActive ∨ (hidden ∧ traySensors ≠ ∅)) ∧ running`.
+pub fn stream_effective(
+    wish: bool,
+    hidden: bool,
+    log_active: bool,
+    tray_sensors: bool,
+    running: bool,
+) -> bool {
+    running && ((wish && !hidden) || log_active || (hidden && tray_sensors))
+}
+
+/// Sends `sensorStream` when the effective value ([`stream_effective`]) differs from what the
+/// current process last received, or always when `force`.
 pub fn sync_sensor_stream(app: &AppHandle, force: bool) {
     let state = app.state::<AppState>();
     let mgr = &state.agent;
     let running = mgr.is_running();
-    let effective =
-        mgr.stream_wish.load(Ordering::SeqCst) && !state.in_tray.load(Ordering::SeqCst) && running;
+    let effective = stream_effective(
+        mgr.stream_wish.load(Ordering::SeqCst),
+        state.in_tray.load(Ordering::SeqCst),
+        state.sensor_log.is_active(),
+        !lock(&state.tray_sensors).is_empty(),
+        running,
+    );
     let mut sent = lock(&mgr.stream_sent);
     if !running {
         *sent = None;
@@ -443,9 +568,15 @@ pub fn start(app: &AppHandle) {
     *lock(&mgr.sensor_tree) = None;
     *lock(&mgr.spec_cache) = None;
     *lock(&mgr.stream_sent) = None;
+    crate::frames::clear(app);
+    crate::tuning::clear(app);
 
+    // CONTRACT §1.1 / §2.13: `--presentmon "<abs path>"` only when the bundled exe exists.
     let command = match app.shell().sidecar(SIDECAR_NAME) {
-        Ok(c) => c,
+        Ok(c) => match crate::frames::presentmon_path(app) {
+            Some(path) => c.args(["--presentmon".to_string(), path]),
+            None => c,
+        },
         Err(e) => {
             update_status(app, |s| {
                 s.running = false;
@@ -615,14 +746,32 @@ fn handle_line(app: &AppHandle, raw: &[u8]) {
             if value.pointer("/fanSafety/failsafe").and_then(Value::as_bool) == Some(true) {
                 failsafe::update(app, |t, now| t.on_failsafe_telemetry(is_admin, now));
             }
+            crate::alerts::on_telemetry(app, &value);
+            crate::drive_history::on_telemetry(app, &value);
             let _ = app.emit("telemetry", value);
         }
         "sensorValues" => {
+            crate::sensor_log::on_values(app, &value);
+            *lock(&state.latest_values) = Some((Instant::now(), value.clone()));
             let _ = app.emit("sensor-values", value);
         }
         "sensorTree" => {
             *lock(&state.agent.sensor_tree) = Some(value.clone());
+            crate::sensor_log::on_tree(app, &value);
             let _ = app.emit("sensor-tree", value);
+        }
+        "frameSession" | "frameTarget" | "frameStats" => {
+            crate::frames::on_line(app, value);
+        }
+        "presentingList" => {
+            state.agent.resolve_replies("presentingList", &value);
+        }
+        "tuningState" => {
+            crate::tuning::on_state(app, &value);
+            state.agent.resolve_replies("tuningState", &value);
+        }
+        "tuningProbe" => {
+            state.agent.resolve_replies("tuningProbe", &value);
         }
         "spec" => {
             if let Some(tx) = lock(&state.agent.spec_waiter).take() {
@@ -647,6 +796,8 @@ fn handle_line(app: &AppHandle, raw: &[u8]) {
             sync_sensor_stream(app, true);
             // Sync the poll interval with the current settings / tray state.
             apply_interval(app);
+            // CONTRACT §2.13: frame capture starts with the agent (not with a game).
+            crate::frames::on_hello(app);
         }
         "ack" => {
             let ack = AgentAck {
@@ -693,6 +844,10 @@ fn handle_exit(app: &AppHandle, gen: u64, code: Option<i32>) {
     mgr.fail_all_waiters("Hardware agent exited");
     *lock(&mgr.sensor_tree) = None;
     *lock(&mgr.stream_sent) = None;
+    *lock(&state.latest_values) = None;
+    crate::frames::clear(app);
+    crate::tuning::clear(app);
+    crate::alerts::on_agent_down(app);
 
     let code_text = code
         .map(|c| c.to_string())
@@ -1077,12 +1232,12 @@ mod tests {
     #[test]
     fn hello_parsing_and_status() {
         let v = json!({
-            "type": "hello", "version": "1.0.0", "protocol": 2, "isAdmin": true, "pid": 42,
+            "type": "hello", "version": "1.1.0", "protocol": 3, "isAdmin": true, "pid": 42,
             "sensorDriver": { "kind": "none", "version": null, "minVersion": "2.1.0", "ok": false, "reason": "missing" },
             "fanFlag": "none"
         });
         let h = parse_hello(&v);
-        assert_eq!(h.protocol, Some(2));
+        assert_eq!(h.protocol, Some(3));
         assert_eq!(h.fan_flag.as_deref(), Some("none"));
         assert_eq!(h.sensor_driver, Some(SensorDriverStatus {
             kind: "none".into(),
@@ -1095,8 +1250,8 @@ mod tests {
         apply_hello(&mut s, &h);
         assert!(s.running && s.is_admin);
         assert_eq!(s.limited_reasons, vec!["pawnIoMissing"]);
-        assert_eq!(s.protocol, Some(2));
-        assert_eq!(s.message, "Hardware agent v1.0.0 online (pid 42)");
+        assert_eq!(s.protocol, Some(3));
+        assert_eq!(s.message, "Hardware agent v1.1.0 online (pid 42)");
         let j = serde_json::to_value(&s).unwrap();
         assert_eq!(j["sensorDriver"]["minVersion"], "2.1.0");
         assert_eq!(j["limitedReasons"][0], "pawnIoMissing");
@@ -1110,9 +1265,9 @@ mod tests {
         assert_eq!(s.sensor_driver, None);
         assert_eq!(s.limited_reasons, vec!["notElevated"]);
         assert_eq!(s.message, "Hardware agent version mismatch (protocol unknown)");
-        let h = parse_hello(&json!({ "type": "hello", "version": "2", "protocol": 3, "isAdmin": true, "sensorDriver": driver(None) }));
+        let h = parse_hello(&json!({ "type": "hello", "version": "1.0.0", "protocol": 2, "isAdmin": true, "sensorDriver": driver(None) }));
         apply_hello(&mut s, &h);
-        assert_eq!(s.message, "Hardware agent version mismatch (protocol 3)");
+        assert_eq!(s.message, "Hardware agent version mismatch (protocol 2)");
         assert!(s.limited_reasons.is_empty());
 
         s.clear_agent_fields();
@@ -1138,5 +1293,22 @@ mod tests {
             clean_sensor_ids(Some(vec![" /a ".into(), "".into(), "/a".into(), "/b".into()])),
             Some(vec!["/a".to_string(), "/b".to_string()])
         );
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::stream_effective;
+
+    #[test]
+    fn effective_stream_formula() {
+        // (wish ∧ visible) ∨ logActive ∨ (hidden ∧ traySensors), and only while running.
+        assert!(stream_effective(true, false, false, false, true));
+        assert!(!stream_effective(true, true, false, false, true), "hidden pauses the UI wish");
+        assert!(stream_effective(false, true, true, false, true), "a log forces it on");
+        assert!(stream_effective(false, false, true, false, true));
+        assert!(stream_effective(false, true, false, true, true), "tray sensors while hidden");
+        assert!(!stream_effective(false, false, false, true, true), "tray sensors only while hidden");
+        assert!(!stream_effective(true, false, true, true, false), "never while the agent is down");
     }
 }

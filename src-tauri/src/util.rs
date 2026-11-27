@@ -171,17 +171,6 @@ pub fn file_timestamp() -> String {
     chrono::Local::now().format("%Y%m%d-%H%M%S").to_string()
 }
 
-/// `Documents\Nexum` (created if missing).
-pub fn documents_nexum_dir() -> Result<PathBuf, String> {
-    let docs = dirs::document_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join("Documents")))
-        .ok_or_else(|| "Could not locate the Documents folder".to_string())?;
-    let dir = docs.join("Nexum");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
-    Ok(dir)
-}
-
 /// Current wall-clock time as unix milliseconds.
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()

@@ -25,8 +25,9 @@ use windows::Win32::Foundation::{BOOLEAN, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FileDispositionInfo, GetFileInformationByHandle, SetFileInformationByHandle,
     BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    FILE_APPEND_DATA, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, SYNCHRONIZE,
 };
 
 use crate::cleaner::{final_path, norm_path};
@@ -198,6 +199,147 @@ impl PinnedDir {
         }
         Ok((file, path))
     }
+
+    /// Creates `<stem>.<ext>`, or `<stem>-2.<ext>`, `<stem>-3.<ext>`, … when the name is taken
+    /// (CONTRACT §2.9 collision rule), through [`Self::create_new_file`].
+    pub fn create_unique(&self, stem: &str, ext: &str) -> io::Result<(File, PathBuf)> {
+        for n in 1..=100u32 {
+            let name = if n == 1 {
+                format!("{stem}.{ext}")
+            } else {
+                format!("{stem}-{n}.{ext}")
+            };
+            match self.create_new_file(&name) {
+                Ok(r) => return Ok(r),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "too many files with the same name",
+        ))
+    }
+
+    /// Opens an existing plain file `name` in this folder without following a link, after
+    /// the same checks as [`Self::create_new_file`]: not a reparse point, a single hard link
+    /// (a second name could point at a file elsewhere), final path inside this folder.
+    fn open_existing(&self, name: &str, access: u32, share: u32) -> io::Result<File> {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains(['\\', '/', ':'])
+            || name.chars().any(char::is_control)
+        {
+            return Err(refused("invalid file name"));
+        }
+        let path = self.path.join(name);
+        let file = std::fs::OpenOptions::new()
+            .access_mode(access)
+            .share_mode(share)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(&path)?;
+        let handle = HANDLE(file.as_raw_handle());
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `handle` belongs to `file`, which is open; `info` is a valid out pointer.
+        unsafe { GetFileInformationByHandle(handle, &mut info) }.map_err(win_io)?;
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return Err(refused("the file is a link"));
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
+            return Err(refused("the path is a folder"));
+        }
+        if info.nNumberOfLinks > 1 {
+            return Err(refused("the file has more than one name"));
+        }
+        let expected = norm_path(&Path::new(&self.final_norm).join(name));
+        if final_path(handle).as_deref() != Some(expected.as_str()) {
+            return Err(refused("the file resolves to a different location"));
+        }
+        Ok(file)
+    }
+
+    /// Opens an existing file for appending (CONTRACT §2.11 `open_append`), shared for reading
+    /// only, with the checks of [`Self::open_existing`].
+    pub fn open_append(&self, name: &str) -> io::Result<File> {
+        self.open_existing(
+            name,
+            FILE_APPEND_DATA.0 | FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0,
+            FILE_SHARE_READ.0,
+        )
+    }
+
+    /// Opens an existing file for reading with the checks of [`Self::open_existing`].
+    pub fn open_read(&self, name: &str) -> io::Result<File> {
+        self.open_existing(
+            name,
+            FILE_GENERIC_READ.0,
+            FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0,
+        )
+    }
+}
+
+/// The user's profile folder (from the token; not redirectable through `User Shell Folders`).
+fn profile_dir() -> io::Result<PathBuf> {
+    use windows::Win32::UI::Shell::FOLDERID_Profile;
+    crate::util::known_folder(&FOLDERID_Profile).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "the user profile folder is unavailable",
+        )
+    })
+}
+
+/// `(profile, <known folder>)` when the known folder lies strictly inside the profile. A
+/// folder redirected elsewhere (another drive, a share, another user's profile) is refused:
+/// the elevated app only writes below the profile through [`PinnedDir`].
+fn known_folder_in_profile(id: &windows::core::GUID, what: &str) -> io::Result<(PathBuf, PathBuf)> {
+    let profile = profile_dir()?;
+    let folder = crate::util::known_folder(id).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("the {what} folder is unavailable"))
+    })?;
+    let folder = crate::cleaner::within_profile(Some(folder), Some(&profile)).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("the {what} folder is not inside your user profile, so Nexum does not write there"),
+        )
+    })?;
+    Ok((profile, folder))
+}
+
+/// `<Documents>\<sub…>` (for display / "Open folder"); not created.
+pub fn documents_path(sub: &[&str]) -> io::Result<PathBuf> {
+    use windows::Win32::UI::Shell::FOLDERID_Documents;
+    let (_, docs) = known_folder_in_profile(&FOLDERID_Documents, "Documents")?;
+    let mut p = docs;
+    for s in sub {
+        p.push(s);
+    }
+    Ok(p)
+}
+
+/// Opens (creating as needed) `<Documents>\<sub…>` through [`PinnedDir`] with the profile as
+/// the trusted base, so every folder from the profile down is checked.
+pub fn open_documents(sub: &[&str]) -> io::Result<PinnedDir> {
+    use windows::Win32::UI::Shell::FOLDERID_Documents;
+    let (profile, docs) = known_folder_in_profile(&FOLDERID_Documents, "Documents")?;
+    let mut dir = docs;
+    for s in sub {
+        dir.push(s);
+    }
+    PinnedDir::open(&profile, &dir, true)
+}
+
+/// Opens (creating as needed) `%LOCALAPPDATA%\<sub…>` through [`PinnedDir`] with the profile
+/// as the trusted base (same rule as the cleanup log, CONTRACT §3 rule 11).
+pub fn open_local_appdata(sub: &[&str]) -> io::Result<PinnedDir> {
+    use windows::Win32::UI::Shell::FOLDERID_LocalAppData;
+    let (profile, local) = known_folder_in_profile(&FOLDERID_LocalAppData, "local application data")?;
+    let mut dir = local;
+    for s in sub {
+        dir.push(s);
+    }
+    PinnedDir::open(&profile, &dir, true)
 }
 
 #[cfg(test)]
@@ -262,6 +404,36 @@ mod tests {
         assert!(std::fs::rename(&dir, base.join("Nexum").join("moved")).is_err());
         drop(pinned);
         std::fs::rename(&dir, base.join("Nexum").join("moved")).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn unique_names_append_and_read() {
+        use std::io::Read;
+        let base = scratch("unique");
+        let dir = base.join("Nexum").join("history");
+        let pinned = PinnedDir::open(&base, &dir, true).unwrap();
+        let (mut a, pa) = pinned.create_unique("report", "txt").unwrap();
+        let (_, pb) = pinned.create_unique("report", "txt").unwrap();
+        let (_, pc) = pinned.create_unique("report", "txt").unwrap();
+        assert!(pa.ends_with("report.txt"));
+        assert!(pb.ends_with("report-2.txt"));
+        assert!(pc.ends_with("report-3.txt"));
+        a.write_all(b"one\n").unwrap();
+        drop(a);
+        let mut f = pinned.open_append("report.txt").unwrap();
+        f.write_all(b"two\n").unwrap();
+        drop(f);
+        let mut s = String::new();
+        pinned.open_read("report.txt").unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s, "one\ntwo\n");
+        assert!(pinned.open_append("missing.txt").is_err());
+        assert!(pinned.open_append(r"..\x.txt").is_err());
+        // A second hard link to the file is refused (it could name a file elsewhere).
+        std::fs::hard_link(&pa, dir.join("alias.txt")).unwrap();
+        assert!(pinned.open_append("report.txt").is_err());
+        assert!(pinned.open_append("alias.txt").is_err());
+        drop(pinned);
         let _ = std::fs::remove_dir_all(&base);
     }
 

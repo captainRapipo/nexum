@@ -60,6 +60,138 @@ pub struct Settings {
     pub dismissed_alerts: Vec<String>,
     #[serde(deserialize_with = "de_choice")]
     pub sensor_driver_choice: String,
+    /// Opt-in frame capture (CONTRACT §1.6, §2.13).
+    pub fps_capture_enabled: bool,
+    #[serde(deserialize_with = "de_fps_window")]
+    pub fps_window_sec: u64,
+    #[serde(deserialize_with = "de_string_list")]
+    pub fps_excludes: Vec<String>,
+    #[serde(deserialize_with = "de_log_interval")]
+    pub sensor_log_interval_ms: u64,
+    #[serde(deserialize_with = "de_alerts")]
+    pub alerts: AlertSettings,
+    /// `null` = every Recycle Bin item; else one of 1, 14, 30, 60 (CONTRACT §3.2).
+    #[serde(deserialize_with = "de_recycle_age")]
+    pub recycle_min_age_days: Option<u32>,
+}
+
+/// `Settings.alerts` (CONTRACT §2.2, §2.10). Each member is sanitized on its own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlertSettings {
+    pub desktop_notifications: bool,
+    /// CPU limit override °C (60..105); `None` = per-model table.
+    pub cpu_temp_c: Option<u32>,
+    /// GPU hot-spot crit override °C (70..115); `None` = 110.
+    pub gpu_hotspot_c: Option<u32>,
+    /// GPU memory-junction crit override °C (70..115); `None` = 105.
+    pub gpu_mem_junction_c: Option<u32>,
+    /// Low-space warn threshold % (1..50).
+    pub free_space_pct: u32,
+    /// Sustained window, seconds (10..600).
+    pub sustain_sec: u32,
+}
+
+impl Default for AlertSettings {
+    fn default() -> Self {
+        Self {
+            desktop_notifications: false,
+            cpu_temp_c: None,
+            gpu_hotspot_c: None,
+            gpu_mem_junction_c: None,
+            free_space_pct: 10,
+            sustain_sec: 60,
+        }
+    }
+}
+
+pub const FPS_WINDOW_MIN: u64 = 5;
+pub const FPS_WINDOW_MAX: u64 = 120;
+pub const FPS_WINDOW_DEFAULT: u64 = 30;
+pub const SENSOR_LOG_INTERVALS: [u64; 4] = [1000, 2000, 5000, 10000];
+pub const RECYCLE_AGE_OPTIONS: [u32; 4] = [1, 14, 30, 60];
+pub const RECYCLE_AGE_DEFAULT: u32 = 30;
+
+/// Integer clamp of a finite number (rounded), `None` otherwise.
+fn int_clamp(v: f64, min: u32, max: u32) -> Option<u32> {
+    v.is_finite()
+        .then(|| v.round().clamp(min as f64, max as f64) as u32)
+}
+
+impl AlertSettings {
+    /// Parses each member on its own: a missing or malformed member gets its default.
+    pub fn from_value(v: &serde_json::Value) -> Self {
+        let d = Self::default();
+        let num = |k: &str| v.get(k).and_then(serde_json::Value::as_f64);
+        // `null` is a valid "use the default rule" value; anything else that is not a number
+        // falls back to the default (also `None`).
+        let opt = |k: &str, min: u32, max: u32| num(k).and_then(|n| int_clamp(n, min, max));
+        Self {
+            desktop_notifications: v
+                .get("desktopNotifications")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(d.desktop_notifications),
+            cpu_temp_c: opt("cpuTempC", 60, 105),
+            gpu_hotspot_c: opt("gpuHotspotC", 70, 115),
+            gpu_mem_junction_c: opt("gpuMemJunctionC", 70, 115),
+            free_space_pct: num("freeSpacePct")
+                .and_then(|n| int_clamp(n, 1, 50))
+                .unwrap_or(d.free_space_pct),
+            sustain_sec: num("sustainSec")
+                .and_then(|n| int_clamp(n, 10, 600))
+                .unwrap_or(d.sustain_sec),
+        }
+    }
+
+    /// Clamps values that came in through the typed struct (e.g. built in code).
+    pub fn sanitized(self) -> Self {
+        Self {
+            desktop_notifications: self.desktop_notifications,
+            cpu_temp_c: self.cpu_temp_c.map(|c| c.clamp(60, 105)),
+            gpu_hotspot_c: self.gpu_hotspot_c.map(|c| c.clamp(70, 115)),
+            gpu_mem_junction_c: self.gpu_mem_junction_c.map(|c| c.clamp(70, 115)),
+            free_space_pct: self.free_space_pct.clamp(1, 50),
+            sustain_sec: self.sustain_sec.clamp(10, 600),
+        }
+    }
+
+    /// Crit threshold of the low-space rule: `max(1, floor(freeSpacePct / 2))`.
+    pub fn free_space_crit_pct(&self) -> u32 {
+        (self.free_space_pct / 2).max(1)
+    }
+}
+
+/// `sensorLogIntervalMs`: one of 1000, 2000, 5000, 10000; anything else → 1000.
+pub fn sanitize_log_interval(ms: u64) -> u64 {
+    if SENSOR_LOG_INTERVALS.contains(&ms) {
+        ms
+    } else {
+        1000
+    }
+}
+
+/// `recycleMinAgeDays`: `None` or one of 1, 14, 30, 60; anything else → 30.
+pub fn sanitize_recycle_age(days: Option<u32>) -> Option<u32> {
+    match days {
+        None => None,
+        Some(d) if RECYCLE_AGE_OPTIONS.contains(&d) => Some(d),
+        Some(_) => Some(RECYCLE_AGE_DEFAULT),
+    }
+}
+
+/// A `recycleMinAgeDays` JSON value: `null` → `None`, a whole number → sanitized, anything else
+/// (strings, fractions, negatives) → the default.
+pub fn recycle_age_from_value(v: &serde_json::Value) -> Option<u32> {
+    match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::Number(n) => match n.as_f64() {
+            Some(f) if f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f <= u32::MAX as f64 => {
+                sanitize_recycle_age(Some(f as u32))
+            }
+            _ => Some(RECYCLE_AGE_DEFAULT),
+        },
+        _ => Some(RECYCLE_AGE_DEFAULT),
+    }
 }
 
 impl Default for Settings {
@@ -79,6 +211,12 @@ impl Default for Settings {
             hide_unused_sensors: true,
             dismissed_alerts: Vec::new(),
             sensor_driver_choice: "undecided".to_string(),
+            fps_capture_enabled: false,
+            fps_window_sec: FPS_WINDOW_DEFAULT,
+            fps_excludes: Vec::new(),
+            sensor_log_interval_ms: 1000,
+            alerts: AlertSettings::default(),
+            recycle_min_age_days: Some(RECYCLE_AGE_DEFAULT),
         }
     }
 }
@@ -140,6 +278,12 @@ impl Settings {
         ) {
             self.sensor_driver_choice = "undecided".to_string();
         }
+
+        self.fps_window_sec = self.fps_window_sec.clamp(FPS_WINDOW_MIN, FPS_WINDOW_MAX);
+        self.fps_excludes = crate::frames::sanitize_excludes(std::mem::take(&mut self.fps_excludes));
+        self.sensor_log_interval_ms = sanitize_log_interval(self.sensor_log_interval_ms);
+        self.alerts = self.alerts.clone().sanitized();
+        self.recycle_min_age_days = sanitize_recycle_age(self.recycle_min_age_days);
         self
     }
 }
@@ -264,6 +408,49 @@ fn de_choice<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     })
 }
 
+/// A finite, non-negative number (or numeric string) rounded to an integer.
+fn tolerant_u64(v: &serde_json::Value) -> Option<u64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_u64().or_else(|| {
+            n.as_f64()
+                .filter(|f| f.is_finite() && *f >= 0.0)
+                .map(|f| f.round() as u64)
+        }),
+        serde_json::Value::String(s) => s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite() && *f >= 0.0)
+            .map(|f| f.round() as u64),
+        _ => None,
+    }
+}
+
+/// `fpsWindowSec`; malformed → 30 (clamped in `sanitized`).
+fn de_fps_window<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    Ok(tolerant_u64(&serde_json::Value::deserialize(d)?).unwrap_or(FPS_WINDOW_DEFAULT))
+}
+
+/// `sensorLogIntervalMs`; malformed → 1000 (checked in `sanitized`).
+fn de_log_interval<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    Ok(tolerant_u64(&serde_json::Value::deserialize(d)?).unwrap_or(1000))
+}
+
+/// `alerts`; a non-object becomes the defaults, each member is parsed on its own.
+fn de_alerts<'de, D: Deserializer<'de>>(d: D) -> Result<AlertSettings, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(if v.is_object() {
+        AlertSettings::from_value(&v)
+    } else {
+        AlertSettings::default()
+    })
+}
+
+/// `recycleMinAgeDays`: `null` stays `null` (every item); malformed → 30.
+fn de_recycle_age<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    Ok(recycle_age_from_value(&serde_json::Value::deserialize(d)?))
+}
+
 /// True when `p` exists and is a reparse point (junction, symbolic link, mount point).
 fn is_reparse_point(p: &Path) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -369,15 +556,52 @@ pub fn persist_current(app: &AppHandle) -> Result<(), String> {
     }
 }
 
-/// Effective sidecar interval: the user's poll interval, throttled to >= 5 s while in the tray.
+/// Effective sidecar interval (CONTRACT §2 minimized to tray, §2.9): the user's poll interval;
+/// while hidden `max(poll, 5000)`, or `min(that, log interval)` while a sensor log runs.
+pub fn effective_poll(poll_ms: u64, in_tray: bool, log_interval_ms: Option<u64>) -> u64 {
+    let poll = clamp_poll(poll_ms);
+    if !in_tray {
+        return poll;
+    }
+    let hidden = poll.max(TRAY_POLL_MS).min(MAX_POLL_MS);
+    match log_interval_ms {
+        Some(log) => clamp_poll(hidden.min(log)),
+        None => hidden,
+    }
+}
+
+/// [`effective_poll`] for the current settings, tray state and sensor log.
 pub fn effective_poll_ms(app: &AppHandle) -> u64 {
     let state = app.state::<AppState>();
-    let poll = clamp_poll(lock(&state.settings).poll_interval_ms);
-    if state.in_tray.load(Ordering::SeqCst) {
-        poll.max(TRAY_POLL_MS).min(MAX_POLL_MS)
-    } else {
-        poll
+    let poll = lock(&state.settings).poll_interval_ms;
+    effective_poll(
+        poll,
+        state.in_tray.load(Ordering::SeqCst),
+        state.sensor_log.active_interval(),
+    )
+}
+
+/// Applies `f` to a copy of the current settings, sanitizes, saves and stores the result
+/// (one writer at a time). Returns `(old, new)`.
+pub fn update_settings(
+    app: &AppHandle,
+    f: impl FnOnce(&mut Settings),
+) -> Result<(Settings, Settings), String> {
+    let state = app.state::<AppState>();
+    let _writer = lock(&state.settings_write);
+    let old = lock(&state.settings).clone();
+    let mut new = old.clone();
+    f(&mut new);
+    let new = new.sanitized();
+    if new != old {
+        let path = lock(&state.settings_path).clone();
+        match path {
+            Some(p) => write_to(&p, &new)?,
+            None => return Err("Settings location is unavailable".to_string()),
+        }
+        *lock(&state.settings) = new.clone();
     }
+    Ok((old, new))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -627,9 +851,10 @@ pub fn get_settings(app: AppHandle) -> Result<Settings, String> {
 #[tauri::command]
 pub async fn save_settings(app: AppHandle, settings: Settings) -> Result<Settings, String> {
     let worker = app.clone();
-    let saved = tauri::async_runtime::spawn_blocking(move || -> Result<Settings, String> {
+    let (old, saved) = tauri::async_runtime::spawn_blocking(move || -> Result<(Settings, Settings), String> {
         let app = worker;
         let state = app.state::<AppState>();
+        let _writer = lock(&state.settings_write);
         let new = settings.sanitized();
         let old = lock(&state.settings).clone();
 
@@ -648,12 +873,24 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> Result<Setting
             }
         }
         *lock(&state.settings) = new.clone();
-        Ok(new)
+        Ok((old, new))
     })
     .await
     .map_err(|e| format!("Settings worker failed: {e}"))??;
 
     crate::agent::apply_interval(&app);
+    // CONTRACT §2.13: the same effects as the dedicated frame commands, so both paths agree.
+    crate::frames::apply_settings_change(&app, &old, &saved);
+    // New thresholds / unit / dismissals: re-evaluate the alerts at once.
+    if old.alerts != saved.alerts
+        || old.temp_unit != saved.temp_unit
+        || old.dismissed_alerts != saved.dismissed_alerts
+    {
+        crate::alerts::on_settings_changed(&app);
+    }
+    if old.sensor_labels != saved.sensor_labels {
+        crate::alerts::request_tooltip(&app);
+    }
     Ok(saved)
 }
 
@@ -768,6 +1005,79 @@ mod tests {
         assert_eq!(s.dismissed_alerts[0], "alert-50");
         assert_eq!(s.dismissed_alerts[199], "alert-249");
         assert_eq!(s.sensor_driver_choice, "undecided");
+    }
+
+    #[test]
+    fn v11_defaults_match_contract() {
+        let v = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(v["fpsCaptureEnabled"], false);
+        assert_eq!(v["fpsWindowSec"], 30);
+        assert_eq!(v["fpsExcludes"], serde_json::json!([]));
+        assert_eq!(v["sensorLogIntervalMs"], 1000);
+        assert_eq!(v["recycleMinAgeDays"], 30);
+        assert_eq!(
+            v["alerts"],
+            serde_json::json!({
+                "desktopNotifications": false, "cpuTempC": null, "gpuHotspotC": null,
+                "gpuMemJunctionC": null, "freeSpacePct": 10, "sustainSec": 60
+            })
+        );
+        // A v1.0 file (no 1.1 members) gets every default.
+        let s: Settings = serde_json::from_str(r#"{"pollIntervalMs":1000}"#).unwrap();
+        let s = s.sanitized();
+        assert_eq!(s.recycle_min_age_days, Some(30));
+        assert_eq!(s.alerts, AlertSettings::default());
+    }
+
+    #[test]
+    fn v11_members_are_sanitized() {
+        let s: Settings = serde_json::from_value(serde_json::json!({
+            "fpsCaptureEnabled": true,
+            "fpsWindowSec": 500,
+            "fpsExcludes": ["obs64.exe", "OBS64.EXE", "dwm.exe", "bad name", " game.exe "],
+            "sensorLogIntervalMs": 3000,
+            "recycleMinAgeDays": null,
+            "alerts": { "desktopNotifications": true, "cpuTempC": 200, "gpuHotspotC": "x",
+                        "gpuMemJunctionC": 60.4, "freeSpacePct": 0, "sustainSec": 30.6 }
+        }))
+        .unwrap();
+        let s = s.sanitized();
+        assert!(s.fps_capture_enabled);
+        assert_eq!(s.fps_window_sec, 120);
+        assert_eq!(s.fps_excludes, vec!["obs64.exe", "game.exe"]);
+        assert_eq!(s.sensor_log_interval_ms, 1000);
+        assert_eq!(s.recycle_min_age_days, None, "null means every item");
+        assert!(s.alerts.desktop_notifications);
+        assert_eq!(s.alerts.cpu_temp_c, Some(105));
+        assert_eq!(s.alerts.gpu_hotspot_c, None, "malformed member → default");
+        assert_eq!(s.alerts.gpu_mem_junction_c, Some(70));
+        assert_eq!(s.alerts.free_space_pct, 1);
+        assert_eq!(s.alerts.sustain_sec, 31);
+        assert_eq!(s.alerts.free_space_crit_pct(), 1);
+
+        let s: Settings = serde_json::from_value(serde_json::json!({
+            "fpsWindowSec": 1, "recycleMinAgeDays": 7, "alerts": "nope", "sensorLogIntervalMs": 5000
+        }))
+        .unwrap();
+        let s = s.sanitized();
+        assert_eq!(s.fps_window_sec, 5);
+        assert_eq!(s.recycle_min_age_days, Some(30));
+        assert_eq!(s.alerts, AlertSettings::default());
+        assert_eq!(s.sensor_log_interval_ms, 5000);
+        assert_eq!(recycle_age_from_value(&serde_json::json!(14)), Some(14));
+        assert_eq!(recycle_age_from_value(&serde_json::json!(1.5)), Some(30));
+        assert_eq!(recycle_age_from_value(&serde_json::json!("14")), Some(30));
+        assert_eq!(AlertSettings { free_space_pct: 15, ..AlertSettings::default() }.free_space_crit_pct(), 7);
+    }
+
+    #[test]
+    fn hidden_poll_interval_follows_the_log() {
+        assert_eq!(effective_poll(1000, false, Some(10_000)), 1000);
+        assert_eq!(effective_poll(1000, true, None), 5000);
+        assert_eq!(effective_poll(1000, true, Some(1000)), 1000);
+        assert_eq!(effective_poll(1000, true, Some(10_000)), 5000);
+        assert_eq!(effective_poll(8000, true, Some(2000)), 2000);
+        assert_eq!(effective_poll(8000, true, None), 8000);
     }
 
     #[test]

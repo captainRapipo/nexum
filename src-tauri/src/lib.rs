@@ -1,42 +1,83 @@
 //! Nexum Tauri core: window/tray lifecycle, sidecar management and command registry.
 
 mod agent;
+mod alerts;
 mod cleaner;
+mod drive_history;
 mod drivers;
 mod elevation;
 mod external;
 mod failsafe;
+mod frames;
 mod procs;
 mod purge_log;
+mod report;
 mod safe_fs;
 mod self_usage;
+mod sensor_log;
 mod settings;
 mod spec;
 mod state;
 mod system_info;
+mod tuning;
 mod util;
 
 use std::sync::atomic::Ordering;
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent, Wry};
 
 use state::AppState;
 use util::lock;
 
-const MAIN_WINDOW: &str = "main";
-const TRAY_ID: &str = "nexum-tray";
+pub(crate) const MAIN_WINDOW: &str = "main";
+pub(crate) const TRAY_ID: &str = "nexum-tray";
+/// Tray menu id of the sensor-log toggle (CONTRACT §2 tray menu).
+const TRAY_SENSOR_LOG: &str = "sensor-log";
+const LOG_START_LABEL: &str = "Start sensor log";
+const LOG_STOP_LABEL: &str = "Stop sensor log";
 
 /// Tray entries that open a view: (menu id = `navigate` payload = ViewId, label).
-const TRAY_VIEWS: [(&str, &str); 6] = [
+const TRAY_VIEWS: [(&str, &str); 7] = [
     ("dashboard", "Dashboard"),
     ("sensors", "Sensors"),
     ("system", "System"),
     ("storage", "Storage"),
     ("cooling", "Cooling"),
     ("drivers", "Drivers"),
+    ("gaming", "Gaming"),
 ];
+
+/// The tray's sensor-log menu item (its label follows `SensorLogStatus.active`).
+struct TrayLogItem(MenuItem<Wry>);
+
+/// Sets the tray's sensor-log label (`Start sensor log` / `Stop sensor log`).
+pub(crate) fn set_tray_log_label(app: &AppHandle, active: bool) {
+    if let Some(item) = app.try_state::<TrayLogItem>() {
+        let item = item.0.clone();
+        let label = if active { LOG_STOP_LABEL } else { LOG_START_LABEL };
+        // `set_text` waits for the main thread; callers may sit on the agent reader path.
+        std::thread::spawn(move || {
+            if let Err(e) = item.set_text(label) {
+                eprintln!("[nexum] tray label: {e}");
+            }
+        });
+    }
+}
+
+/// Tray "Start/Stop sensor log": starts with `Settings.sensorLogIntervalMs` and every visible
+/// sensor (`ids:null`), or stops the running log.
+fn toggle_sensor_log(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        if app.state::<AppState>().sensor_log.is_active() {
+            sensor_log::stop(&app);
+        } else if let Err(e) = sensor_log::start(&app, None, None) {
+            eprintln!("[nexum] sensor log: {e}");
+        }
+    });
+}
 
 /// `navigate` payload for a tray menu id (CONTRACT §2 tray menu), or `None` for ids that do
 /// not navigate.
@@ -80,7 +121,7 @@ fn has_tray(app: &AppHandle) -> bool {
     app.tray_by_id(TRAY_ID).is_some()
 }
 
-fn navigate(app: &AppHandle, target: &str) {
+pub(crate) fn navigate(app: &AppHandle, target: &str) {
     show_main_window(app);
     let _ = app.emit("navigate", target.to_string());
 }
@@ -98,6 +139,12 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     for (id, label) in TRAY_VIEWS {
         views.push(MenuItem::with_id(app, id, label, true, None::<&str>)?);
     }
+    let log_label = if app.state::<AppState>().sensor_log.is_active() {
+        LOG_STOP_LABEL
+    } else {
+        LOG_START_LABEL
+    };
+    let log_item = MenuItem::with_id(app, TRAY_SENSOR_LOG, log_label, true, None::<&str>)?;
     let clean = MenuItem::with_id(app, "clean-caches", "Clean caches…", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
@@ -111,10 +158,12 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         items.push(v);
     }
     items.push(&sep2);
+    items.push(&log_item);
     items.push(&clean);
     items.push(&sep3);
     items.push(&quit_item);
     let menu = Menu::with_items(app, &items)?;
+    app.manage(TrayLogItem(log_item.clone()));
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("Nexum")
@@ -125,6 +174,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             match id {
                 "show" => show_main_window(app),
                 "quit" => quit(app),
+                TRAY_SENSOR_LOG => toggle_sensor_log(app),
                 other => {
                     if let Some(target) = tray_navigation(other) {
                         navigate(app, target);
@@ -176,6 +226,8 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_shell::init())
+        // Rust-side only (CONTRACT §0): no capability grants the WebView notification access.
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             system_info::get_system_info,
@@ -202,6 +254,23 @@ pub fn run() {
             failsafe::dismiss_fan_failsafe,
             elevation::restart_as_admin,
             external::open_reliability_monitor,
+            cleaner::scan_trash_details,
+            frames::get_frame_state,
+            frames::set_frame_capture,
+            frames::set_frame_target,
+            frames::set_frame_window,
+            frames::set_frame_excludes,
+            frames::list_presenting_processes,
+            sensor_log::start_sensor_log,
+            sensor_log::stop_sensor_log,
+            sensor_log::get_sensor_log_status,
+            alerts::get_health_alerts,
+            alerts::dismiss_alert,
+            alerts::set_tray_sensors,
+            drive_history::get_drive_history,
+            report::save_report,
+            tuning::get_tuning_state,
+            tuning::run_tuning_probe,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -225,8 +294,12 @@ pub fn run() {
             let flag = failsafe::flag_exists();
             failsafe::update(&handle, |t, now| t.on_app_start(flag, now));
 
+            // Notification click → show Nexum on the Dashboard (CONTRACT §2.10.4).
+            alerts::register_notification_click(&handle);
+
             agent::start(&handle);
             agent::start_watchdog(&handle);
+            alerts::start(&handle);
             self_usage::start(&handle);
             settings::refresh_autostart_in_background(&handle);
             Ok(())
@@ -250,6 +323,8 @@ pub fn run() {
 
     app.run(|app, event| {
         if let RunEvent::Exit = event {
+            // A sensor log never survives a restart of Nexum (flush + close first).
+            sensor_log::shutdown(app);
             agent::shutdown(app);
         }
     });
@@ -271,7 +346,8 @@ mod tests {
         let ids: Vec<&str> = TRAY_VIEWS.iter().map(|(v, _)| *v).collect();
         assert_eq!(
             ids,
-            vec!["dashboard", "sensors", "system", "storage", "cooling", "drivers"]
+            vec!["dashboard", "sensors", "system", "storage", "cooling", "drivers", "gaming"]
         );
+        assert_eq!(tray_navigation(TRAY_SENSOR_LOG), None, "the log toggle does not navigate");
     }
 }

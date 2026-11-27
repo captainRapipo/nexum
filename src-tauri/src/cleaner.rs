@@ -2317,7 +2317,8 @@ fn make_category(
     }
 }
 
-pub fn scan(include_browser: bool) -> TrashScan {
+/// `recycle_age`: the Recycle Bin age filter in days (`None` = every item, CONTRACT §3.2).
+pub fn scan(include_browser: bool, recycle_age: Option<u32>) -> TrashScan {
     let started = Instant::now();
     let ids: Vec<CategoryId> = CategoryId::ALL
         .into_iter()
@@ -2329,7 +2330,18 @@ pub fn scan(include_browser: bool) -> TrashScan {
         let mut description = id.base_description().to_string();
         let mut notes = Vec::new();
         let (bytes, files) = match id {
-            CategoryId::Recycle => query_recycle_bin().unwrap_or((0, 0)),
+            CategoryId::Recycle => match recycle_age {
+                None => query_recycle_bin().unwrap_or((0, 0)),
+                Some(days) => {
+                    description = recycle_description(Some(days));
+                    notes.push(recycle_keep_note(days));
+                    let bins = recycle_bins(&ctx.deny, Some(days), now_ms());
+                    (
+                        bins.iter().flat_map(|b| b.items.iter()).map(|i| i.bytes).sum::<u64>(),
+                        bins.iter().map(|b| b.items.len() as u64).sum::<u64>(),
+                    )
+                }
+            },
             _ => {
                 let plan = plan_category(id, &ctx);
                 let (mut bytes, mut files) = (plan.bytes(), plan.files());
@@ -2429,7 +2441,11 @@ fn log_blocked(log: &mut PurgeLog, id: CategoryId, plan: &RootPlan, reason: Bloc
     }
 }
 
-pub fn purge(app: &AppHandle, categories: &[String]) -> Result<PurgeResult, String> {
+pub fn purge(
+    app: &AppHandle,
+    categories: &[String],
+    recycle_age: Option<u32>,
+) -> Result<PurgeResult, String> {
     let started = Instant::now();
     let started_ts = now_ms();
     let requested = parse_categories(categories)?;
@@ -2456,6 +2472,10 @@ pub fn purge(app: &AppHandle, categories: &[String]) -> Result<PurgeResult, Stri
             // Rule 12: an unavailable category is skipped, not an error.
             notes.push(NOTE_NEEDS_ADMIN.to_string());
             PurgeCounts::default()
+        } else if id == CategoryId::Recycle && recycle_age.is_some() {
+            // CONTRACT §3.2: only items older than N days, item by item, no SHEmptyRecycleBinW.
+            let days = recycle_age.unwrap_or(RECYCLE_DEFAULT_DAYS);
+            purge_recycle_aged(&ctx, days, &mut log)
         } else if id == CategoryId::Recycle {
             let c = empty_recycle_bin();
             let (result, message) = if c.skipped > 0 {
@@ -2527,18 +2547,535 @@ pub fn purge(app: &AppHandle, categories: &[String]) -> Result<PurgeResult, Stri
 }
 
 // ---------------------------------------------------------------------------------------------
+// Recycle Bin age filter (CONTRACT §3.2)
+// ---------------------------------------------------------------------------------------------
+
+/// `Settings.recycleMinAgeDays` default.
+const RECYCLE_DEFAULT_DAYS: u32 = 30;
+const DAY_MS: u64 = 86_400_000;
+/// Milliseconds between 1601-01-01 (FILETIME epoch) and 1970-01-01.
+const FILETIME_UNIX_OFFSET_MS: u64 = 11_644_473_600_000;
+/// `$I` files are tiny (v2: 28 bytes + the path); anything larger is not one.
+const MAX_INFO_BYTES: u64 = 64 * 1024;
+
+/// `Permanently deletes items that have been in the Recycle Bin for more than <N> days.`
+pub fn recycle_description(days: Option<u32>) -> String {
+    match days {
+        None => CategoryId::Recycle.base_description().to_string(),
+        Some(1) => {
+            "Permanently deletes items that have been in the Recycle Bin for more than 1 day."
+                .to_string()
+        }
+        Some(n) => format!(
+            "Permanently deletes items that have been in the Recycle Bin for more than {n} days."
+        ),
+    }
+}
+
+/// `Keeps items deleted in the last <N> days.` (`1 day` when N = 1).
+pub fn recycle_keep_note(days: u32) -> String {
+    if days == 1 {
+        "Keeps items deleted in the last 1 day.".to_string()
+    } else {
+        format!("Keeps items deleted in the last {days} days.")
+    }
+}
+
+/// A parsed `$I` metadata file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecycleMeta {
+    #[allow(dead_code)] // parsed for completeness; checked by tests
+    pub version: u64,
+    #[allow(dead_code)]
+    pub original_size: u64,
+    /// Deletion time, unix ms (`None` for a time before 1970).
+    pub deleted_ms: Option<u64>,
+    pub original_path: String,
+}
+
+fn le_u64(b: &[u8], at: usize) -> Option<u64> {
+    let s = b.get(at..at + 8)?;
+    Some(u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+}
+
+fn utf16_until_nul(b: &[u8]) -> String {
+    let units: Vec<u16> = b
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|u| *u != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Parses `$I`: little-endian `int64 version` (1 or 2), `int64 originalSize`, `FILETIME
+/// deletedAt` (offset 16); v2: `int32 pathChars` then the UTF-16 path; v1: 260 UTF-16 chars,
+/// NUL-terminated. Unknown version or a short file → `None` (the item is skipped, never
+/// deleted).
+pub fn parse_recycle_meta(b: &[u8]) -> Option<RecycleMeta> {
+    let version = le_u64(b, 0)?;
+    let original_size = le_u64(b, 8)?;
+    let ft = le_u64(b, 16)?;
+    let original_path = match version {
+        1 => utf16_until_nul(b.get(24..24 + 520)?),
+        2 => {
+            let raw = b.get(24..28)?;
+            let chars = i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            if chars <= 0 || chars > 32_768 {
+                return None;
+            }
+            utf16_until_nul(b.get(28..28 + 2 * chars as usize)?)
+        }
+        _ => return None,
+    };
+    if original_path.is_empty() {
+        return None;
+    }
+    Some(RecycleMeta {
+        version,
+        original_size,
+        deleted_ms: (ft / 10_000).checked_sub(FILETIME_UNIX_OFFSET_MS),
+        original_path,
+    })
+}
+
+/// An item qualifies when it was deleted at least `days` days ago (`None` = every item). An
+/// unknown or future deletion time never qualifies for an age filter.
+pub fn recycle_item_qualifies(deleted_ms: Option<u64>, min_age_days: Option<u32>, now: u64) -> bool {
+    match min_age_days {
+        None => true,
+        Some(days) => deleted_ms.is_some_and(|d| d <= now && now - d >= days as u64 * DAY_MS),
+    }
+}
+
+/// Binary SID → `S-1-5-21-…` (the folder name inside `$Recycle.Bin`).
+pub fn sid_to_string(b: &[u8]) -> Option<String> {
+    if b.len() < 8 {
+        return None;
+    }
+    let count = b[1] as usize;
+    if b[0] != 1 || b.len() != 8 + 4 * count {
+        return None;
+    }
+    let mut auth: u64 = 0;
+    for x in &b[2..8] {
+        auth = (auth << 8) | *x as u64;
+    }
+    let mut s = if auth >> 32 == 0 {
+        format!("S-1-{auth}")
+    } else {
+        format!("S-1-0x{auth:012X}")
+    };
+    for i in 0..count {
+        let o = 8 + 4 * i;
+        let v = u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        s.push_str(&format!("-{v}"));
+    }
+    Some(s)
+}
+
+/// One Recycle Bin item: the `$I` metadata and its `$R` data (file or folder tree).
+#[derive(Debug, Clone)]
+struct RecycleItem {
+    info_path: PathBuf,
+    data_path: PathBuf,
+    is_dir: bool,
+    bytes: u64,
+    /// Files to delete (the `$R` file itself, or every plain file inside the `$R` folder).
+    files: Vec<Candidate>,
+    /// Sub-folders inside a `$R` folder (depth, path), deleted bottom-up before the folder.
+    dirs: Vec<(usize, PathBuf)>,
+    deleted_ms: Option<u64>,
+    original_path: String,
+}
+
+/// The current user's bin on one volume; `plan` only carries the verified root for
+/// [`verified_delete`].
+struct RecycleBin {
+    plan: RootPlan,
+    items: Vec<RecycleItem>,
+}
+
+/// `X:\` for every fixed volume.
+fn fixed_drive_roots() -> Vec<PathBuf> {
+    use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    const DRIVE_FIXED: u32 = 3;
+    // SAFETY: no arguments.
+    let mask = unsafe { GetLogicalDrives() };
+    let mut out = Vec::new();
+    for i in 0..26u32 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let root = format!("{}:\\", (b'A' + i as u8) as char);
+        let wide = to_wide(&root);
+        // SAFETY: `wide` is NUL-terminated and outlives the call.
+        if unsafe { GetDriveTypeW(PCWSTR(wide.as_ptr())) } == DRIVE_FIXED {
+            out.push(PathBuf::from(root));
+        }
+    }
+    out
+}
+
+/// Plain files and sub-folders inside a `$R` folder. Links are never followed or listed;
+/// the third value is true when something (a link, an unreadable entry, excessive depth)
+/// means the folder can never be removed completely.
+fn walk_recycled_dir(root: &Path) -> (Vec<Candidate>, Vec<(usize, PathBuf)>, bool) {
+    let root_norm = norm_path(root);
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    let mut blocked = false;
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            blocked = true;
+            continue;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Ok(md) = std::fs::symlink_metadata(&path) else {
+                blocked = true;
+                continue;
+            };
+            if is_reparse(&md) || !is_strictly_under(&norm_path(&path), &root_norm) {
+                blocked = true;
+                continue;
+            }
+            if md.is_dir() {
+                if depth + 1 >= MAX_DEPTH {
+                    blocked = true;
+                    continue;
+                }
+                dirs.push((depth + 1, path.clone()));
+                stack.push((path, depth + 1));
+            } else if md.is_file() {
+                files.push(Candidate {
+                    mtime: md.modified().ok().and_then(unix_ms),
+                    size: md.len(),
+                    path,
+                });
+            } else {
+                blocked = true;
+            }
+        }
+    }
+    (files, dirs, blocked)
+}
+
+/// Reads a `$I` file (a plain, small file; never through a link).
+fn read_info(path: &Path) -> Option<RecycleMeta> {
+    let md = std::fs::symlink_metadata(path).ok()?;
+    if is_reparse(&md) || !md.is_file() || md.len() > MAX_INFO_BYTES {
+        return None;
+    }
+    parse_recycle_meta(&std::fs::read(path).ok()?)
+}
+
+/// The current user's bin on `drive` with its qualifying items, or `None` when it does not
+/// exist or fails the root checks (a link in the path, deny-list, resolves elsewhere).
+fn recycle_bin(
+    drive: &Path,
+    sid: &str,
+    deny: &DenyList,
+    min_age_days: Option<u32>,
+    now: u64,
+) -> Option<RecycleBin> {
+    let path = drive.join("$Recycle.Bin").join(sid);
+    let md = std::fs::symlink_metadata(&path).ok()?;
+    if is_reparse(&md) || !md.is_dir() || has_reparse_ancestor(&path) {
+        return None;
+    }
+    let canon = std::fs::canonicalize(&path).ok()?;
+    if !same_final_name(&path, &canon) || has_reparse_ancestor(&canon) {
+        return None;
+    }
+    let canon_norm = norm_path(&canon);
+    if !deny.root_allowed(&canon_norm, RootGuard::Fixed) {
+        return None;
+    }
+    let mut items = Vec::new();
+    for entry in std::fs::read_dir(&canon).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.len() < 3 || !name.is_char_boundary(2) || !name[..2].eq_ignore_ascii_case("$I") {
+            continue;
+        }
+        let info_path = entry.path();
+        if !is_strictly_under(&norm_path(&info_path), &canon_norm) {
+            continue;
+        }
+        let Some(meta) = read_info(&info_path) else {
+            continue;
+        };
+        if !recycle_item_qualifies(meta.deleted_ms, min_age_days, now) {
+            continue;
+        }
+        let data_path = canon.join(format!("$R{}", &name[2..]));
+        let Ok(dmd) = std::fs::symlink_metadata(&data_path) else {
+            continue;
+        };
+        // Rule 3: a `$R` that is itself a link is never followed or deleted.
+        if is_reparse(&dmd) {
+            continue;
+        }
+        let item = if dmd.is_dir() {
+            let (files, dirs, blocked) = walk_recycled_dir(&data_path);
+            // A folder that can never be removed completely is not counted and never touched.
+            if blocked {
+                continue;
+            }
+            RecycleItem {
+                bytes: files.iter().map(|f| f.size).sum(),
+                info_path,
+                data_path,
+                is_dir: true,
+                files,
+                dirs,
+                deleted_ms: meta.deleted_ms,
+                original_path: meta.original_path,
+            }
+        } else if dmd.is_file() {
+            RecycleItem {
+                bytes: dmd.len(),
+                files: vec![Candidate {
+                    path: data_path.clone(),
+                    size: dmd.len(),
+                    mtime: dmd.modified().ok().and_then(unix_ms),
+                }],
+                info_path,
+                data_path,
+                is_dir: false,
+                dirs: Vec::new(),
+                deleted_ms: meta.deleted_ms,
+                original_path: meta.original_path,
+            }
+        } else {
+            continue;
+        };
+        items.push(item);
+    }
+    Some(RecycleBin {
+        plan: RootPlan {
+            root: canon,
+            root_norm: canon_norm,
+            single_file: false,
+            files: Vec::new(),
+            held: Vec::new(),
+            dirs: Vec::new(),
+        },
+        items,
+    })
+}
+
+/// The current user's bins on every fixed volume (SID of the process token; other users'
+/// bins are never touched).
+fn recycle_bins(deny: &DenyList, min_age_days: Option<u32>, now: u64) -> Vec<RecycleBin> {
+    let Some(sid) = crate::procs::current_user_sid()
+        .as_deref()
+        .and_then(sid_to_string)
+    else {
+        return Vec::new();
+    };
+    fixed_drive_roots()
+        .iter()
+        .filter_map(|d| recycle_bin(d, &sid, deny, min_age_days, now))
+        .collect()
+}
+
+/// Deletes one item: `$R` first (files, then folders bottom-up, then the `$R` folder), then
+/// `$I` only when `$R` is gone. Returns the freed bytes and the outcome for the log.
+fn purge_recycle_item(
+    item: &RecycleItem,
+    plan: &RootPlan,
+    deny: &DenyList,
+) -> (u64, Result<(), DeleteError>) {
+    let mut freed = 0u64;
+    for f in &item.files {
+        match verified_delete(&f.path, false, plan, deny) {
+            Ok(size) => freed += size,
+            Err(e) => return (freed, Err(e)),
+        }
+    }
+    if item.is_dir {
+        let mut dirs: Vec<&(usize, PathBuf)> = item.dirs.iter().collect();
+        dirs.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, d) in dirs {
+            if let Err(e) = verified_delete(d, true, plan, deny) {
+                return (freed, Err(e));
+            }
+        }
+        if let Err(e) = verified_delete(&item.data_path, true, plan, deny) {
+            return (freed, Err(e));
+        }
+    }
+    // Only a `$R` that is really gone may lose its `$I`; otherwise the item stays visible in
+    // Explorer (it still takes space).
+    match std::fs::symlink_metadata(&item.data_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(e) = verified_delete(&item.info_path, false, plan, deny) {
+                eprintln!("[nexum] Recycle Bin: metadata file left behind ({e:?})");
+            }
+            (freed, Ok(()))
+        }
+        _ => (freed, Err(DeleteError::NotAllowed("still present"))),
+    }
+}
+
+/// Purge in age mode: item by item, audit-logged with the `$R` path (CONTRACT §3.2).
+fn purge_recycle_aged(ctx: &Context, days: u32, log: &mut PurgeLog) -> PurgeCounts {
+    let category = CategoryId::Recycle.as_str();
+    let mut c = PurgeCounts::default();
+    for bin in recycle_bins(&ctx.deny, Some(days), now_ms()) {
+        for item in &bin.items {
+            let (freed, outcome) = purge_recycle_item(item, &bin.plan, &ctx.deny);
+            c.freed += freed;
+            match outcome {
+                Ok(()) => {
+                    c.deleted += 1;
+                    log.file(category, &item.data_path, item.bytes, item.deleted_ms, "deleted", None);
+                }
+                Err(e) => {
+                    c.skipped += 1;
+                    let (result, reason) = delete_outcome(&e);
+                    log.file(
+                        category,
+                        &item.data_path,
+                        item.bytes,
+                        item.deleted_ms,
+                        result,
+                        Some(reason.as_str()),
+                    );
+                }
+            }
+        }
+    }
+    c
+}
+
+// ---------------------------------------------------------------------------------------------
+// Drill-down (CONTRACT §3.3)
+// ---------------------------------------------------------------------------------------------
+
+/// `TrashDetailItem`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashDetailItem {
+    pub path: String,
+    pub bytes: u64,
+    pub modified_ts: Option<u64>,
+    pub kind: &'static str,
+}
+
+pub const DETAILS_MAX: usize = 50;
+
+/// `limit` as an integer clamped to 1..50.
+pub fn clamp_details_limit(limit: f64) -> usize {
+    if !limit.is_finite() {
+        return DETAILS_MAX;
+    }
+    limit.round().clamp(1.0, DETAILS_MAX as f64) as usize
+}
+
+/// Sorted by bytes desc, then path asc; the first `limit` (1..50).
+pub fn top_details(mut items: Vec<TrashDetailItem>, limit: usize) -> Vec<TrashDetailItem> {
+    items.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
+    items.truncate(limit.clamp(1, DETAILS_MAX));
+    items
+}
+
+/// Exactly what a purge of `category` would delete now: the same roots, enumerator, age
+/// guards and skip checks (blocked roots and held files are not listed).
+pub fn scan_details(
+    category: &str,
+    limit: usize,
+    recycle_age: Option<u32>,
+) -> Result<Vec<TrashDetailItem>, String> {
+    let id = CategoryId::parse(category).ok_or_else(|| "Unknown category".to_string())?;
+    let ctx = Context::current(&[id]);
+    if id.requires_admin() && !ctx.is_admin {
+        return Err(NOTE_NEEDS_ADMIN.to_string());
+    }
+    let display = crate::purge_log::display_path;
+    let mut items: Vec<TrashDetailItem> = Vec::new();
+    if id == CategoryId::Recycle {
+        for bin in recycle_bins(&ctx.deny, recycle_age, now_ms()) {
+            for it in bin.items {
+                items.push(TrashDetailItem {
+                    path: it.original_path,
+                    bytes: it.bytes,
+                    modified_ts: it.deleted_ms,
+                    kind: if it.is_dir { "folder" } else { "file" },
+                });
+            }
+        }
+    } else {
+        let plan = plan_category(id, &ctx);
+        for root in &plan.active {
+            for f in &root.files {
+                items.push(TrashDetailItem {
+                    path: display(&f.path),
+                    bytes: f.size,
+                    modified_ts: f.mtime,
+                    kind: "file",
+                });
+            }
+        }
+        if id == CategoryId::WuCache {
+            // Cleared by the Windows cmdlet, not file by file (rule 10): one summary row.
+            let dir = do_cache_dir(&ctx.env);
+            if let Some((bytes, _)) = folder_size(&dir).filter(|(b, _)| *b > 0) {
+                items.push(TrashDetailItem {
+                    path: display(&dir),
+                    bytes,
+                    modified_ts: None,
+                    kind: "group",
+                });
+            }
+        }
+    }
+    Ok(top_details(items, limit))
+}
+
+// ---------------------------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------------------------
 
+/// The optional `recycleMinAgeDays` argument: absent → `None` (use the setting); present →
+/// `Some(value)`, where `null` means every item (CONTRACT §2, §3.2). Tauri maps a missing key
+/// and `null` alike to `None` for `Option` parameters, so the raw request body is read.
+fn recycle_age_arg(request: &tauri::ipc::Request<'_>) -> Option<Option<u32>> {
+    match request.body() {
+        tauri::ipc::InvokeBody::Json(v) => v
+            .get("recycleMinAgeDays")
+            .map(crate::settings::recycle_age_from_value),
+        tauri::ipc::InvokeBody::Raw(_) => None,
+    }
+}
+
+fn resolve_recycle_age(app: &AppHandle, arg: Option<Option<u32>>) -> Option<u32> {
+    match arg {
+        Some(v) => v,
+        None => crate::util::lock(&app.state::<AppState>().settings).recycle_min_age_days,
+    }
+}
+
 #[tauri::command]
-pub async fn scan_trash(include_browser: bool) -> Result<TrashScan, String> {
-    tauri::async_runtime::spawn_blocking(move || scan(include_browser))
+pub async fn scan_trash(
+    app: AppHandle,
+    include_browser: bool,
+    request: tauri::ipc::Request<'_>,
+) -> Result<TrashScan, String> {
+    let age = resolve_recycle_age(&app, recycle_age_arg(&request));
+    tauri::async_runtime::spawn_blocking(move || scan(include_browser, age))
         .await
         .map_err(|e| format!("Scan failed: {e}"))
 }
 
 #[tauri::command]
-pub async fn purge_trash(app: AppHandle, categories: Vec<String>) -> Result<PurgeResult, String> {
+pub async fn purge_trash(
+    app: AppHandle,
+    categories: Vec<String>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<PurgeResult, String> {
+    let age = resolve_recycle_age(&app, recycle_age_arg(&request));
     {
         let state = app.state::<AppState>();
         if state.purge_running.swap(true, Ordering::SeqCst) {
@@ -2546,7 +3083,7 @@ pub async fn purge_trash(app: AppHandle, categories: Vec<String>) -> Result<Purg
         }
     }
     let worker = app.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || purge(&worker, &categories))
+    let result = tauri::async_runtime::spawn_blocking(move || purge(&worker, &categories, age))
         .await
         .map_err(|e| format!("Cleanup failed: {e}"))
         .and_then(|r| r);
@@ -2554,6 +3091,20 @@ pub async fn purge_trash(app: AppHandle, categories: Vec<String>) -> Result<Purg
         .purge_running
         .store(false, Ordering::SeqCst);
     result
+}
+
+#[tauri::command]
+pub async fn scan_trash_details(
+    app: AppHandle,
+    category_id: String,
+    limit: Option<f64>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<Vec<TrashDetailItem>, String> {
+    let age = resolve_recycle_age(&app, recycle_age_arg(&request));
+    let limit = clamp_details_limit(limit.unwrap_or(DETAILS_MAX as f64));
+    tauri::async_runtime::spawn_blocking(move || scan_details(&category_id, limit, age))
+        .await
+        .map_err(|e| format!("Scan failed: {e}"))?
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3256,7 +3807,7 @@ mod tests {
 
     #[test]
     fn scan_never_counts_unavailable_bytes() {
-        let scan = scan(false);
+        let scan = scan(false, None);
         assert!(scan.categories.iter().all(|c| c.id != "browser"));
         let available: u64 = scan
             .categories
@@ -3767,5 +4318,254 @@ mod tests {
         }
         let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
         assert!(deny.is_denied(&norm_path(&exe_dir.join("nexum-agent.exe"))));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Recycle Bin age filter (CONTRACT §3.2) and drill-down (§3.3)
+    // -----------------------------------------------------------------------------------------
+
+    fn filetime(unix_ms: u64) -> u64 {
+        (unix_ms + FILETIME_UNIX_OFFSET_MS) * 10_000
+    }
+
+    fn info_v2(size: u64, deleted_ms: u64, path: &str) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&2u64.to_le_bytes());
+        b.extend_from_slice(&size.to_le_bytes());
+        b.extend_from_slice(&filetime(deleted_ms).to_le_bytes());
+        let units: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        b.extend_from_slice(&(units.len() as i32).to_le_bytes());
+        for u in units {
+            b.extend_from_slice(&u.to_le_bytes());
+        }
+        b
+    }
+
+    fn info_v1(size: u64, deleted_ms: u64, path: &str) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.extend_from_slice(&size.to_le_bytes());
+        b.extend_from_slice(&filetime(deleted_ms).to_le_bytes());
+        let mut units: Vec<u16> = path.encode_utf16().collect();
+        units.resize(260, 0);
+        for u in units {
+            b.extend_from_slice(&u.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn recycle_metadata_parsing() {
+        let t = 1_764_230_000_000u64;
+        let m = parse_recycle_meta(&info_v2(123, t, r"C:\Users\User\Desktop\a,b.txt")).unwrap();
+        assert_eq!(m.version, 2);
+        assert_eq!(m.original_size, 123);
+        assert_eq!(m.deleted_ms, Some(t));
+        assert_eq!(m.original_path, r"C:\Users\User\Desktop\a,b.txt");
+        let m = parse_recycle_meta(&info_v1(5, t, r"D:\old.txt")).unwrap();
+        assert_eq!((m.version, m.original_path.as_str()), (1, r"D:\old.txt"));
+        // Unknown version, short files and a bad length are skipped.
+        let mut v3 = info_v2(1, t, "x");
+        v3[0] = 3;
+        assert_eq!(parse_recycle_meta(&v3), None);
+        assert_eq!(parse_recycle_meta(&info_v2(1, t, "x")[..20]), None);
+        let v2 = info_v2(1, t, r"C:\x");
+        assert_eq!(parse_recycle_meta(&v2[..v2.len() - 4]), None);
+        assert_eq!(parse_recycle_meta(&info_v1(1, t, "x")[..100]), None);
+        let mut neg = info_v2(1, t, "x");
+        neg[24..28].copy_from_slice(&(-1i32).to_le_bytes());
+        assert_eq!(parse_recycle_meta(&neg), None);
+    }
+
+    #[test]
+    fn recycle_age_rule_and_texts() {
+        let now = 100 * DAY_MS;
+        assert!(recycle_item_qualifies(Some(now - 30 * DAY_MS), Some(30), now));
+        assert!(!recycle_item_qualifies(Some(now - 30 * DAY_MS + 1), Some(30), now));
+        assert!(!recycle_item_qualifies(None, Some(1), now));
+        assert!(!recycle_item_qualifies(Some(now + 5), Some(1), now), "future time never qualifies");
+        assert!(recycle_item_qualifies(None, None, now), "no filter = every item");
+        assert_eq!(
+            recycle_description(Some(1)),
+            "Permanently deletes items that have been in the Recycle Bin for more than 1 day."
+        );
+        assert_eq!(
+            recycle_description(Some(30)),
+            "Permanently deletes items that have been in the Recycle Bin for more than 30 days."
+        );
+        assert_eq!(recycle_description(None), "Permanently deletes everything in the Recycle Bin.");
+        assert_eq!(recycle_keep_note(1), "Keeps items deleted in the last 1 day.");
+        assert_eq!(recycle_keep_note(14), "Keeps items deleted in the last 14 days.");
+    }
+
+    #[test]
+    fn sid_strings() {
+        // S-1-5-21-1-2-3-1001
+        let mut b = vec![1u8, 5, 0, 0, 0, 0, 0, 5];
+        for v in [21u32, 1, 2, 3, 1001] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(sid_to_string(&b).as_deref(), Some("S-1-5-21-1-2-3-1001"));
+        assert_eq!(sid_to_string(&b[..b.len() - 1]), None);
+        assert_eq!(sid_to_string(&[2, 0, 0, 0, 0, 0, 0, 5]), None);
+        if let Some(sid) = crate::procs::current_user_sid() {
+            assert!(sid_to_string(&sid).unwrap().starts_with("S-1-"));
+        }
+    }
+
+    #[test]
+    fn details_limit_and_order() {
+        assert_eq!(clamp_details_limit(0.0), 1);
+        assert_eq!(clamp_details_limit(50.0), 50);
+        assert_eq!(clamp_details_limit(500.0), 50);
+        assert_eq!(clamp_details_limit(f64::NAN), 50);
+        let item = |p: &str, b: u64| TrashDetailItem {
+            path: p.into(),
+            bytes: b,
+            modified_ts: None,
+            kind: "file",
+        };
+        let many: Vec<TrashDetailItem> = (0..80).map(|i| item(&format!("f{i:02}"), i % 7)).collect();
+        let top = top_details(many, 50);
+        assert_eq!(top.len(), 50);
+        assert!(top
+            .windows(2)
+            .all(|w| w[0].bytes > w[1].bytes || (w[0].bytes == w[1].bytes && w[0].path < w[1].path)));
+        let top = top_details(vec![item("b", 5), item("a", 5), item("c", 9)], 2);
+        assert_eq!(top.iter().map(|i| i.path.as_str()).collect::<Vec<_>>(), vec!["c", "a"]);
+        assert!(matches!(scan_details("nope", 50, None), Err(e) if e == "Unknown category"));
+        let v = serde_json::to_value(item("x", 1)).unwrap();
+        assert!(v["modifiedTs"].is_null());
+        assert_eq!(v["kind"], "file");
+    }
+
+    #[test]
+    fn details_match_the_purge_plan() {
+        // Same enumerator as the purge: files held by a rule (too new) are not listed.
+        let t = TempTree::new("details");
+        let root = t.base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("big.tmp"), vec![0u8; 300]).unwrap();
+        fs::write(root.join("small.tmp"), vec![0u8; 10]).unwrap();
+        let deny = DenyList::build();
+        let fresh = plan_root(
+            &RootSpec::dir(root.clone(), true, Filter::Stale(RECENT_GUARD)),
+            &deny,
+            SystemTime::now(),
+        )
+        .unwrap();
+        assert!(fresh.files.is_empty(), "too-new files are held, not candidates");
+        let plan = plan_root(&all_filter_spec(&root), &deny, SystemTime::now()).unwrap();
+        let items: Vec<TrashDetailItem> = plan
+            .files
+            .iter()
+            .map(|f| TrashDetailItem {
+                path: crate::purge_log::display_path(&f.path),
+                bytes: f.size,
+                modified_ts: f.mtime,
+                kind: "file",
+            })
+            .collect();
+        let top = top_details(items, 1);
+        assert_eq!(top.len(), 1);
+        assert!(top[0].path.ends_with("big.tmp"));
+        assert!(!top[0].path.starts_with(r"\\?\"));
+        assert!(top[0].modified_ts.is_some());
+    }
+
+    #[test]
+    fn recycle_age_purge_deletes_only_old_items() {
+        let t = TempTree::new("recycle");
+        let sid = "S-1-5-21-1-2-3-1001";
+        let bin = t.base.join("$Recycle.Bin").join(sid);
+        fs::create_dir_all(&bin).unwrap();
+        let now = now_ms();
+        let old = now - 40 * DAY_MS;
+        // An old file item, an old folder item, a recent item, an unknown-version item,
+        // an orphan $R and an old folder item with a junction inside.
+        fs::write(bin.join("$IAAA111.txt"), info_v2(10, old, r"C:\Users\User\a.txt")).unwrap();
+        fs::write(bin.join("$RAAA111.txt"), vec![0u8; 10]).unwrap();
+        fs::write(bin.join("$IBBB222"), info_v1(30, old, r"C:\Users\User\folder")).unwrap();
+        fs::create_dir_all(bin.join("$RBBB222").join("sub")).unwrap();
+        fs::write(bin.join("$RBBB222").join("x.bin"), vec![0u8; 20]).unwrap();
+        fs::write(bin.join("$RBBB222").join("sub").join("y.bin"), vec![0u8; 10]).unwrap();
+        fs::write(bin.join("$ICCC333.txt"), info_v2(7, now - DAY_MS, r"C:\new.txt")).unwrap();
+        fs::write(bin.join("$RCCC333.txt"), vec![0u8; 7]).unwrap();
+        let mut odd = info_v2(5, old, r"C:\odd.txt");
+        odd[0] = 9;
+        fs::write(bin.join("$IDDD444.txt"), odd).unwrap();
+        fs::write(bin.join("$RDDD444.txt"), vec![0u8; 5]).unwrap();
+        fs::write(bin.join("$REEE555.txt"), vec![0u8; 3]).unwrap();
+        let outside = t.base.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        fs::write(bin.join("$IFFF666"), info_v2(1, old, r"C:\linked")).unwrap();
+        fs::create_dir_all(bin.join("$RFFF666")).unwrap();
+        assert!(make_junction(&bin.join("$RFFF666").join("link"), &outside));
+        fs::write(bin.join("desktop.ini"), b"[.ShellClassInfo]").unwrap();
+
+        let deny = DenyList::build();
+        let rb = recycle_bin(&t.base, sid, &deny, Some(30), now).expect("bin");
+        let mut names: Vec<String> = rb
+            .items
+            .iter()
+            .map(|i| i.data_path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["$RAAA111.txt", "$RBBB222"]);
+        assert_eq!(rb.items.iter().map(|i| i.bytes).sum::<u64>(), 40);
+        let folder = rb.items.iter().find(|i| i.is_dir).unwrap();
+        assert_eq!(folder.original_path, r"C:\Users\User\folder");
+        // Without a filter the recent item is listed too ("every item" drill-down).
+        let all = recycle_bin(&t.base, sid, &deny, None, now).unwrap();
+        assert_eq!(all.items.len(), 3);
+
+        for item in &rb.items {
+            let (_, r) = purge_recycle_item(item, &rb.plan, &deny);
+            assert!(r.is_ok(), "{r:?}");
+        }
+        for gone in ["$IAAA111.txt", "$RAAA111.txt", "$IBBB222", "$RBBB222"] {
+            assert!(!bin.join(gone).exists(), "{gone}");
+        }
+        for kept in [
+            "$ICCC333.txt",
+            "$RCCC333.txt",
+            "$IDDD444.txt",
+            "$RDDD444.txt",
+            "$REEE555.txt",
+            "$IFFF666",
+            "desktop.ini",
+        ] {
+            assert!(bin.join(kept).exists(), "{kept}");
+        }
+        assert!(outside.join("keep.txt").exists(), "never through a junction");
+        let _ = fs::remove_dir(bin.join("$RFFF666").join("link"));
+    }
+
+    #[test]
+    fn recycle_item_with_a_locked_file_keeps_its_metadata() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let t = TempTree::new("recycle-locked");
+        let sid = "S-1-5-21-9-9-9-1001";
+        let bin = t.base.join("$Recycle.Bin").join(sid);
+        fs::create_dir_all(&bin).unwrap();
+        let old = now_ms() - 90 * DAY_MS;
+        fs::write(bin.join("$IGGG777"), info_v2(4, old, r"C:\busy")).unwrap();
+        fs::create_dir_all(bin.join("$RGGG777")).unwrap();
+        fs::write(bin.join("$RGGG777").join("busy.bin"), b"busy").unwrap();
+        // Hold the file open without delete sharing.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0)
+            .open(bin.join("$RGGG777").join("busy.bin"))
+            .unwrap();
+        let deny = DenyList::build();
+        let rb = recycle_bin(&t.base, sid, &deny, Some(30), now_ms()).unwrap();
+        assert_eq!(rb.items.len(), 1);
+        let (_, r) = purge_recycle_item(&rb.items[0], &rb.plan, &deny);
+        assert!(r.is_err());
+        drop(held);
+        assert!(bin.join("$IGGG777").exists(), "the item stays visible in Explorer");
+        assert!(bin.join("$RGGG777").join("busy.bin").exists());
     }
 }

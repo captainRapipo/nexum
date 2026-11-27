@@ -26,6 +26,8 @@ pub struct SystemSpec {
     pub gpus: Value,
     pub os: OsSpec,
     pub security: SecuritySpec,
+    /// Copied from `AgentSpec.diskLinks` (`[]` when the agent is down; CONTRACT §2.6).
+    pub disk_links: Value,
     pub errors: Vec<String>,
 }
 
@@ -46,7 +48,7 @@ pub fn merge(
     now: u64,
 ) -> SystemSpec {
     let mut errors: Vec<String> = Vec::new();
-    let (captured_ts, cpu, board, memory, gpus) = match &agent {
+    let (captured_ts, cpu, board, memory, gpus, disk_links) = match &agent {
         Ok(v) => {
             if let Some(list) = v.get("errors").and_then(Value::as_array) {
                 errors.extend(
@@ -59,12 +61,17 @@ pub fn merge(
                 Some(g @ Value::Array(_)) => g.clone(),
                 _ => Value::Array(Vec::new()),
             };
+            let disk_links = match v.get("diskLinks") {
+                Some(d @ Value::Array(_)) => d.clone(),
+                _ => Value::Array(Vec::new()),
+            };
             (
                 v.get("capturedTs").and_then(Value::as_u64).unwrap_or(now),
                 object_or_null(v.get("cpu")),
                 object_or_null(v.get("board")),
                 object_or_null(v.get("memory")),
                 gpus,
+                disk_links,
             )
         }
         Err(reason) => {
@@ -74,6 +81,7 @@ pub fn merge(
                 Value::Null,
                 Value::Null,
                 Value::Null,
+                Value::Array(Vec::new()),
                 Value::Array(Vec::new()),
             )
         }
@@ -87,34 +95,38 @@ pub fn merge(
         gpus,
         os,
         security,
+        disk_links,
         errors,
     }
+}
+
+/// The cached spec, or a fresh one (`refresh`, nothing cached). Blocking (waits up to 15 s).
+pub fn load(app: &AppHandle, refresh: bool) -> SystemSpec {
+    let state = app.state::<AppState>();
+    let mgr = &state.agent;
+    let _one_in_flight = lock(&mgr.spec_lock);
+    if !refresh {
+        if let Some(cached) = lock(&mgr.spec_cache).clone() {
+            return cached;
+        }
+    }
+    let agent = mgr.request_spec(SPEC_TIMEOUT);
+    let answered = agent.is_ok();
+    let (os, security, rust_errors) = collect_os_security();
+    let spec = merge(agent, os, security, rust_errors, now_ms());
+    // Only a real agent answer is cached; a missing agent is retried next time.
+    if answered {
+        *lock(&mgr.spec_cache) = Some(spec.clone());
+    }
+    spec
 }
 
 #[tauri::command]
 pub async fn get_system_spec(app: AppHandle, refresh: Option<bool>) -> Result<SystemSpec, String> {
     let refresh = refresh.unwrap_or(false);
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let mgr = &state.agent;
-        let _one_in_flight = lock(&mgr.spec_lock);
-        if !refresh {
-            if let Some(cached) = lock(&mgr.spec_cache).clone() {
-                return cached;
-            }
-        }
-        let agent = mgr.request_spec(SPEC_TIMEOUT);
-        let answered = agent.is_ok();
-        let (os, security, rust_errors) = collect_os_security();
-        let spec = merge(agent, os, security, rust_errors, now_ms());
-        // Only a real agent answer is cached; a missing agent is retried next time.
-        if answered {
-            *lock(&mgr.spec_cache) = Some(spec.clone());
-        }
-        spec
-    })
-    .await
-    .map_err(|e| format!("System spec failed: {e}"))
+    tauri::async_runtime::spawn_blocking(move || load(&app, refresh))
+        .await
+        .map_err(|e| format!("System spec failed: {e}"))
 }
 
 #[cfg(test)]
@@ -149,6 +161,7 @@ mod tests {
             "board": null,
             "memory": "garbage",
             "gpus": [{ "name": "GPU" }],
+            "diskLinks": [{ "diskNumber": 0, "model": "SSD", "bus": "nvme", "gen": 4, "width": 4, "maxGen": 4, "maxWidth": 4, "sataGen": null }],
             "errors": ["Board query failed: x"]
         });
         let s = merge(Ok(agent), os(), security(), vec!["OS query failed: y".into()], 999);
@@ -157,6 +170,7 @@ mod tests {
         assert!(s.board.is_null());
         assert!(s.memory.is_null(), "a non-object section becomes null");
         assert_eq!(s.gpus.as_array().unwrap().len(), 1);
+        assert_eq!(s.disk_links[0]["bus"], "nvme");
         assert_eq!(
             s.errors,
             vec!["Board query failed: x".to_string(), "OS query failed: y".to_string()]
@@ -181,6 +195,7 @@ mod tests {
         assert_eq!(s.captured_ts, 999);
         assert!(s.cpu.is_null() && s.board.is_null() && s.memory.is_null());
         assert_eq!(s.gpus, json!([]));
+        assert_eq!(serde_json::to_value(&s).unwrap()["diskLinks"], json!([]));
         assert_eq!(s.errors, vec!["Hardware agent is not running".to_string()]);
         let s = merge(
             Err("Hardware agent did not answer".into()),
