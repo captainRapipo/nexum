@@ -8,7 +8,7 @@
 use std::io::Write;
 
 use serde_json::Value;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 use crate::spec::SystemSpec;
 use crate::system_info::PhysicalDisk;

@@ -1526,7 +1526,8 @@ pub fn on_agent_down(app: &AppHandle) {
 /// Fresh volume data (the 60 s refresh or a frontend `get_volumes`).
 pub fn on_volumes(app: &AppHandle, volumes: Vec<Volume>) {
     {
-        let mut e = lock(&app.state::<AppState>().alerts.inner);
+        let state = app.state::<AppState>();
+        let mut e = lock(&state.alerts.inner);
         e.volumes = volumes;
         e.volumes_seen = true;
     }
@@ -1536,7 +1537,8 @@ pub fn on_volumes(app: &AppHandle, volumes: Vec<Volume>) {
 /// Fresh physical disks (drive names).
 pub fn on_physical(app: &AppHandle, disks: Vec<PhysicalDisk>) {
     {
-        let mut e = lock(&app.state::<AppState>().alerts.inner);
+        let state = app.state::<AppState>();
+        let mut e = lock(&state.alerts.inner);
         e.physical = disks;
     }
     publish(app);
