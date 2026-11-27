@@ -26,7 +26,7 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, FileDispositionInfo, GetFileInformationByHandle, SetFileInformationByHandle,
     BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
 use crate::cleaner::{final_path, norm_path};
@@ -47,10 +47,12 @@ fn win_io(e: windows::core::Error) -> io::Error {
 fn open_dir_no_follow(path: &Path) -> io::Result<OwnedHandle> {
     let wide = to_wide(path);
     // SAFETY: `wide` is NUL-terminated and outlives the call; the handle is owned below.
+    // FILE_LIST_DIRECTORY matters: a handle with attribute access only takes no part in the
+    // share-mode check, so it would not stop a rename of the folder.
     let handle = unsafe {
         CreateFileW(
             PCWSTR(wide.as_ptr()),
-            FILE_READ_ATTRIBUTES.0,
+            FILE_LIST_DIRECTORY.0 | FILE_READ_ATTRIBUTES.0,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
