@@ -115,6 +115,8 @@ jobs:
       - name: Sidecar protocol smoke test
         shell: pwsh
         run: |
+          # The agent reads stdin during the (slow) hardware open and honours 'shutdown'
+          # at once, so wait for real telemetry lines instead of sleeping a fixed time.
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = (Resolve-Path build/agent/nexum-agent.exe).Path
           $psi.RedirectStandardInput = $true
@@ -124,23 +126,43 @@ jobs:
           $p = [System.Diagnostics.Process]::Start($psi)
           $errTask = $p.StandardError.ReadToEndAsync()
           $p.StandardInput.WriteLine('{"cmd":"interval","ms":500}')
-          Start-Sleep -Seconds 4
+          $p.StandardInput.Flush()
+          $lines = New-Object System.Collections.Generic.List[string]
+          $telemetrySeen = 0
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          $pending = $p.StandardOutput.ReadLineAsync()
+          while ($sw.Elapsed.TotalSeconds -lt 60 -and $telemetrySeen -lt 3) {
+            if (-not $pending.Wait(500)) { continue }
+            $l = $pending.Result
+            if ($null -eq $l) { break }
+            if ($l.Trim()) { $lines.Add($l) }
+            if ($l -match '"type":"telemetry"') { $telemetrySeen++ }
+            $pending = $p.StandardOutput.ReadLineAsync()
+          }
+          Write-Host "first $telemetrySeen telemetry packet(s) after $([int]$sw.Elapsed.TotalMilliseconds) ms"
           $p.StandardInput.WriteLine('{"cmd":"shutdown"}')
           $p.StandardInput.Close()
-          if (-not $p.WaitForExit(15000)) { $p.Kill(); throw "sidecar did not exit after shutdown" }
-          $lines = $p.StandardOutput.ReadToEnd() -split "`n" | Where-Object { $_.Trim() }
-          if ($lines.Count -lt 2) { Write-Host $errTask.Result; throw "expected hello + telemetry lines, got $($lines.Count)" }
+          while ($pending.Wait(15000)) {
+            $l = $pending.Result
+            if ($null -eq $l) { break }
+            if ($l.Trim()) { $lines.Add($l) }
+            $pending = $p.StandardOutput.ReadLineAsync()
+          }
+          if (-not $p.WaitForExit(15000)) { $p.Kill(); Write-Host $errTask.Result; throw "sidecar did not exit after shutdown" }
+          Write-Host "--- agent stderr ---"; Write-Host $errTask.Result; Write-Host "--------------------"
+          if ($p.ExitCode -ne 0) { throw "sidecar exit code $($p.ExitCode)" }
+          if ($lines.Count -lt 2) { throw "expected hello + telemetry lines, got $($lines.Count)" }
           $types = foreach ($l in $lines) { ($l | ConvertFrom-Json -ErrorAction Stop).type }
+          Write-Host "types in order: $($types -join ', ')"
           if ($types[0] -ne 'hello') { throw "first line must be hello, got $($types[0])" }
           if (-not ($types -contains 'telemetry')) { throw "no telemetry packet emitted" }
           $t = ($lines | Where-Object { $_ -match '"type":"telemetry"' } | Select-Object -First 1) | ConvertFrom-Json
-          foreach ($k in 'ts','cpu','ram','fans','disks','gpus','fanPreset') { if (-not ($t.PSObject.Properties.Name -contains $k)) { throw "telemetry missing '$k'" } }
-          # Protocol 2 (CONTRACT 1.0.0-gate). Reported as warnings until the sidecar lands it.
+          foreach ($k in 'ts','cpu','ram','fans','disks','gpus','fanPreset','fanSafety') { if (-not ($t.PSObject.Properties.Name -contains $k)) { throw "telemetry missing '$k'" } }
+          # Protocol 2 (CONTRACT 1.0.0-gate, §1.1).
           $h = $lines[0] | ConvertFrom-Json
-          if ($h.protocol -ne 2) { Write-Host "::warning::hello.protocol is '$($h.protocol)', CONTRACT 1.0.0-gate expects 2" }
-          foreach ($k in 'sensorDriver','fanFlag') { if (-not ($h.PSObject.Properties.Name -contains $k)) { Write-Host "::warning::hello missing '$k' (CONTRACT §1.1)" } }
-          if (-not ($t.PSObject.Properties.Name -contains 'fanSafety')) { Write-Host "::warning::telemetry missing 'fanSafety' (CONTRACT §1.5.1)" }
-          if ($h.sensorDriver) { Write-Host "sensorDriver: $($h.sensorDriver | ConvertTo-Json -Compress)" }
+          if ($h.protocol -ne 2) { throw "hello.protocol is '$($h.protocol)', CONTRACT 1.0.0-gate expects 2" }
+          foreach ($k in 'sensorDriver','fanFlag') { if (-not ($h.PSObject.Properties.Name -contains $k)) { throw "hello missing '$k' (CONTRACT §1.1)" } }
+          Write-Host "sensorDriver: $($h.sensorDriver | ConvertTo-Json -Compress) fanFlag: $($h.fanFlag)"
           Write-Host "OK: $($lines.Count) protocol lines, types: $(($types | Select-Object -Unique) -join ', ')"
 
       - name: Rust tests (cleaner safety, parsing)
