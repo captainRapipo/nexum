@@ -18,6 +18,48 @@ pub fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     cmd
 }
 
+/// Inherited environment variables that would let a standard-user process load code into, or
+/// change the security-relevant behaviour of, this elevated app and its children.
+///
+/// An elevated process (the UAC prompt and the "launch on startup" logon task alike) gets the
+/// user's environment, including `HKCU\Environment`, which any non-elevated process can write:
+/// * `WEBVIEW2_*`: the WebView2 loader honours `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` (runs a
+///   different browser executable), `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` (for example a
+///   remote-debugging port that exposes every Tauri command), `WEBVIEW2_USER_DATA_FOLDER` and
+///   `WEBVIEW2_RELEASE_CHANNEL_PREFERENCE`;
+/// * .NET (the agent, Windows PowerShell): `COR_*` / `CORECLR_*` (profiler DLLs),
+///   `COMPlus_*` / `DOTNET_*` (runtime knobs, startup hooks, bundle extraction and dump paths),
+///   `APPDOMAIN_MANAGER_*`.
+///
+/// Debug builds keep `DOTNET_ROOT*` so a framework-dependent dev agent still finds its runtime.
+pub fn is_untrusted_inherited_var(name: &str) -> bool {
+    const PREFIXES: [&str; 6] = [
+        "WEBVIEW2_",
+        "COR_",
+        "CORECLR_",
+        "COMPLUS_",
+        "DOTNET_",
+        "APPDOMAIN_MANAGER_",
+    ];
+    let n = name.trim().to_ascii_uppercase();
+    if cfg!(debug_assertions) && n.starts_with("DOTNET_ROOT") {
+        return false;
+    }
+    PREFIXES.iter().any(|p| n.starts_with(p))
+}
+
+/// Removes [`is_untrusted_inherited_var`] variables from this process's environment. Must run
+/// first thing in `run()`, before any thread or WebView exists.
+pub fn scrub_inherited_environment() {
+    let names: Vec<std::ffi::OsString> = std::env::vars_os()
+        .map(|(k, _)| k)
+        .filter(|k| is_untrusted_inherited_var(&k.to_string_lossy()))
+        .collect();
+    for k in names {
+        std::env::remove_var(&k);
+    }
+}
+
 /// Locks a mutex, recovering the data if a previous holder panicked.
 pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -444,6 +486,27 @@ mod tests {
         assert!(w.to_string_lossy().to_ascii_uppercase().starts_with(&d));
         use windows::Win32::UI::Shell::FOLDERID_ProgramData;
         assert!(known_folder(&FOLDERID_ProgramData).is_some_and(|p| p.is_dir()));
+    }
+
+    #[test]
+    fn untrusted_inherited_variables() {
+        for v in [
+            "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER",
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+            "webview2_user_data_folder",
+            "COR_ENABLE_PROFILING",
+            "COR_PROFILER_PATH",
+            "CORECLR_PROFILER_PATH_64",
+            "COMPlus_ETWEnabled",
+            "DOTNET_STARTUP_HOOKS",
+            "DOTNET_BUNDLE_EXTRACT_BASE_DIR",
+            "APPDOMAIN_MANAGER_ASM",
+        ] {
+            assert!(is_untrusted_inherited_var(v), "{v}");
+        }
+        for v in ["PATH", "TEMP", "TMP", "USERPROFILE", "SystemRoot", "COMPUTERNAME", "CORP"] {
+            assert!(!is_untrusted_inherited_var(v), "{v}");
+        }
     }
 
     #[test]

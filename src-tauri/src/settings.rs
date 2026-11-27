@@ -264,8 +264,22 @@ fn de_choice<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     })
 }
 
-/// Reads settings from disk (defaults when missing or unreadable).
+/// True when `p` exists and is a reparse point (junction, symbolic link, mount point).
+fn is_reparse_point(p: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    std::fs::symlink_metadata(p)
+        .map(|m| m.file_attributes() & 0x400 != 0)
+        .unwrap_or(false)
+}
+
+/// Reads settings from disk (defaults when missing or unreadable). The settings folder is
+/// writable by non-elevated code, so neither the file nor its folder may be a link: the
+/// elevated app would otherwise read (and, for an invalid file, rename) whatever it points at.
 pub fn load_from(path: &Path) -> Settings {
+    if is_reparse_point(path) || path.parent().is_some_and(is_reparse_point) {
+        eprintln!("[nexum] settings.json or its folder is a link; using defaults");
+        return Settings::default();
+    }
     match std::fs::read(path) {
         Ok(bytes) => {
             let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
@@ -284,18 +298,46 @@ pub fn load_from(path: &Path) -> Settings {
 }
 
 /// Writes settings atomically (tmp file + rename).
+///
+/// The settings folder (`%APPDATA%\<app id>`) is writable by non-elevated code, which could
+/// plant a junction or an object-manager symbolic link there to redirect this elevated write.
+/// The folder is therefore opened without following links and held (see
+/// [`crate::safe_fs::PinnedDir`]), the temporary file is created new and verified, and the final
+/// rename replaces the `settings.json` name itself (a rename never follows a link at the
+/// destination).
 pub fn write_to(path: &Path, settings: &Settings) -> Result<(), String> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
-    }
+    use std::io::Write;
+    let (dir, name) = match (path.parent(), path.file_name()) {
+        (Some(d), Some(n)) => (d, n.to_string_lossy().to_string()),
+        _ => return Err("Invalid settings path".to_string()),
+    };
+    let base = dir
+        .parent()
+        .ok_or_else(|| "Invalid settings path".to_string())?;
+    std::fs::create_dir_all(base)
+        .map_err(|e| format!("Could not create {}: {e}", base.display()))?;
+    let pinned = crate::safe_fs::PinnedDir::open(base, dir, true)
+        .map_err(|e| format!("Could not open {}: {e}", dir.display()))?;
     let json = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).map_err(|e| format!("Could not write settings: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
+    let tmp_name = format!("{name}.tmp");
+    let tmp = pinned.path().join(&tmp_name);
+    // A leftover from an interrupted save (or a planted link): removing a name never follows it.
+    let _ = std::fs::remove_file(&tmp);
+    let (mut file, tmp) = pinned
+        .create_new_file(&tmp_name)
+        .map_err(|e| format!("Could not write settings: {e}"))?;
+    let written = file.write_all(&json).and_then(|_| file.sync_all());
+    drop(file);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Could not write settings: {e}"));
+    }
+    let result = std::fs::rename(&tmp, pinned.path().join(&name)).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("Could not save settings: {e}")
-    })
+    });
+    drop(pinned);
+    result
 }
 
 /// Resolves `<app_config_dir>/settings.json`.
@@ -770,5 +812,63 @@ mod tests {
         let xml = task_xml(Path::new(r"C:\Apps & Tools\Nexum.exe"));
         assert!(xml.contains(r"C:\Apps &amp; Tools\Nexum.exe"));
         assert!(xml.contains("<Arguments>--minimized</Arguments>"));
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "nexum-test-settings-{tag}-{}-{}",
+            std::process::id(),
+            crate::util::now_ms()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn junction(link: &Path, target: &Path) -> bool {
+        hidden_command("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn settings_round_trip_and_overwrite() {
+        let base = scratch("rt");
+        let path = base.join("com.nexum.app").join("settings.json");
+        let mut s = Settings::default();
+        s.poll_interval_ms = 2000;
+        write_to(&path, &s).unwrap();
+        // Saving again replaces the file (and tolerates a stale temp file).
+        std::fs::write(path.with_extension("json.tmp"), b"stale").unwrap();
+        s.poll_interval_ms = 3000;
+        write_to(&path, &s).unwrap();
+        assert_eq!(load_from(&path).poll_interval_ms, 3000);
+        assert!(!path.with_extension("json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn settings_never_follow_a_planted_junction() {
+        let base = scratch("junction");
+        let target = scratch("junction-target");
+        std::fs::write(target.join("settings.json"), br#"{"pollIntervalMs":4000}"#).unwrap();
+        assert!(junction(&base.join("com.nexum.app"), &target));
+        let path = base.join("com.nexum.app").join("settings.json");
+        assert!(write_to(&path, &Settings::default()).is_err());
+        // Neither written nor read (nor renamed to .bad) through the junction.
+        assert_eq!(
+            std::fs::read(target.join("settings.json")).unwrap(),
+            br#"{"pollIntervalMs":4000}"#
+        );
+        assert!(!target.join("settings.json.tmp").exists());
+        assert_eq!(load_from(&path).poll_interval_ms, Settings::default().poll_interval_ms);
+        let _ = std::fs::remove_dir(base.join("com.nexum.app"));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&target);
     }
 }

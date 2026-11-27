@@ -8,6 +8,7 @@ mod external;
 mod failsafe;
 mod procs;
 mod purge_log;
+mod safe_fs;
 mod self_usage;
 mod settings;
 mod spec;
@@ -151,6 +152,10 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 }
 
 pub fn run() {
+    // Before anything else (no threads, no WebView yet): drop inherited variables a standard
+    // user could have set to load code into this elevated process or its children.
+    util::scrub_inherited_environment();
+
     // Started by `restart_as_admin`: let the previous (non-elevated) instance exit first, or
     // the single-instance plugin would hand this launch back to it.
     elevation::wait_for_previous_instance();

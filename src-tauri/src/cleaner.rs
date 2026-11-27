@@ -471,16 +471,41 @@ struct Env {
 impl Env {
     fn current() -> Self {
         use windows::Win32::UI::Shell::{
-            FOLDERID_LocalAppData, FOLDERID_ProgramData, FOLDERID_RoamingAppData,
+            FOLDERID_LocalAppData, FOLDERID_Profile, FOLDERID_ProgramData,
+            FOLDERID_RoamingAppData,
         };
+        let profile = known_folder(&FOLDERID_Profile);
         Self {
             windir: windows_dir(),
             temp: pick_user_temp(std::env::var_os("TMP"), std::env::var_os("TEMP")),
-            local_appdata: known_folder(&FOLDERID_LocalAppData),
-            roaming_appdata: known_folder(&FOLDERID_RoamingAppData),
+            local_appdata: within_profile(
+                known_folder(&FOLDERID_LocalAppData),
+                profile.as_deref(),
+            ),
+            roaming_appdata: within_profile(
+                known_folder(&FOLDERID_RoamingAppData),
+                profile.as_deref(),
+            ),
             programdata: known_folder(&FOLDERID_ProgramData),
         }
     }
+}
+
+/// `folder` if it lies strictly inside the user's profile folder, else `None`.
+///
+/// `LocalAppData` and `RoamingAppData` can be redirected per user (`HKCU\...\User Shell
+/// Folders`) by any non-elevated process. Without this check such a redirect could point the
+/// elevated cleaner (and the audit log) at another user's profile or a system folder. The
+/// profile folder itself comes from the user's token and cannot be redirected that way.
+pub(crate) fn within_profile(folder: Option<PathBuf>, profile: Option<&Path>) -> Option<PathBuf> {
+    let folder = folder?;
+    let f = norm_path(&folder);
+    let p = norm_path(profile?);
+    (folder.is_absolute()
+        && !has_parent_components(&f)
+        && local_depth(&p).is_some()
+        && is_strictly_under(&f, &p))
+    .then_some(folder)
 }
 
 /// The user temp folder as `GetTempPath` would pick it (`%TMP%`, then `%TEMP%`), but with no
@@ -995,8 +1020,12 @@ impl DenyList {
             }
         }
 
+        // Only a LocalAppData inside the profile makes `<LocalAppData>\Temp` a standard temp
+        // location (the never-root entries above may use the unchecked value: they only add
+        // restrictions).
+        let scoped_local = within_profile(local_appdata.clone(), profile.as_deref());
         let temp = TempPolicy::new(
-            local_appdata.as_deref(),
+            scoped_local.as_deref(),
             profile.as_deref(),
             users_root.as_deref(),
             &windir,
@@ -1178,6 +1207,17 @@ impl Filter {
         }
     }
 
+    /// Whether an empty sub-directory may be removed after the purge. Under an age guard, a
+    /// folder created or changed recently (timestamps taken at enumeration, before any file in
+    /// it is deleted) is left alone: it may be the working folder of an installer or app that
+    /// is running right now.
+    fn dir_removable(self, md: &std::fs::Metadata, now: SystemTime) -> bool {
+        match self {
+            Filter::Stale(age) => stale(md, age, now),
+            _ => true,
+        }
+    }
+
     /// Whether the walker may descend into a sub-directory named `name` (relative path `rel`).
     fn may_descend(self, rel: &str) -> bool {
         match self {
@@ -1351,7 +1391,9 @@ fn plan_root(spec: &RootSpec, deny: &DenyList, now: SystemTime) -> Option<RootPl
             let rel = &pn[canon_norm.len() + 1..];
             if emd.is_dir() {
                 if spec.recursive && depth < MAX_DEPTH && spec.filter.may_descend(rel) {
-                    dirs.push((depth + 1, path.clone()));
+                    if spec.filter.dir_removable(&emd, now) {
+                        dirs.push((depth + 1, path.clone()));
+                    }
                     stack.push((path, depth + 1));
                 }
                 continue;
@@ -1557,7 +1599,7 @@ fn delete_outcome(err: &DeleteError) -> (&'static str, String) {
     }
 }
 
-fn final_path(h: HANDLE) -> Option<String> {
+pub(crate) fn final_path(h: HANDLE) -> Option<String> {
     let flags = GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0);
     let mut buf = vec![0u16; 1024];
     loop {
@@ -2051,20 +2093,78 @@ pub fn do_failure_reason(stderr: &str, exit_code: Option<i32>) -> String {
     }
 }
 
+/// The `-Command` text for rule 10.
+///
+/// The cmdlet runs in an elevated Windows PowerShell whose module search a standard user could
+/// otherwise steer (`PSModulePath` in `HKCU\Environment`, the personal
+/// `Documents\WindowsPowerShell\Modules` folder, the module analysis cache). Module
+/// auto-loading is therefore switched off, and the three modules the cmdlet needs (its own and
+/// the two whose commands it calls: `Invoke-CimMethod`, `Write-Host`) are imported by absolute
+/// path from the real Windows directory. The call itself is module-qualified.
+pub fn do_script(windir: &Path) -> String {
+    let modules = windir
+        .join(r"System32\WindowsPowerShell\v1.0\Modules")
+        .to_string_lossy()
+        .replace('\'', "''");
+    let import =
+        |rel: &str| format!("Import-Module -Name '{modules}\\{rel}' -DisableNameChecking; ");
+    let mut script = String::from(
+        "$ErrorActionPreference = 'Stop'; $PSModuleAutoloadingPreference = 'None'; ",
+    );
+    script.push_str(&import(
+        r"Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1",
+    ));
+    script.push_str(&import(r"CimCmdlets\CimCmdlets.psd1"));
+    script.push_str(&import(r"DeliveryOptimization\DeliveryOptimization.psd1"));
+    script.push_str(r"DeliveryOptimization\Delete-DeliveryOptimizationCache -Force");
+    script
+}
+
+/// The complete environment of the elevated PowerShell child; nothing is inherited. The app's
+/// own environment is built from the user's (`HKCU\Environment`), which a standard-user process
+/// can set: `PSModulePath`, `COR_PROFILER`, `COMPlus_*`, `APPDOMAIN_MANAGER_*` and the like
+/// would otherwise load code into the elevated child.
+pub fn do_child_env(windir: &Path) -> Vec<(&'static str, String)> {
+    let w = windir.to_string_lossy().to_string();
+    vec![
+        ("SystemRoot", w.clone()),
+        ("windir", w.clone()),
+        ("SystemDrive", crate::util::system_drive()),
+        (
+            "PATH",
+            format!(r"{w}\System32;{w};{w}\System32\Wbem;{w}\System32\WindowsPowerShell\v1.0"),
+        ),
+        ("PATHEXT", ".COM;.EXE;.BAT;.CMD".to_string()),
+        (
+            "PSModulePath",
+            format!(r"{w}\System32\WindowsPowerShell\v1.0\Modules"),
+        ),
+        // The documented way to switch off the (user-writable) module analysis cache file.
+        ("PSModuleAnalysisCachePath", "NUL".to_string()),
+        ("TEMP", format!(r"{w}\Temp")),
+        ("TMP", format!(r"{w}\Temp")),
+    ]
+}
+
 /// Runs `Delete-DeliveryOptimizationCache -Force` through Windows PowerShell (System32 path,
-/// no window, 120 s limit).
+/// no window, 120 s limit, clean environment: see [`do_script`] and [`do_child_env`]).
 fn run_do_cmdlet() -> Result<(), String> {
     use std::io::Read;
     use std::process::Stdio;
-    let ps = windows_dir().join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    let windir = windows_dir();
+    let ps = windir.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    let script = do_script(&windir);
     let mut child = crate::util::hidden_command(&ps)
+        .env_clear()
+        .envs(do_child_env(&windir))
+        .current_dir(windir.join("System32"))
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
             "RemoteSigned",
             "-Command",
-            "Delete-DeliveryOptimizationCache -Force",
+            script.as_str(),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2334,12 +2434,9 @@ pub fn purge(app: &AppHandle, categories: &[String]) -> Result<PurgeResult, Stri
     let started_ts = now_ms();
     let requested = parse_categories(categories)?;
 
-    // Rule 11: no log, no purge.
-    let dir = crate::purge_log::log_dir().ok_or_else(|| {
-        "Could not create the cleanup log: the local application data folder is unavailable"
-            .to_string()
-    })?;
-    let mut log = PurgeLog::create(&dir, &crate::util::file_timestamp())
+    // Rule 11: no log, no purge. The log folder is user-writable; `create_default` never
+    // writes through a link planted there.
+    let mut log = PurgeLog::create_default(&crate::util::file_timestamp())
         .map_err(|e| format!("Could not create the cleanup log: {e}"))?;
 
     let ctx = Context::current(&requested);
@@ -3494,6 +3591,172 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn delivery_optimization_runs_in_a_locked_down_powershell() {
+        let w = Path::new(r"C:\Windows");
+        let script = do_script(w);
+        assert!(script.starts_with(
+            "$ErrorActionPreference = 'Stop'; $PSModuleAutoloadingPreference = 'None'; "
+        ));
+        for m in [
+            r"Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1",
+            r"CimCmdlets\CimCmdlets.psd1",
+            r"DeliveryOptimization\DeliveryOptimization.psd1",
+        ] {
+            assert!(
+                script.contains(&format!(
+                    r"Import-Module -Name 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules\{m}' -DisableNameChecking; "
+                )),
+                "{script}"
+            );
+        }
+        assert!(script.ends_with(r"DeliveryOptimization\Delete-DeliveryOptimizationCache -Force"));
+        assert!(!script.contains("IncludePinnedFiles"));
+        // Quotes in the Windows path cannot break out of the PowerShell string.
+        assert!(do_script(Path::new(r"C:\Win'dows")).contains(r"'C:\Win''dows\System32"));
+
+        let env = do_child_env(w);
+        let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
+        assert_eq!(
+            get("PSModulePath").as_deref(),
+            Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules")
+        );
+        assert_eq!(get("PSModuleAnalysisCachePath").as_deref(), Some("NUL"));
+        assert_eq!(get("SystemRoot").as_deref(), Some(r"C:\Windows"));
+        assert!(get("PATH").unwrap().split(';').all(|p| p.starts_with(r"C:\Windows")));
+        // Nothing user-controlled is passed on.
+        for k in ["USERPROFILE", "APPDATA", "LOCALAPPDATA", "COR_PROFILER", "COMPlus_X"] {
+            assert!(get(k).is_none(), "{k}");
+        }
+
+        // The real invocation resolves the module-qualified cmdlet from System32 with this
+        // environment (read-only check: Get-Command, nothing is deleted).
+        let windir = windows_dir();
+        let modules = windir.join(r"System32\WindowsPowerShell\v1.0\Modules\DeliveryOptimization");
+        if modules.is_dir() {
+            let probe = do_script(&windir).replace(
+                r"DeliveryOptimization\Delete-DeliveryOptimizationCache -Force",
+                r"(Get-Command DeliveryOptimization\Delete-DeliveryOptimizationCache).Module.ModuleBase; (Get-Command Invoke-CimMethod).Source",
+            );
+            let out = crate::util::hidden_command(
+                windir.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+            )
+            .env_clear()
+            .envs(do_child_env(&windir))
+            .current_dir(windir.join("System32"))
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "RemoteSigned",
+                "-Command",
+                probe.as_str(),
+            ])
+            .output()
+            .expect("powershell runs");
+            let stdout = String::from_utf8_lossy(&out.stdout).to_lowercase();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert!(stdout.contains(&norm_path(&modules)), "{stdout}");
+            assert!(stdout.contains("cimcmdlets"), "{stdout}");
+        }
+    }
+
+    #[test]
+    fn per_user_folders_must_stay_inside_the_profile() {
+        let profile = Path::new(r"C:\Users\me");
+        let ok = |p: &str| within_profile(Some(PathBuf::from(p)), Some(profile)).is_some();
+        assert!(ok(r"C:\Users\me\AppData\Local"));
+        assert!(ok(r"c:\users\ME\AppData\Roaming"));
+        assert!(!ok(r"C:\Users\me"));
+        assert!(!ok(r"C:\Users\me2\AppData\Local"));
+        assert!(!ok(r"C:\Users\victim\AppData\Local"));
+        assert!(!ok(r"C:\Windows\System32\config\systemprofile\AppData\Local"));
+        assert!(!ok(r"C:\Users\me\..\victim\AppData\Local"));
+        assert!(!ok(r"\\server\share\me\AppData"));
+        assert!(!ok(r"AppData\Local"));
+        assert!(within_profile(Some(PathBuf::from(r"C:\Users\me\x")), None).is_none());
+        // The real known folders satisfy it.
+        let env = Env::current();
+        assert!(env.local_appdata.is_some());
+    }
+
+    #[test]
+    fn fresh_empty_folders_survive_an_age_guarded_purge() {
+        use std::os::windows::fs::{FileTimesExt, OpenOptionsExt};
+        let t = TempTree::new("freshdir");
+        let root = t.base.join("root");
+        fs::create_dir_all(root.join("fresh-empty")).unwrap();
+        fs::create_dir_all(root.join("old-empty")).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3 * 24 * 3600);
+        let set_dir_times = |p: &Path| {
+            // FILE_WRITE_ATTRIBUTES on the folder itself (backup semantics opens a folder).
+            let f = fs::OpenOptions::new()
+                .access_mode(0x0100)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+                .open(p)
+                .unwrap();
+            f.set_times(fs::FileTimes::new().set_modified(old).set_created(old))
+                .unwrap();
+        };
+        set_dir_times(&root.join("old-empty"));
+        let deny = DenyList::build();
+        let spec = RootSpec::dir(root.clone(), true, Filter::Stale(RECENT_GUARD));
+        let plan = plan_root(&spec, &deny, SystemTime::now()).unwrap();
+        purge_plan(&plan, &deny);
+        assert!(root.join("fresh-empty").is_dir(), "a fresh folder may be in use");
+        assert!(!root.join("old-empty").exists());
+        // Without an age guard empty folders go as before.
+        let plan = plan_root(&all_filter_spec(&root), &deny, SystemTime::now()).unwrap();
+        purge_plan(&plan, &deny);
+        assert!(!root.join("fresh-empty").exists());
+        assert!(root.is_dir(), "the root itself is never removed");
+    }
+
+    #[test]
+    fn dump_ties_and_future_timestamps_are_deterministic() {
+        let now_ms = 1_800_000_000_000u64;
+        let day = 86_400_000u64;
+        // Seven dumps with the same old mtime: exactly the 5 first by path are kept, every
+        // time, so scan and purge agree.
+        let files: Vec<Candidate> = ["g", "c", "a", "f", "b", "e", "d"]
+            .iter()
+            .map(|n| Candidate {
+                path: PathBuf::from(format!("{n}.dmp")),
+                size: 1,
+                mtime: Some(now_ms - 60 * day),
+            })
+            .collect();
+        let (take, held) = apply_dump_rules(files.clone(), now_ms);
+        let mut gone: Vec<String> = take.iter().map(|c| c.path.display().to_string()).collect();
+        gone.sort();
+        assert_eq!(gone, vec!["f.dmp", "g.dmp"]);
+        assert_eq!(held.len(), 5);
+        let mut reversed = files;
+        reversed.reverse();
+        let (take2, _) = apply_dump_rules(reversed, now_ms);
+        let mut gone2: Vec<String> = take2.iter().map(|c| c.path.display().to_string()).collect();
+        gone2.sort();
+        assert_eq!(gone, gone2);
+        // A dump stamped in the future (clock skew) is kept (newest and not older than 30
+        // days), and an old dump is still deleted only when 5 newer ones exist.
+        let mut files: Vec<Candidate> = (0..5)
+            .map(|i| Candidate {
+                path: PathBuf::from(format!("old{i}.dmp")),
+                size: 1,
+                mtime: Some(now_ms - (40 + i) * day),
+            })
+            .collect();
+        files.push(Candidate {
+            path: PathBuf::from("future.dmp"),
+            size: 1,
+            mtime: Some(now_ms + 365 * day),
+        });
+        let (take, held) = apply_dump_rules(files, now_ms);
+        assert!(held.iter().any(|h| h.path == Path::new("future.dmp")));
+        assert_eq!(take.len(), 1);
+        assert_eq!(take[0].path, Path::new("old4.dmp"));
     }
 
     #[test]
