@@ -21,7 +21,9 @@
     <!-- Supports a self-contained single-file publish for win-x64
          (dotnet publish, Release, self-contained true, PublishSingleFile=true). -->
     <InvariantGlobalization>true</InvariantGlobalization>
-    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <!-- MF-8: native runtime DLLs ship next to nexum-agent.exe (Program Files) instead of being
+         extracted to a user-writable %TEMP%\.net folder that an elevated process would load from. -->
+    <IncludeNativeLibrariesForSelfExtract>false</IncludeNativeLibrariesForSelfExtract>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <DebugType>embedded</DebugType>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>

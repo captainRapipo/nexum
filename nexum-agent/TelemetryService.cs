@@ -8,25 +8,33 @@ namespace NexumAgent;
 /// <summary>
 /// LibreHardwareMonitor wrapper: owns the <see cref="Computer"/>, updates every sensor and maps
 /// them to the CONTRACT §1.1 <see cref="TelemetryPacket"/>. All access to LHM objects (including
-/// fan control in <see cref="FanController"/>) must happen while holding <see cref="SyncRoot"/>.
+/// fan control in <see cref="FanController"/> and the sensor tree) must happen while holding <see cref="SyncRoot"/>.
 /// </summary>
 internal sealed class TelemetryService : IDisposable
 {
     private static readonly Regex CoreLoadRegex =
         new(@"^CPU Core #(\d+)(\s+Thread #\d+)?$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-    private static readonly Regex CoreClockRegex =
+    private static readonly Regex RawCoreClockRegex =
         new(@"^(?:CPU )?Core #\d+$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex EffectiveCoreClockRegex =
+        new(@"^(?:CPU )?Core #\d+ \(Effective\)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>CPU temperature source order (CONTRACT §1.1.2). Also the fan-override input.</summary>
+    internal static readonly string[] CpuTempNames =
+        { "Core (Tctl/Tdie)", "CPU Package", "Core (Tctl)", "Core (Tdie)", "Tctl/Tdie", "Package" };
 
     private readonly Computer _computer;
     private readonly UpdateVisitor _visitor = new();
     private readonly StaticInfo _static;
-    private readonly DiskReliabilityCache _reliability = new();
-    private double? _maxObservedClockMhz;
+    private readonly WindowsDiskCache _windowsDisks = new();
     private bool _opened;
     private bool _closed;
 
     public object SyncRoot { get; } = new();
+
+    public StaticInfo Static => _static;
 
     public TelemetryService()
     {
@@ -41,6 +49,10 @@ internal sealed class TelemetryService : IDisposable
             IsNetworkEnabled = true,
         };
         _static = StaticInfo.Load();
+
+        // MF-7: LHM keeps one day of per-sensor history by default. Disable it for every sensor of every
+        // hardware as it appears (DIMMs from MemoryGroup arrive ~10 s after Open). Min/Max keep working.
+        _computer.HardwareAdded += OnHardwareAdded;
     }
 
     /// <summary>Opens the LHM Computer (loads the ring-0 driver when elevated). Call once, under <see cref="SyncRoot"/>.</summary>
@@ -49,11 +61,12 @@ internal sealed class TelemetryService : IDisposable
         if (_opened || _closed) return;
         _computer.Open();
         _opened = true;
-        _reliability.Start();
+        foreach (var hw in AllHardware()) DisableHistory(hw);
+        _windowsDisks.Start();
 
         try
         {
-            foreach (var hw in Flatten(_computer.Hardware))
+            foreach (var hw in AllHardware())
             {
                 Program.Log($"Hardware: {hw.HardwareType} '{SafeName(hw)}' {SafeId(hw)} ({SensorsOf(hw).Length} sensors)");
             }
@@ -64,7 +77,43 @@ internal sealed class TelemetryService : IDisposable
         }
     }
 
-    /// <summary>All hardware including nested SubHardware (e.g. Super I/O chips under the motherboard).</summary>
+    public bool IsOpen => _opened && !_closed;
+
+    private static void OnHardwareAdded(IHardware hardware)
+    {
+        try
+        {
+            foreach (var hw in Flatten(new[] { hardware })) DisableHistory(hw);
+        }
+        catch (Exception ex)
+        {
+            Program.Log($"HardwareAdded handler failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>Sets ValuesTimeWindow = 0 on every sensor of <paramref name="hw"/> (not recursive) and on sensors added later.</summary>
+    internal static void DisableHistory(IHardware hw)
+    {
+        foreach (var s in SensorsOf(hw)) DisableHistory(s);
+        try
+        {
+            hw.SensorAdded -= DisableHistory;
+            hw.SensorAdded += DisableHistory;
+        }
+        catch { /* some hardware types do not raise the event */ }
+    }
+
+    internal static void DisableHistory(ISensor? s)
+    {
+        if (s is null) return;
+        try
+        {
+            if (s.ValuesTimeWindow != TimeSpan.Zero) s.ValuesTimeWindow = TimeSpan.Zero;
+        }
+        catch { /* ignore */ }
+    }
+
+    /// <summary>All hardware including nested SubHardware (e.g. Super I/O chips under the motherboard), depth-first.</summary>
     public List<IHardware> AllHardware()
     {
         try { return Flatten(_computer.Hardware).ToList(); }
@@ -91,12 +140,12 @@ internal sealed class TelemetryService : IDisposable
         Section("cpu", warnings, () => packet.Cpu = MapCpu(all.FirstOrDefault(h => h.HardwareType == HardwareType.Cpu)));
         Section("gpu", warnings, () =>
         {
-            var gpus = all.Where(GpuMonitor.IsGpu)
-                          .Select(h => (h.HardwareType, GpuMonitor.Map(h)))
-                          .ToList();
-            packet.Gpus = gpus.Select(g => g.Item2).ToList();
-            int primary = GpuMonitor.SelectPrimaryIndex(gpus);
-            packet.Gpu = primary >= 0 ? gpus[primary].Item2 : null;
+            var gpus = all.Where(GpuMonitor.IsGpu).ToList();
+            var mapped = gpus.Select(h => (h.HardwareType, GpuMonitor.Map(h))).ToList();
+            packet.Gpus = mapped.Select(g => g.Item2).ToList();
+            packet.GpuHwIds = gpus.Select(SafeId).ToList();
+            int primary = GpuMonitor.SelectPrimaryIndex(mapped);
+            packet.Gpu = primary >= 0 ? mapped[primary].Item2 : null;
         });
         Section("ram", warnings, () => packet.Ram = MapRam(all));
         Section("fans", warnings, () =>
@@ -111,6 +160,32 @@ internal sealed class TelemetryService : IDisposable
         return packet;
     }
 
+    /// <summary>
+    /// Extra update of only the CPU and the given GPUs, for the fan-override evaluation when the poll
+    /// interval is longer than 1 s (CONTRACT §1.5.2). Returns T_cpu and T_gpu per GPU hardware id.
+    /// </summary>
+    public (double? CpuTemp, Dictionary<string, (double? Hotspot, double? Edge)> Gpus) SafetyUpdate(IReadOnlyCollection<string> gpuIds)
+    {
+        var gpus = new Dictionary<string, (double?, double?)>(StringComparer.OrdinalIgnoreCase);
+        if (!_opened || _closed) return (null, gpus);
+        double? cpuTemp = null;
+        foreach (var hw in AllHardware())
+        {
+            if (hw.HardwareType == HardwareType.Cpu && cpuTemp is null)
+            {
+                try { hw.Update(); } catch (Exception ex) { Program.LogThrottled("safety-cpu", $"CPU update failed: {ex.Message}"); }
+                cpuTemp = ReadCpuTemp(hw);
+            }
+            else if (GpuMonitor.IsGpu(hw) && gpuIds.Contains(SafeId(hw)))
+            {
+                try { hw.Update(); } catch (Exception ex) { Program.LogThrottled("safety-gpu", $"GPU update failed: {ex.Message}"); }
+                var t = GpuMonitor.Map(hw);
+                gpus[SafeId(hw)] = (t.HotspotTempC, t.TempC);
+            }
+        }
+        return (cpuTemp, gpus);
+    }
+
     private static void Section(string name, List<string> warnings, Action action)
     {
         try { action(); }
@@ -122,7 +197,7 @@ internal sealed class TelemetryService : IDisposable
     }
 
     // ---------------------------------------------------------------------------------------------
-    // CPU
+    // CPU (CONTRACT §1.1.2, MF-9)
 
     private CpuTelemetry BaseCpu() => new()
     {
@@ -130,6 +205,9 @@ internal sealed class TelemetryService : IDisposable
         Cores = _static.Cores,
         Threads = _static.Threads,
     };
+
+    /// <summary>First present (positive) temperature of <see cref="CpuTempNames"/> on the CPU hardware, 1 decimal.</summary>
+    internal static double? ReadCpuTemp(IHardware cpu) => Round(FindPositive(cpu, SensorType.Temperature, CpuTempNames));
 
     private CpuTelemetry MapCpu(IHardware? cpu)
     {
@@ -142,7 +220,7 @@ internal sealed class TelemetryService : IDisposable
         // Total load.
         t.LoadTotal = Math.Clamp(RoundOr(FindValue(cpu, SensorType.Load, "CPU Total")), 0, 100);
 
-        // Per-core load: "CPU Core #n" or, with SMT, "CPU Core #n Thread #m" averaged per core.
+        // Per PHYSICAL core: "CPU Core #n" or, with SMT, "CPU Core #n Thread #m" averaged per core.
         var perCore = new SortedDictionary<int, List<float>>();
         bool hasThreadSuffix = false;
         foreach (var s in OfType(cpu, SensorType.Load))
@@ -168,52 +246,23 @@ internal sealed class TelemetryService : IDisposable
         }
         t.LoadPerCore = loads.Select(v => Math.Clamp(RoundOr(v), 0, 100)).ToList();
 
-        // Clocks: average of the per-core clocks; max = highest core clock observed this session.
-        var coreClocks = OfType(cpu, SensorType.Clock)
-            .Where(s => CoreClockRegex.IsMatch((s.Name ?? "").Trim()))
-            .Select(s => Finite(s.Value))
-            .Where(v => v.HasValue && v.Value > 0)
-            .Select(v => (double)v!.Value)
-            .ToList();
-        if (coreClocks.Count == 0)
+        // Clock: "Cores (Average Effective)", else mean of "Core #n (Effective)", else mean of raw "Core #n".
+        // A 0 reading means the value is not readable (no ring-0 access) and is treated as unavailable.
+        var rawClocks = PositiveValues(cpu, SensorType.Clock, RawCoreClockRegex);
+        double? clock = FindPositive(cpu, SensorType.Clock, "Cores (Average Effective)");
+        if (!clock.HasValue)
         {
-            coreClocks = OfType(cpu, SensorType.Clock)
-                .Where(s => !(s.Name ?? "").Contains("Bus", StringComparison.OrdinalIgnoreCase))
-                .Select(s => Finite(s.Value))
-                .Where(v => v.HasValue && v.Value > 0)
-                .Select(v => (double)v!.Value)
-                .ToList();
+            var eff = PositiveValues(cpu, SensorType.Clock, EffectiveCoreClockRegex);
+            if (eff.Count > 0) clock = eff.Average();
+            else if (rawClocks.Count > 0) clock = rawClocks.Average();
         }
-        if (coreClocks.Count > 0)
-        {
-            t.ClockMhz = Round(coreClocks.Average());
-            double max = coreClocks.Max();
-            if (!_maxObservedClockMhz.HasValue || max > _maxObservedClockMhz.Value) _maxObservedClockMhz = max;
-        }
-        t.MaxClockMhz = Round(_maxObservedClockMhz);
+        t.ClockMhz = Round(clock);
+        t.MaxClockMhz = rawClocks.Count > 0 ? Round(rawClocks.Max()) : null;
 
-        // Package temperature.
-        var temp = FindPositive(cpu, SensorType.Temperature,
-                       "Core (Tctl/Tdie)", "CPU Package", "Core (Tctl)", "Core (Tdie)", "Tctl/Tdie", "Package");
-        if (!temp.HasValue)
-        {
-            var temps = OfType(cpu, SensorType.Temperature)
-                .Where(s => !IsTjMaxDistance(s.Name))
-                .ToList();
-            var coreTemps = temps.Where(s => (s.Name ?? "").Contains("Core", StringComparison.OrdinalIgnoreCase))
-                                 .Select(s => Positive(s.Value)).Where(v => v.HasValue).Select(v => v!.Value).ToList();
-            if (coreTemps.Count > 0) temp = coreTemps.Max();
-            else
-            {
-                var any = temps.Select(s => Positive(s.Value)).Where(v => v.HasValue).Select(v => v!.Value).ToList();
-                if (any.Count > 0) temp = any.Max();
-            }
-        }
-        t.PackageTempC = Round(temp);
+        t.PackageTempC = ReadCpuTemp(cpu);
 
-        // Core voltage (3 decimals: 1 decimal is meaningless for volts). SVI2/MSR voltages need the
-        // ring-0 driver; unelevated they return a fixed placeholder, so report null instead.
-        t.Voltage = !Program.IsAdmin ? null : Round(FindPositive(cpu, SensorType.Voltage,
+        // Core voltage (3 decimals). Without the sensor driver LHM returns a fixed placeholder, so report null.
+        t.Voltage = !Program.SensorDriverOk ? null : Round(FindPositive(cpu, SensorType.Voltage,
                               "Core (SVI2 TFN)", "Core (SVI3 TFN)", "CPU Core", "Core", "Core (SVI2)", "Core (SVI3)")
                           ?? FirstPositive(cpu, SensorType.Voltage), 3);
 
@@ -224,9 +273,13 @@ internal sealed class TelemetryService : IDisposable
         return t;
     }
 
-    private static bool IsTjMaxDistance(string? name) =>
-        name is not null && (name.Contains("Distance", StringComparison.OrdinalIgnoreCase) ||
-                             name.Contains("TjMax", StringComparison.OrdinalIgnoreCase));
+    private static List<double> PositiveValues(IHardware hw, SensorType type, Regex nameRegex) =>
+        OfType(hw, type)
+            .Where(s => nameRegex.IsMatch((s.Name ?? "").Trim()))
+            .Select(s => Finite(s.Value))
+            .Where(v => v.HasValue && v.Value > 0)
+            .Select(v => (double)v!.Value)
+            .ToList();
 
     // ---------------------------------------------------------------------------------------------
     // RAM
@@ -243,7 +296,7 @@ internal sealed class TelemetryService : IDisposable
         }
 
         const double GiB = 1024d * 1024d * 1024d;
-        var status = MemoryFlush.QueryMemoryStatus();
+        var status = NativeMethods.QueryMemoryStatus();
 
         double? used = usedGb;
         double? avail = availGb;
@@ -278,7 +331,7 @@ internal sealed class TelemetryService : IDisposable
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Disks
+    // Disks (CONTRACT §1.1.3, MF-1)
 
     private DiskTelemetry MapDisk(IHardware hw)
     {
@@ -286,43 +339,68 @@ internal sealed class TelemetryService : IDisposable
         var name = SafeName(hw);
         var d = new DiskTelemetry { Id = id, Name = string.IsNullOrWhiteSpace(name) ? "Disk" : name };
 
-        d.TempC = Round(FindPositive(hw, SensorType.Temperature, "Temperature", "Composite Temperature", "Drive Temperature")
-                        ?? FirstPositive(hw, SensorType.Temperature));
+        var smart = DriveHealth.ReadSmart(hw);
+        d.DiskNumber = smart.DiskNumber;
+        d.Serial = smart.Serial;
+
+        var tempSensor = FindPositiveSensor(hw, SensorType.Temperature, "Composite Temperature", "Temperature", "Drive Temperature");
+        if (tempSensor is not null)
+        {
+            d.TempC = Round(Positive(tempSensor.Value));
+            d.TempMinC = Round(Positive(tempSensor.Min));
+            d.TempMaxC = Round(Positive(tempSensor.Max));
+        }
 
         var read = FindValue(hw, SensorType.Throughput, "Read Rate");
         var write = FindValue(hw, SensorType.Throughput, "Write Rate");
         d.ReadMBps = read.HasValue ? Round(Math.Max(0, read.Value / BytesPerMiB), 2) : null;
         d.WriteMBps = write.HasValue ? Round(Math.Max(0, write.Value / BytesPerMiB), 2) : null;
 
-        // LHM >= 0.9.5 (DiskInfoToolkit) exposes "Life" (100 = new, 0 = worn out); older builds used
-        // "Remaining Life" (NVMe/SSD) or "Percentage Used" (NVMe wear, inverted).
-        var remaining = FindValue(hw, SensorType.Level, "Life", "Remaining Life", "Life Remaining")
-                        ?? FindValue(hw, SensorType.Load, "Life");
-        if (remaining.HasValue)
-        {
-            d.HealthPct = Clamp(Round(remaining.Value), 0, 100);
-        }
-        else
-        {
-            var used = FindValue(hw, SensorType.Level, "Percentage Used");
-            if (used.HasValue) d.HealthPct = Clamp(Round(100d - used.Value), 0, 100);
-        }
+        d.HealthPct = Clamp(Round(smart.Life), 0, 100);
+        d.PercentageUsed = smart.PercentageUsed;
+        d.CriticalWarning = smart.CriticalWarning;
+        d.AvailableSparePct = smart.AvailableSpare;
+        d.AvailableSpareThresholdPct = smart.AvailableSpareThreshold;
+        d.MediaErrors = smart.MediaErrors;
+        d.UnsafeShutdowns = smart.UnsafeShutdowns;
+        d.PowerCycles = smart.PowerCycles;
+        d.ErrorLogEntries = smart.ErrorLogEntries;
+        d.WarningTempC = smart.WarningTempC;
+        d.CriticalTempC = smart.CriticalTempC;
+        d.WarningTempMinutes = smart.WarningTempMinutes;
+        d.CriticalTempMinutes = smart.CriticalTempMinutes;
+        d.ReallocatedSectors = smart.Reallocated;
+        d.PendingSectors = smart.Pending;
+        d.UncorrectableSectors = smart.Uncorrectable;
+        d.Tbw = smart.HostWritesGb.HasValue ? Round(smart.HostWritesGb.Value / 1024d, 2) : null;
+        d.DataReadTb = smart.HostReadsGb.HasValue ? Round(smart.HostReadsGb.Value / 1024d, 2) : null;
 
-        var writtenGb = FindValue(hw, SensorType.Data, "Data Written", "Total Bytes Written", "Host Writes", "Total Host Writes");
-        d.Tbw = writtenGb.HasValue ? Round(Math.Max(0, writtenGb.Value / 1024d), 2) : null;
-
-        var poh = FindValueContaining(hw, null, "Power On Hours", "Power-On Hours", "Power On Time");
-        long? powerOnHours = poh.HasValue && poh.Value >= 0 ? (long)Math.Round(poh.Value) : null;
-
-        var rel = _reliability.Lookup(id, name);
-        if (rel is not null)
+        long? powerOnHours = smart.PowerOnHours;
+        var win = _windowsDisks.Lookup(smart.Serial, smart.DiskNumber);
+        if (win is not null)
         {
-            powerOnHours ??= rel.PowerOnHours;
-            d.TempC ??= rel.TempC;
+            powerOnHours ??= win.PowerOnHours;
+            d.TempC ??= win.TempC;
         }
         d.PowerOnHours = powerOnHours;
 
         d.UsedPct = Clamp(Round(FindValue(hw, SensorType.Load, "Used Space")), 0, 100);
+
+        d.Health = DriveHealth.Classify(new DriveHealth.Input
+        {
+            IsAdmin = Program.IsAdmin,
+            Source = smart.Source,
+            Life = d.HealthPct,
+            PercentageUsed = d.PercentageUsed,
+            PowerOnHours = d.PowerOnHours,
+            CriticalWarning = d.CriticalWarning,
+            AvailableSparePct = d.AvailableSparePct,
+            AvailableSpareThresholdPct = d.AvailableSpareThresholdPct,
+            ReallocatedSectors = d.ReallocatedSectors,
+            PendingSectors = d.PendingSectors,
+            UncorrectableSectors = d.UncorrectableSectors,
+            WindowsHealth = win?.HealthStatus,
+        });
         return d;
     }
 
@@ -355,7 +433,7 @@ internal sealed class TelemetryService : IDisposable
     {
         if (_closed) return;
         _closed = true;
-        _reliability.Dispose();
+        _windowsDisks.Dispose();
         if (_opened)
         {
             try { _computer.Close(); }
@@ -518,115 +596,5 @@ internal sealed class StaticInfo
         if (o is null) return null;
         try { return Convert.ToInt64(o, System.Globalization.CultureInfo.InvariantCulture); }
         catch { return null; }
-    }
-}
-
-/// <summary>
-/// Background cache of Windows Storage reliability counters (MSFT_StorageReliabilityCounter):
-/// fills powerOnHours / temperature when LibreHardwareMonitor does not expose them.
-/// Refreshed off the telemetry thread every 10 minutes.
-/// </summary>
-internal sealed class DiskReliabilityCache : IDisposable
-{
-    internal sealed record Entry(string DeviceId, string Name, long? PowerOnHours, double? TempC);
-
-    private static readonly Regex TrailingIndex = new(@"/(\d+)$", RegexOptions.Compiled);
-    private static readonly TimeSpan RefreshEvery = TimeSpan.FromMinutes(10);
-
-    private readonly CancellationTokenSource _cts = new();
-    private volatile IReadOnlyList<Entry> _entries = Array.Empty<Entry>();
-    private int _started;
-
-    public void Start()
-    {
-        if (Interlocked.Exchange(ref _started, 1) == 1) return;
-        var thread = new Thread(Loop) { IsBackground = true, Name = "disk-reliability", Priority = ThreadPriority.BelowNormal };
-        thread.Start();
-    }
-
-    private void Loop()
-    {
-        var token = _cts.Token;
-        if (token.WaitHandle.WaitOne(TimeSpan.FromSeconds(3))) return;
-        while (!token.IsCancellationRequested)
-        {
-            try { _entries = Query(); }
-            catch (Exception ex) { Program.Log($"Storage reliability query failed: {ex.Message}"); }
-            if (token.WaitHandle.WaitOne(RefreshEvery)) return;
-        }
-    }
-
-    private static IReadOnlyList<Entry> Query()
-    {
-        var list = new List<Entry>();
-        var scope = new ManagementScope(@"\\.\root\Microsoft\Windows\Storage");
-        scope.Connect();
-        using var searcher = new ManagementObjectSearcher(scope, new ObjectQuery("SELECT * FROM MSFT_PhysicalDisk"));
-        using var disks = searcher.Get();
-        foreach (ManagementObject disk in disks)
-        {
-            using (disk)
-            {
-                var deviceId = disk["DeviceId"]?.ToString() ?? "";
-                var name = disk["FriendlyName"]?.ToString()?.Trim() ?? "";
-                long? poh = null;
-                double? temp = null;
-                try
-                {
-                    using var related = disk.GetRelated("MSFT_StorageReliabilityCounter");
-                    foreach (ManagementObject rc in related)
-                    {
-                        using (rc)
-                        {
-                            var p = StaticInfo.ToLong(rc["PowerOnHours"]);
-                            if (p.HasValue && p.Value > 0) poh ??= p;
-                            var t = StaticInfo.ToLong(rc["Temperature"]);
-                            if (t.HasValue && t.Value > 0 && t.Value < 150) temp ??= t.Value;
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Program.LogThrottled($"reliability:{deviceId}", $"Reliability counter unavailable for disk {deviceId}: {ex.Message}");
-                }
-                list.Add(new Entry(deviceId, name, poh, temp));
-            }
-        }
-        return list;
-    }
-
-    /// <summary>Matches an LHM storage device (identifier "/nvme/0", model name) to a Windows physical disk.</summary>
-    public Entry? Lookup(string lhmId, string lhmName)
-    {
-        var entries = _entries;
-        if (entries.Count == 0) return null;
-
-        string? index = null;
-        var m = TrailingIndex.Match(lhmId ?? "");
-        if (m.Success) index = m.Groups[1].Value;
-
-        var norm = Normalize(lhmName);
-        bool NameMatches(Entry e)
-        {
-            var n = Normalize(e.Name);
-            return n.Length > 0 && norm.Length > 0 && (n == norm || n.Contains(norm) || norm.Contains(n));
-        }
-
-        if (index is not null)
-        {
-            var byIndex = entries.FirstOrDefault(e => e.DeviceId == index && NameMatches(e));
-            if (byIndex is not null) return byIndex;
-        }
-
-        var byName = entries.Where(NameMatches).ToList();
-        return byName.Count == 1 ? byName[0] : null;
-    }
-
-    private static string Normalize(string? s) =>
-        new string((s ?? "").Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
-
-    public void Dispose()
-    {
-        try { _cts.Cancel(); } catch { /* ignore */ }
     }
 }

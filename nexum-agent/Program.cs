@@ -5,23 +5,25 @@ using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using LibreHardwareMonitor.Hardware;
+using LibreHardwareMonitor.Hardware.Storage;
 
 namespace NexumAgent;
 
 /// <summary>
-/// Nexum hardware sidecar. Protocol (CONTRACT §1): NDJSON on stdout (one object per line,
+/// Nexum hardware sidecar. Protocol 2 (CONTRACT §1): NDJSON on stdout (one object per line,
 /// UTF-8 without BOM, flushed per line), NDJSON commands on stdin, all logs on stderr.
 /// </summary>
 internal static class Program
 {
     public const string AgentVersion = "1.0.0";
+    public const int ProtocolVersion = 2;
 
     private const int DefaultIntervalMs = 1000;
     private const int MinIntervalMs = 250;
     private const int MaxIntervalMs = 10000;
 
-    /// <summary>Above this CPU package / GPU core temperature a fixed low preset is released to BIOS control.</summary>
-    private const double ThermalFailsafeC = 90.0;
+    private static readonly Version MinPawnIoVersion = new(2, 1, 0);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -29,7 +31,7 @@ internal static class Program
         DefaultIgnoreCondition = JsonIgnoreCondition.Never,
         WriteIndented = false,
         // Still escapes quotes, backslashes and control characters (always single-line, valid JSON);
-        // only keeps apostrophes and non-ASCII text readable.
+        // only keeps apostrophes and non-ASCII text (°C, µS/cm, —) readable.
         Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
     };
 
@@ -43,11 +45,22 @@ internal static class Program
     private static readonly ConcurrentDictionary<string, long> ThrottleMap = new();
 
     private static volatile int _intervalMs = DefaultIntervalMs;
+    private static volatile bool _streamOn;
     private static int _shutdownStarted;
     private static TelemetryService? _telemetry;
     private static FanController? _fans;
+    private static FanSafety? _safety;
+    private static readonly SensorTree Tree = new();
+    /// <summary>Set after the first telemetry tick built the sensor tree (values are then populated).</summary>
+    private static readonly ManualResetEventSlim FirstTreeBuilt = new(false);
 
     public static bool IsAdmin { get; private set; }
+
+    /// <summary>hello.sensorDriver, computed once at start.</summary>
+    public static SensorDriverStatus SensorDriver { get; private set; } = new();
+
+    /// <summary>Admin + PawnIO ≥ 2.1.0: CPU temperature/power/clock/voltage and Super I/O are readable.</summary>
+    public static bool SensorDriverOk => SensorDriver.Ok;
 
     public static int Main(string[] args)
     {
@@ -77,28 +90,37 @@ internal static class Program
 
         IsAdmin = DetectAdmin();
 
+        if (args.Any(a => string.Equals(a, "--selftest", StringComparison.OrdinalIgnoreCase)))
+        {
+            return SelfTest.Run();
+        }
+
+        SensorDriver = ComputeSensorDriver(IsAdmin);
+
         if (args.Any(a => string.Equals(a, "--dump", StringComparison.OrdinalIgnoreCase)))
         {
-            // Diagnostics: list every hardware node and sensor (stderr) and exit. Not part of the protocol.
+            // Diagnostics: list every hardware node and sensor (stderr) and exit. Read-only; not part of the protocol.
             return DumpSensors();
         }
 
-        Log($"nexum-agent {AgentVersion} starting (pid {Environment.ProcessId}, admin={IsAdmin})");
+        Log($"nexum-agent {AgentVersion} (protocol {ProtocolVersion}) starting (pid {Environment.ProcessId}, admin={IsAdmin})");
+        Log($"Sensor driver: kind={SensorDriver.Kind} version={SensorDriver.Version ?? "n/a"} ok={SensorDriver.Ok} reason={SensorDriver.Reason ?? "none"}");
         if (!IsAdmin)
         {
-            Log("Not elevated: motherboard sensors, CPU temps/power and fan control will be unavailable.");
+            Log("Not elevated: motherboard sensors, CPU temps/power, drive S.M.A.R.T. and fan control are unavailable.");
         }
 
-        // CONTRACT: 'hello' is the first line on stdout.
-        Emit(new HelloMessage { IsAdmin = IsAdmin, Pid = Environment.ProcessId });
-
+        // Write-ahead fan flag (CONTRACT §1.5.3): decided before any hardware access.
+        string fanFlag = FanFlag.CheckAtStart(IsAdmin);
         _fans = new FanController();
+        _safety = new FanSafety(_fans, IsAdmin, fanFlag);
 
-        // Start reading commands right away so 'shutdown' / EOF are honoured even while the
-        // (potentially slow) hardware open is in progress. Fan commands simply wait for the lock.
+        // Read stdin right away so 'shutdown' / EOF are honoured during the (slow) hardware open.
+        // Every other command waits until 'hello' has been written (causal order).
         var reader = new Thread(ReadCommands) { IsBackground = true, Name = "stdin-reader" };
         reader.Start();
 
+        string? initError = null;
         try
         {
             _telemetry = new TelemetryService();
@@ -107,18 +129,26 @@ internal static class Program
                 var sw = Stopwatch.StartNew();
                 _telemetry.Open();
                 Log($"Hardware opened in {sw.ElapsedMilliseconds} ms");
+                _fans.Refresh(_telemetry.AllHardware());
+                _safety.EnterFailsafeIfNeeded();
             }
-            CheckKernelDriver();
         }
         catch (Exception ex)
         {
             Log($"Hardware initialisation failed: {ex}");
-            EmitError($"Hardware initialisation failed: {ex.Message}");
+            initError = $"Hardware initialisation failed: {ex.Message}";
         }
-        finally
+
+        // CONTRACT: 'hello' is the first line, after Open() and before the first telemetry.
+        Emit(new HelloMessage
         {
-            InitDone.Set();
-        }
+            IsAdmin = IsAdmin,
+            Pid = Environment.ProcessId,
+            SensorDriver = SensorDriver,
+            FanFlag = fanFlag,
+        });
+        if (initError is not null) EmitError(initError);
+        InitDone.Set();
 
         if (!ExitSignal.IsSet)
         {
@@ -130,6 +160,46 @@ internal static class Program
         Shutdown("exit requested");
         Log("nexum-agent exited cleanly");
         return 0;
+    }
+
+    /// <summary>hello.sensorDriver (CONTRACT §1.1, MF-2/MF-3).</summary>
+    internal static SensorDriverStatus ComputeSensorDriver(bool admin)
+    {
+        bool installed = false;
+        Version? version = null;
+        try { installed = LibreHardwareMonitor.PawnIo.PawnIo.IsInstalled; }
+        catch (Exception ex) { Log($"PawnIO install check failed: {ex.Message}"); }
+        if (installed)
+        {
+            try
+            {
+                var v = LibreHardwareMonitor.PawnIo.PawnIo.Version;
+                if (v is not null && (v.Major > 0 || v.Minor > 0 || v.Build > 0))
+                {
+                    version = new Version(v.Major, Math.Max(v.Minor, 0), Math.Max(v.Build, 0));
+                }
+            }
+            catch (Exception ex) { Log($"PawnIO version unreadable: {ex.Message}"); }
+        }
+        return BuildSensorDriver(admin, installed, version);
+    }
+
+    internal static SensorDriverStatus BuildSensorDriver(bool admin, bool installed, Version? version)
+    {
+        bool versionOk = version is not null && version >= MinPawnIoVersion;
+        string? reason =
+            !installed ? "missing" :
+            version is not null && !versionOk ? "outdated" :
+            !admin ? "notElevated" :
+            null;
+        return new SensorDriverStatus
+        {
+            Kind = installed ? "pawnio" : "none",
+            Version = version is null ? null : $"{version.Major}.{version.Minor}.{Math.Max(version.Build, 0)}",
+            MinVersion = "2.1.0",
+            Ok = admin && installed && versionOk,
+            Reason = reason,
+        };
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -168,9 +238,17 @@ internal static class Program
                 if (nextDueMs - now > _intervalMs) nextDueMs = now + _intervalMs; // interval was shortened
                 long remaining = nextDueMs - now;
                 if (remaining <= 0) break;
-                int signalled = WaitHandle.WaitAny(waitHandles, (int)remaining);
-                if (signalled == WaitHandle.WaitTimeout) break;
-                if (signalled == 1) nextDueMs = tickStartMs + _intervalMs; // interval changed: re-evaluate
+
+                // MF-13: while fans are under manual control the override is evaluated at least every
+                // second, even when the poll interval is longer (e.g. 5 s while minimised to the tray).
+                var safety = _safety;
+                bool manual = safety is not null && safety.ManualActive && !safety.Failsafe;
+                int wait = manual ? (int)Math.Min(remaining, 250) : (int)remaining;
+
+                int signalled = WaitHandle.WaitAny(waitHandles, wait);
+                if (signalled == 1) { nextDueMs = tickStartMs + _intervalMs; continue; } // interval changed: re-evaluate
+                if (signalled == 0) break;
+                if (manual && nextDueMs - clock.ElapsedMilliseconds > 0) ExtraSafetyEvaluation();
             }
         }
     }
@@ -179,54 +257,85 @@ internal static class Program
     {
         var svc = _telemetry;
         var fans = _fans;
-        if (svc is null || fans is null) return;
+        var safety = _safety;
+        if (svc is null || fans is null || safety is null) return;
 
         warnings.Clear();
-        TelemetryPacket packet;
-        string? failsafeMessage = null;
-
         lock (svc.SyncRoot)
         {
             if (Cts.IsCancellationRequested) return;
-            packet = svc.Collect(fans, warnings);
-            failsafeMessage = CheckThermalFailsafe(packet, fans);
-        }
+            var packet = svc.Collect(fans, warnings);
 
-        Emit(packet);
+            bool newTree = false;
+            if (svc.IsOpen)
+            {
+                try
+                {
+                    newTree = Tree.Sync(svc.AllHardware());
+                    FirstTreeBuilt.Set();
+                    Tree.Accumulate();
+                }
+                catch (Exception ex)
+                {
+                    warnings.Add($"Sensor tree update failed: {ex.Message}");
+                    Log($"Sensor tree update failed: {ex}");
+                }
+            }
+
+            try
+            {
+                safety.Evaluate(packet.Cpu.PackageTempC, GpuTemps(packet));
+            }
+            catch (Exception ex)
+            {
+                Log($"Fan safety evaluation failed: {ex}");
+            }
+            packet.FanSafety = safety.Snapshot();
+            packet.FanPreset = fans.CurrentPreset;
+
+            // Causal order on one writer: tree (new rev) → telemetry → values of that rev.
+            // Emitting under the hardware lock keeps a concurrent command's tree from interleaving.
+            if (newTree && Tree.CurrentWithSession() is { } tree) Emit(tree);
+            Emit(packet);
+            if (_streamOn && Tree.Current is not null) Emit(Tree.BuildValues(packet.Ts));
+        }
 
         foreach (var w in warnings)
         {
             EmitErrorThrottled(w, w);
         }
-        if (failsafeMessage is not null)
-        {
-            EmitError(failsafeMessage);
-        }
     }
 
-    /// <summary>
-    /// Safety net: if a fixed reduced-duty mode (silent / balanced / custom) is active and the CPU
-    /// package or a GPU core reaches <see cref="ThermalFailsafeC"/>, give control back to the BIOS curve.
-    /// Must be called under the telemetry lock. Returns a message when it fired.
-    /// </summary>
-    private static string? CheckThermalFailsafe(TelemetryPacket packet, FanController fans)
+    private static Dictionary<string, (double? Hotspot, double? Edge)> GpuTemps(TelemetryPacket packet)
     {
-        var preset = fans.CurrentPreset;
-        if (preset is not (FanController.PresetSilent or FanController.PresetBalanced or FanController.PresetCustom))
+        var map = new Dictionary<string, (double?, double?)>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < packet.Gpus.Count && i < packet.GpuHwIds.Count; i++)
         {
-            return null;
+            map[packet.GpuHwIds[i]] = (packet.Gpus[i].HotspotTempC, packet.Gpus[i].TempC);
         }
+        return map;
+    }
 
-        double cpu = packet.Cpu.PackageTempC ?? double.MinValue;
-        double gpu = packet.Gpus.Count == 0 ? double.MinValue : packet.Gpus.Max(g => g.TempC ?? double.MinValue);
-        double hottest = Math.Max(cpu, gpu);
-        if (hottest < ThermalFailsafeC) return null;
-
-        var (_, msg) = fans.ApplyPreset(FanController.PresetAuto);
-        packet.FanPreset = fans.CurrentPreset;
-        var source = cpu >= gpu ? "CPU" : "GPU";
-        Log($"Thermal failsafe: {source} at {hottest:0.0} C - {msg}");
-        return $"Thermal failsafe: {source} reached {hottest:0.0} °C, fan control released to BIOS ({msg})";
+    /// <summary>CPU/GPU-only update + override evaluation between long ticks (CONTRACT §1.5.2).</summary>
+    private static void ExtraSafetyEvaluation()
+    {
+        var svc = _telemetry;
+        var safety = _safety;
+        if (svc is null || safety is null) return;
+        try
+        {
+            lock (svc.SyncRoot)
+            {
+                if (Cts.IsCancellationRequested || !safety.ExtraEvaluationDue) return;
+                safety.Fans.Refresh(svc.AllHardware());
+                var (cpu, gpus) = svc.SafetyUpdate(safety.ManualGpuIds);
+                safety.Evaluate(cpu, gpus);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogThrottled("extra-eval", $"Extra fan safety evaluation failed: {ex.Message}");
+        }
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -293,6 +402,7 @@ internal static class Program
         }
         catch (JsonException ex)
         {
+            WaitForHello();
             EmitError($"Invalid command JSON: {ex.Message}");
             return false;
         }
@@ -303,15 +413,22 @@ internal static class Program
             if (root.ValueKind != JsonValueKind.Object ||
                 !root.TryGetProperty("cmd", out var cmdEl) || cmdEl.ValueKind != JsonValueKind.String)
             {
+                WaitForHello();
                 EmitError("Command is missing a string 'cmd' field");
                 return false;
             }
 
             var cmd = cmdEl.GetString() ?? "";
-            if (Volatile.Read(ref _shutdownStarted) == 1)
+            if (cmd == "shutdown")
             {
+                Log("shutdown command received");
                 return true;
             }
+            if (Volatile.Read(ref _shutdownStarted) == 1) return true;
+
+            // Nothing but 'shutdown' may be answered before 'hello'.
+            WaitForHello();
+            if (ExitSignal.IsSet) return true;
 
             switch (cmd)
             {
@@ -332,7 +449,7 @@ internal static class Program
                 case "fanPreset":
                 {
                     var preset = root.TryGetProperty("preset", out var p) && p.ValueKind == JsonValueKind.String ? p.GetString() : null;
-                    var (ok, msg) = WithHardware(f => f.ApplyPreset(preset));
+                    var (ok, msg) = WithFans(s => s.HandlePreset(preset));
                     Ack(cmd, ok, msg);
                     break;
                 }
@@ -345,45 +462,125 @@ internal static class Program
                         Ack(cmd, false, "Missing numeric 'pct'");
                         break;
                     }
-                    var (ok, msg) = WithHardware(f => f.SetFan(id, pct));
+                    var (ok, msg) = WithFans(s => s.HandleFanSet(id, pct));
                     Ack(cmd, ok, msg);
                     break;
                 }
 
-                case "flushStandby":
+                case "sensorTree":
                 {
-                    var (ok, msg) = MemoryFlush.FlushStandby();
-                    Ack(cmd, ok, msg);
+                    var svc = _telemetry;
+                    if (svc is null || !svc.IsOpen)
+                    {
+                        EmitError("Sensor tree is not available: the hardware monitor is not open");
+                        break;
+                    }
+                    FirstTreeBuilt.Wait(TimeSpan.FromSeconds(5)); // tree is built after the first Update()
+                    lock (svc.SyncRoot)
+                    {
+                        if (Tree.Current is null) Tree.Sync(svc.AllHardware()); // first tick did not complete in time
+                        if (Tree.CurrentWithSession() is { } tree) Emit(tree);
+                    }
                     break;
                 }
 
-                case "shutdown":
-                    Log("shutdown command received");
-                    return true;
+                case "sensorStream":
+                {
+                    bool on = root.TryGetProperty("on", out var onEl) && onEl.ValueKind == JsonValueKind.True;
+                    if (_streamOn != on) Log($"Sensor value stream {(on ? "on" : "off")}");
+                    _streamOn = on;
+                    break;
+                }
+
+                case "sensorReset":
+                {
+                    List<string>? ids = null;
+                    if (root.TryGetProperty("ids", out var idsEl) && idsEl.ValueKind == JsonValueKind.Array)
+                    {
+                        ids = idsEl.EnumerateArray().Where(e => e.ValueKind == JsonValueKind.String)
+                                   .Select(e => e.GetString() ?? "").ToList();
+                    }
+                    var svc = _telemetry;
+                    if (svc is null || !svc.IsOpen)
+                    {
+                        Ack(cmd, false, "Hardware monitor is not available");
+                        break;
+                    }
+                    FirstTreeBuilt.Wait(TimeSpan.FromSeconds(5));
+                    lock (svc.SyncRoot)
+                    {
+                        if (Tree.Current is null) Tree.Sync(svc.AllHardware()); // first tick did not complete in time
+                        int n = Tree.Reset(ids);
+                        if (ids is null && Tree.CurrentWithSession() is { } tree) Emit(tree);
+                        Ack(cmd, true, $"Reset {n} sensor{(n == 1 ? "" : "s")}");
+                    }
+                    break;
+                }
+
+                case "spec":
+                    StartSpec();
+                    break;
 
                 default:
-                    Ack(cmd, false, $"Unknown command '{cmd}'");
+                    Ack(cmd, false, "Unknown command");
                     break;
             }
         }
         return false;
     }
 
-    /// <summary>Runs a fan operation under the hardware lock with a fresh fan map.</summary>
-    private static (bool Ok, string Message) WithHardware(Func<FanController, (bool, string)> action)
+    private static void WaitForHello()
     {
-        // Commands can arrive while the hardware is still being opened; wait for it.
-        if (!InitDone.Wait(TimeSpan.FromSeconds(60))) return (false, "Hardware monitor is still initialising");
+        while (!InitDone.Wait(500))
+        {
+            if (ExitSignal.IsSet) return;
+        }
+    }
+
+    /// <summary>Runs a fan operation under the hardware lock with a fresh fan map.</summary>
+    private static (bool Ok, string Message) WithFans(Func<FanSafety, (bool, string)> action)
+    {
         var svc = _telemetry;
-        var fans = _fans;
-        if (svc is null || fans is null) return (false, "Hardware monitor is not available");
+        var safety = _safety;
+        if (safety is null) return (false, "Hardware monitor is not available");
+        if (!IsAdmin) return (false, FanSafety.MsgNeedsAdmin);
+        if (svc is null || !svc.IsOpen) return (false, "Hardware monitor is not available");
 
         lock (svc.SyncRoot)
         {
             if (Volatile.Read(ref _shutdownStarted) == 1) return (false, "Agent is shutting down");
-            fans.Refresh(svc.AllHardware());
-            return action(fans);
+            safety.Fans.Refresh(svc.AllHardware());
+            return action(safety);
         }
+    }
+
+    /// <summary>{cmd:"spec"}: LHM facts under the lock (brief), WMI on a background thread.</summary>
+    private static void StartSpec()
+    {
+        var svc = _telemetry;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                SystemSpec.LhmFacts facts;
+                if (svc is null) facts = new SystemSpec.LhmFacts();
+                else lock (svc.SyncRoot) facts = SystemSpec.CaptureLhm(svc);
+                var info = svc?.Static ?? StaticInfo.Load();
+                var spec = SystemSpec.Build(facts, info);
+                if (Volatile.Read(ref _shutdownStarted) == 0) Emit(spec);
+            }
+            catch (Exception ex)
+            {
+                Log($"Spec failed: {ex}");
+                Emit(new AgentSpecMessage
+                {
+                    CapturedTs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    Errors = { $"System spec failed: {ex.Message}" },
+                });
+            }
+        })
+        { IsBackground = true, Name = "spec", Priority = ThreadPriority.BelowNormal };
+        thread.Start();
     }
 
     private static bool TryGetNumber(JsonElement root, string name, out double value)
@@ -408,7 +605,10 @@ internal static class Program
     // ---------------------------------------------------------------------------------------------
     // Shutdown
 
-    /// <summary>Idempotent: stops the loop, restores fan control defaults, closes the Computer.</summary>
+    /// <summary>
+    /// Idempotent: stops the loop, restores fan control defaults (except in failsafe mode, CONTRACT
+    /// §1.5.4), deletes the fan flag when every restore succeeded, closes the Computer.
+    /// </summary>
     private static void Shutdown(string reason)
     {
         if (Interlocked.Exchange(ref _shutdownStarted, 1) == 1) return;
@@ -417,7 +617,7 @@ internal static class Program
         try { Cts.Cancel(); } catch { /* ignore */ }
 
         var svc = _telemetry;
-        var fans = _fans;
+        var safety = _safety;
         if (svc is null)
         {
             ExitSignal.Set();
@@ -431,18 +631,10 @@ internal static class Program
             Monitor.TryEnter(svc.SyncRoot, TimeSpan.FromSeconds(5), ref locked);
             if (!locked) Log("Hardware lock busy; restoring fan control without it");
 
-            if (fans is not null)
+            if (safety is not null)
             {
-                try
-                {
-                    // Make sure controls set before a re-enumeration are still known.
-                    int n = fans.RestoreAll();
-                    Log($"Restored default fan control on {n} control(s)");
-                }
-                catch (Exception ex)
-                {
-                    Log($"Fan restore failed: {ex.Message}");
-                }
+                try { safety.OnShutdown(); }
+                catch (Exception ex) { Log($"Fan restore failed: {ex.Message}"); }
             }
 
             try { svc.Close(); }
@@ -503,6 +695,8 @@ internal static class Program
         }
     }
 
+    internal static string Serialize(object message) => JsonSerializer.Serialize(message, message.GetType(), JsonOptions);
+
     // ---------------------------------------------------------------------------------------------
     // Logging (stderr only)
 
@@ -541,9 +735,10 @@ internal static class Program
         return throttled;
     }
 
+    /// <summary>Read-only diagnostics: every hardware node, sensor and drive SMART attribute to stderr. Never writes fans.</summary>
     private static int DumpSensors()
     {
-        Log($"nexum-agent {AgentVersion} sensor dump (admin={IsAdmin})");
+        Log($"nexum-agent {AgentVersion} sensor dump (admin={IsAdmin}, sensorDriver ok={SensorDriver.Ok} reason={SensorDriver.Reason ?? "none"})");
         var svc = new TelemetryService();
         try
         {
@@ -562,10 +757,25 @@ internal static class Program
                     string ctrl = s.Control is null ? "" : $" [control mode={s.Control.ControlMode} min={s.Control.MinSoftwareValue} max={s.Control.MaxSoftwareValue}]";
                     Log($"   {s.SensorType,-12} #{s.Index,-3} {s.Name,-36} = {(s.Value.HasValue ? s.Value.Value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) : "null")}  {SensorUtil.SafeId(s)}{ctrl}");
                 }
+                if (hw is StorageDevice sd)
+                {
+                    try
+                    {
+                        var st = sd.Storage;
+                        Log($"   storage: nvme={st.IsNVMe} drive#={st.DriveNumber} bus={st.BusType} smartAttributes={st.Smart?.SmartAttributes?.Count ?? 0}");
+                        foreach (var a in st.Smart?.SmartAttributes ?? new())
+                        {
+                            if (a?.Info is null) continue;
+                            Log($"     SMART {a.Info.ID,3} {a.Info.Type,-40} raw={a.Attribute.RawValueULong} cur={a.Attribute.CurrentValue} thr={a.Attribute.Threshold}");
+                        }
+                    }
+                    catch (Exception ex) { Log($"   storage details failed: {ex.Message}"); }
+                }
             }
 
             foreach (var w in warnings) Log($"warning: {w}");
-            Log("Packet: " + JsonSerializer.Serialize(packet, JsonOptions));
+            foreach (var d in packet.Disks) d.Serial = d.Serial is null ? null : "••••"; // never print serials
+            Log("Packet: " + Serialize(packet));
             return 0;
         }
         catch (Exception ex)
@@ -576,32 +786,6 @@ internal static class Program
         finally
         {
             svc.Close();
-        }
-    }
-
-    /// <summary>
-    /// Since LibreHardwareMonitorLib 0.9.5 ring-0 access (Super I/O fans, CPU MSR temps/power, SMBus)
-    /// goes through the separately installed, signed PawnIO driver instead of the bundled WinRing0
-    /// (which Microsoft's vulnerable-driver blocklist rejects). Tell the host when it is missing.
-    /// </summary>
-    private static void CheckKernelDriver()
-    {
-        try
-        {
-            if (LibreHardwareMonitor.PawnIo.PawnIo.IsInstalled)
-            {
-                Log($"PawnIO driver installed (version {LibreHardwareMonitor.PawnIo.PawnIo.Version})");
-                return;
-            }
-            Log("PawnIO driver not installed: motherboard fans, CPU package temp/power and fan control are unavailable.");
-            if (IsAdmin)
-            {
-                EmitError("PawnIO driver is not installed: motherboard fan and CPU temperature/power sensors and fan control are unavailable. Install PawnIO (https://pawnio.eu) and restart Nexum.");
-            }
-        }
-        catch (Exception ex)
-        {
-            Log($"PawnIO check failed: {ex.Message}");
         }
     }
 

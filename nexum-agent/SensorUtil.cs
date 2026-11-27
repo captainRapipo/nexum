@@ -87,6 +87,23 @@ internal static class SensorUtil
         return null;
     }
 
+    /// <summary>Like <see cref="FindPositive"/> but returns the sensor itself (for Min/Max access).</summary>
+    public static ISensor? FindPositiveSensor(IHardware hw, SensorType type, params string[] names)
+    {
+        var sensors = SensorsOf(hw);
+        foreach (var name in names)
+        {
+            foreach (var s in sensors)
+            {
+                if (s is null || s.SensorType != type) continue;
+                if (!string.Equals(s.Name?.Trim(), name, StringComparison.OrdinalIgnoreCase)) continue;
+                var v = Finite(s.Value);
+                if (v.HasValue && v.Value > 0) return s;
+            }
+        }
+        return null;
+    }
+
     public static float? FirstPositive(IHardware hw, SensorType type)
     {
         foreach (var s in OfType(hw, type))
@@ -98,7 +115,6 @@ internal static class SensorUtil
     }
 
     public static float? Positive(float? v) => v.HasValue && v.Value > 0 ? Finite(v) : null;
-
     /// <summary>First sensor of a type whose name contains any fragment (case-insensitive) and has a finite value.</summary>
     public static float? FindValueContaining(IHardware hw, SensorType? type, params string[] fragments)
     {
