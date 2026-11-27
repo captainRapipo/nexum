@@ -26,6 +26,7 @@ internal static class SelfTest
         SelfTestFans.Run((name, ok, detail) => Check(name, ok, detail));
         Frames.FrameSelfTest.Run((name, ok, detail) => Check(name, ok, detail), presentMonPath);
         Spec.SpecSelfTest.Run((name, ok, detail) => Check(name, ok, detail));
+        NativeGuardSelfTest.Run((name, ok, detail) => Check(name, ok, detail));
 
         Program.Log($"selftest: {_checks - _failures}/{_checks} checks passed");
         return _failures == 0 ? 0 : 1;

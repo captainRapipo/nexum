@@ -28,6 +28,11 @@ internal static class PresentMonTrust
         public string? Code { get; init; }
         public FrameSignature Signature { get; init; } = FrameSignature.NotChecked;
         public string Path { get; init; } = "";
+        /// <summary>
+        /// Ok only: the verified file's own path with every junction / symbolic link resolved
+        /// (GetFinalPathNameByHandle on <see cref="Handle"/>). The spawn uses this, never <see cref="Path"/>.
+        /// </summary>
+        public string FinalPath { get; init; } = "";
         /// <summary>Open (share read only) while Ok; disposed by the caller after CreateProcess returned.</summary>
         public SafeFileHandle? Handle { get; init; }
         /// <summary>Log detail (never shown in the UI).</summary>
@@ -54,6 +59,12 @@ internal static class PresentMonTrust
         if (!IsAcceptablePath(path))
         {
             return new Result { Code = "exeMissing", Path = path ?? "", Detail = "no acceptable --presentmon path" };
+        }
+        // A drive letter can still name a network share (mapped or subst drive): never open it.
+        uint driveType = FrameNative.GetDriveType(path!.Substring(0, 3));
+        if (driveType is FrameNative.DRIVE_REMOTE or FrameNative.DRIVE_UNKNOWN or FrameNative.DRIVE_NO_ROOT_DIR)
+        {
+            return Invalid(path, null, null, $"not a local drive (drive type {driveType})");
         }
 
         SafeFileHandle handle = FrameNative.CreateFile(path!, FrameNative.GENERIC_READ, FrameNative.FILE_SHARE_READ, IntPtr.Zero,
@@ -91,6 +102,15 @@ internal static class PresentMonTrust
                 return Invalid(path!, false, null, $"unexpected size {size}");
             }
 
+            // The name the process is created from: this handle's own path with every reparse point on the way
+            // resolved. While the handle is open (no write / delete sharing) the file under that name cannot be
+            // replaced, and a junction swapped into a parent folder after this point cannot redirect the spawn.
+            string? finalPath = FinalPathOf(handle);
+            if (finalPath is null)
+            {
+                return Invalid(path!, null, null, "final path unavailable or not on a local drive letter");
+            }
+
             // 3. Pinned hash, read through the same handle (positional reads; the file pointer is untouched).
             string hash = HashHex(handle, size);
             if (!string.Equals(hash, PinnedSha256, StringComparison.OrdinalIgnoreCase))
@@ -123,8 +143,9 @@ internal static class PresentMonTrust
                 Ok = true,
                 Signature = new FrameSignature { Status = "valid", Signer = signerCn, Sha256Match = true },
                 Path = path!,
+                FinalPath = finalPath,
                 Handle = handle,
-                Detail = "valid",
+                Detail = string.Equals(finalPath, path, StringComparison.OrdinalIgnoreCase) ? "valid" : $"valid (resolved to {finalPath})",
             };
         }
         catch (Exception ex)
@@ -137,7 +158,28 @@ internal static class PresentMonTrust
         }
     }
 
-    private static Result Invalid(string path, bool? shaMatch, string? signer, string detail) => new()
+    /// <summary>GetFinalPathNameByHandle (normalized, DOS volume name) in the plain drive-letter form, or null.</summary>
+    private static string? FinalPathOf(SafeFileHandle handle)
+    {
+        var buf = new char[1100];
+        uint n = FrameNative.GetFinalPathNameByHandle(handle, buf, (uint)buf.Length, FrameNative.FILE_NAME_NORMALIZED_DOS);
+        if (n == 0 || n >= buf.Length) return null;
+        return NormalizeFinalPath(new string(buf, 0, (int)n));
+    }
+
+    /// <summary>
+    /// <c>\\?\C:\dir\x.exe</c> → <c>C:\dir\x.exe</c>. Null for a network share (<c>\\?\UNC\…</c>), a volume GUID
+    /// path or anything else that is not an acceptable local drive-letter path. Pure (self-tested).
+    /// </summary>
+    internal static string? NormalizeFinalPath(string? raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return null;
+        const string prefix = @"\\?\";
+        string p = raw.StartsWith(prefix, StringComparison.Ordinal) ? raw.Substring(prefix.Length) : raw;
+        return IsAcceptablePath(p) ? p : null;
+    }
+
+    private static Result Invalid(string path,bool? shaMatch, string? signer, string detail) => new()
     {
         Code = "signatureInvalid",
         Signature = new FrameSignature { Status = "invalid", Signer = signer, Sha256Match = shaMatch },

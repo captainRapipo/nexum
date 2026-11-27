@@ -81,6 +81,29 @@ internal sealed class FrameMonitor
         lock (_lock) EmitSessionLocked();
     }
 
+    /// <summary>
+    /// Agent start (elevated only): removes a <c>NexumFrames</c> ETW session left by a hard-killed agent, so it does
+    /// not hold kernel buffers until reboot when frame capture stays off. Queued before any frames command.
+    /// </summary>
+    public void CleanupAtStart()
+    {
+        if (!_isAdmin) return;
+        Post(() =>
+        {
+            lock (_lock)
+            {
+                if (_shuttingDown || _enabled || _child is not null) return;
+            }
+            EtwSession.StopIfPresent(_log, "agent start");
+        });
+    }
+
+    /// <summary>Fallback after a stop or a final failure: ends the fixed-name session if the terminate call could not.</summary>
+    private void StopLeftoverSession(string reason)
+    {
+        if (_isAdmin) EtwSession.StopIfPresent(_log, reason);
+    }
+
     /// <summary>{cmd:"frames", enabled}. The ack is written when the start/stop has finished.</summary>
     public void SetEnabled(bool enabled)
     {
@@ -220,6 +243,7 @@ internal sealed class FrameMonitor
     private (bool Ok, string Message) SpawnCapture(int gen, bool restart)
     {
         using var trust = PresentMonTrust.Check(_exePath);
+        string? trustFailed = null;
         lock (_lock)
         {
             if (_shuttingDown || gen != _generation || !_enabled) return (false, "Frame capture was turned off");
@@ -231,8 +255,14 @@ internal sealed class FrameMonitor
                 string msg = trust.Code == "exeMissing" ? MsgExeMissing : MsgSignatureInvalid;
                 SetStateLocked("error", trust.Code ?? "signatureInvalid", msg, null);
                 ClearTargetLocked();
-                return (false, msg);
+                trustFailed = msg;
             }
+        }
+        if (trustFailed is not null)
+        {
+            // The terminate call cannot run with an untrusted exe either; a session left by a crashed child goes here.
+            StopLeftoverSession("trust check failed");
+            return (false, trustFailed);
         }
 
         PresentMonProcess child;
@@ -256,6 +286,7 @@ internal sealed class FrameMonitor
                 SetStateLocked("error", "spawnFailed", msg, null);
                 ClearTargetLocked();
             }
+            StopLeftoverSession("PresentMon could not be started");
             return (false, msg);
         }
 
@@ -323,6 +354,7 @@ internal sealed class FrameMonitor
                 SafeWait(child, 1000);
             }
         }
+        StopLeftoverSession("after stop");
     }
 
     /// <summary>Spawns "--terminate_existing_session --session_name NexumFrames" after the trust check; waits ≤ waitMs.</summary>
@@ -395,6 +427,9 @@ internal sealed class FrameMonitor
             if (alive) PresentMonProcess.TerminateAll();
             term?.Dispose();
         }
+        // The terminate call may have been cut short by the budget (or skipped): stopping the fixed-name session
+        // directly takes milliseconds and needs no process.
+        StopLeftoverSession("shutdown");
     }
 
     // =============================================================================================
@@ -510,6 +545,7 @@ internal sealed class FrameMonitor
 
     private void ChildExitedOp(PresentMonProcess child, int gen, uint? exitCode)
     {
+        bool gaveUp = false;
         try
         {
             lock (_lock)
@@ -529,6 +565,7 @@ internal sealed class FrameMonitor
                     _generation++;
                     SetStateLocked("error", "exited", $"PresentMon stopped unexpectedly (exit code {code}).", null);
                     ClearTargetLocked();
+                    gaveUp = true;
                     return;
                 }
                 ScheduleRestartLocked(gen);
@@ -537,6 +574,7 @@ internal sealed class FrameMonitor
         finally
         {
             child.Dispose();
+            if (gaveUp) StopLeftoverSession("PresentMon stopped unexpectedly");
         }
     }
 

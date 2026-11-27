@@ -214,6 +214,41 @@ internal static class FrameSelfTest
         Eq("buf.badHeader", fresh.AcceptHeader("Application,MsBetweenAppStart"), "ProcessID");
         Check("buf.badHeaderNoRows", !fresh.HeaderParsed && !fresh.Ingest(RealRow, now));
 
+        // ---------------------------------------------------------------- hostile process names and stream abuse
+        var hostile = new FrameCsv();
+        hostile.ResolveHeader(header);
+        string[] hostileRows =
+        {
+            RealRow.Replace("Game.exe,", "Ga,me.exe,"),               // a comma in the name shifts every column: rejected
+            RealRow.Replace("Game.exe,", "\"Ga,me.exe\","),           // quoted (RFC 4180 style): still rejected, never unquoted
+            RealRow.Replace("Game.exe,", "x,0,0,0,0,0,0,0,0,0,0,"),   // a name forging extra columns
+            string.Join(",", Enumerable.Repeat("1", FrameCsv.MaxColumns + 10)),
+            RealRow.Replace(",34752,", ",99999999999,"),              // pid overflow
+            RealRow.Replace(",103.1058,", ",1e309,"),                 // frametime overflow: not finite
+        };
+        for (int i = 0; i < hostileRows.Length; i++) Check($"row.hostile{i}", !hostile.TryParseRow(hostileRows[i], 1.0, out _, out _), hostileRows[i]);
+        Check("row.hostile.quoteKept", hostile.TryParseRow(RealRow.Replace("Game.exe,", "\"Game\".exe,"), 1.0, out _, out var quoted) &&
+                                       quoted.ToString() == "\"Game\".exe");
+        Check("row.hostile.unicode", hostile.TryParseRow(RealRow.Replace("Game.exe,", "Игра 游戏.exe,"), 1.0, out _, out var uni) &&
+                                     uni.ToString() == "Игра 游戏.exe");
+
+        // A runaway line (no newline for > 16 K chars) is dropped up to its newline; the next line survives.
+        var runaway = Encoding.UTF8.GetBytes(header + "\n" + new string('x', 40_000) + "\n" + RealRow + "\n");
+        var runLines = new List<string>();
+        new LineDecoder(new TrickleStream(runaway, 4096)).Run(batch => batch.ForEach(l => runLines.Add(l.ToString())));
+        Check("decode.runawayDropped", runLines.Count == 2 && runLines[0] == header && runLines[1] == RealRow,
+            string.Join("|", runLines.Select(l => l.Length)));
+
+        // Process cap: buffers stay bounded however many processes present.
+        var many = new FrameBuffers();
+        many.AcceptHeader(header);
+        for (int p = 1; p <= FrameBuffers.MaxTracks + 20; p++) many.Ingest(Row($"App{p}.exe", 1000 + p, 1, now, 5), now);
+        Eq("buf.trackCap", many.Tracks.Count, FrameBuffers.MaxTracks);
+        Check("buf.trackCapExisting", many.Ingest(Row("App1.exe", 1001, 1, now + 5, 5), now + 5) &&
+                                      !many.Ingest(Row("Late.exe", 9999, 1, now + 5, 5), now + 5));
+        many.Maintain(now + FrameBuffers.EvictMs + 10, 30);
+        Check("buf.trackCapFreed", many.Tracks.Count == 0 && many.Ingest(Row("Late.exe", 9999, 1, now + 20_000, 5), now + 20_000));
+
         // ---------------------------------------------------------------- excludes (same rule as Rust §2.13)
         var ex = FrameExcludes.Sanitize(new[]
         {
@@ -256,7 +291,31 @@ internal static class FrameSelfTest
             using var real = PresentMonTrust.Check(presentMonPath);
             Check("trust.pinnedValid", real.Ok && real.Signature.Status == "valid" && real.Signature.Signer == "Intel Corporation" &&
                                        real.Signature.Sha256Match == true && real.Handle is { IsInvalid: false }, real.Detail);
+            Check("trust.finalPath", real.FinalPath.Length > 0 && PresentMonTrust.IsAcceptablePath(real.FinalPath) &&
+                                     string.Equals(Path.GetFileName(real.FinalPath), Path.GetFileName(presentMonPath), StringComparison.OrdinalIgnoreCase),
+                real.FinalPath);
         }
+
+        // Final path normalization (GetFinalPathNameByHandle output → the path the process is created from).
+        Eq("final.dos", PresentMonTrust.NormalizeFinalPath(@"\\?\C:\Program Files\Nexum\presentmon\PresentMon-2.6.0-x64.exe"),
+            @"C:\Program Files\Nexum\presentmon\PresentMon-2.6.0-x64.exe");
+        Eq("final.plain", PresentMonTrust.NormalizeFinalPath(@"D:\x\p.exe"), @"D:\x\p.exe");
+        Eq("final.unc", PresentMonTrust.NormalizeFinalPath(@"\\?\UNC\server\share\p.exe"), (string?)null);
+        Eq("final.volumeGuid", PresentMonTrust.NormalizeFinalPath(@"\\?\Volume{0b9c1b4e-0000-0000-0000-100000000000}\p.exe"), (string?)null);
+        Eq("final.notExe", PresentMonTrust.NormalizeFinalPath(@"\\?\C:\x\p.dll"), (string?)null);
+        Eq("final.empty", PresentMonTrust.NormalizeFinalPath(""), (string?)null);
+        Eq("final.null", PresentMonTrust.NormalizeFinalPath(null), (string?)null);
+        // Child image-load mitigations (winbase.h values): no remote images, no low-label images, System32 first.
+        Eq("spawn.mitigations", FrameNative.ChildMitigations, 0x1110_0000_0000_0000UL);
+
+        // ETW stop buffer (evntrace.h EVENT_TRACE_PROPERTIES, x64): BufferSize first, the name offsets after the struct.
+        var etp = EtwSession.BuildProperties();
+        uint logFileAt = BitConverter.ToUInt32(etp, FrameNative.EtpLogFileNameOffsetAt);
+        Check("etw.props", BitConverter.ToUInt32(etp, 0) == etp.Length &&
+                           BitConverter.ToUInt32(etp, FrameNative.EtpLoggerNameOffsetAt) == FrameNative.EventTracePropertiesSize &&
+                           logFileAt >= FrameNative.EventTracePropertiesSize + 2 * 1024 && logFileAt + 2 * 1024 <= etp.Length &&
+                           etp.Skip(FrameNative.EventTracePropertiesSize).All(b => b == 0), etp.Length.ToString());
+        Eq("etw.sessionName", PresentMonTrust.SessionName, "NexumFrames");
 
         // ---------------------------------------------------------------- wire shapes
         string session = Program.Serialize(new FrameSessionMessage { SinceTs = 5 });

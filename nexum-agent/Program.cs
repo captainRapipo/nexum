@@ -141,6 +141,7 @@ internal static class Program
         _fans = new FanController();
         _safety = new FanSafety(_fans, IsAdmin, fanFlag);
         _frames = new FrameMonitor(presentMonPath, IsAdmin, Emit, Ack, Log);
+        _frames.CleanupAtStart(); // a NexumFrames ETW session orphaned by a hard-killed agent (elevated only, no spawn)
 
         // Read stdin right away so 'shutdown' / EOF are honoured during the (slow) hardware open.
         // Every other command waits until 'hello' has been written (causal order).

@@ -5,9 +5,11 @@ using Microsoft.Win32.SafeHandles;
 namespace NexumAgent.Frames;
 
 /// <summary>
-/// One PresentMon child of this agent (CONTRACT §1.6.2). Started suspended with an explicit application
-/// name, only the listed std handles inherited, placed in the agent's kill-on-close Job Object before
-/// its first instruction runs, then resumed at below-normal priority.
+/// One PresentMon child of this agent (CONTRACT §1.6.2). Started suspended from the verified file's resolved
+/// path (<see cref="PresentMonTrust.Result.FinalPath"/>) with only the listed std handles inherited and the
+/// image-load mitigations (System32 first, no remote / low-label images); its image path is compared with the
+/// verified file before it runs; it is placed in the agent's kill-on-close Job Object before its first
+/// instruction runs, then resumed at below-normal priority.
 /// </summary>
 internal sealed class PresentMonProcess : IDisposable
 {
@@ -49,14 +51,18 @@ internal sealed class PresentMonProcess : IDisposable
     /// </summary>
     public static PresentMonProcess Start(PresentMonTrust.Result trusted, string[] args, bool captureOutput)
     {
-        if (!trusted.Ok || trusted.Handle is null || trusted.Handle.IsInvalid) throw new InvalidOperationException("untrusted executable");
-        string exe = trusted.Path;
+        if (!trusted.Ok || trusted.Handle is null || trusted.Handle.IsInvalid || trusted.FinalPath.Length == 0)
+        {
+            throw new InvalidOperationException("untrusted executable");
+        }
+        // The verified file's resolved path (no junction / link left to swap), not the path Rust passed.
+        string exe = trusted.FinalPath;
         string dir = System.IO.Path.GetDirectoryName(exe) ?? throw new InvalidOperationException("no directory");
         IntPtr job = EnsureJob();
 
         var created = new List<IntPtr>(); // every handle this method owns; closed in finally unless handed over
         IntPtr outRead = IntPtr.Zero, outWrite = IntPtr.Zero, errRead = IntPtr.Zero, errWrite = IntPtr.Zero, nul = IntPtr.Zero;
-        IntPtr attrList = IntPtr.Zero, handleArray = IntPtr.Zero, cmdLine = IntPtr.Zero;
+        IntPtr attrList = IntPtr.Zero, handleArray = IntPtr.Zero, cmdLine = IntPtr.Zero, mitigation = IntPtr.Zero;
         var pi = default(FrameNative.PROCESS_INFORMATION);
         bool processCreated = false, success = false;
         try
@@ -90,9 +96,9 @@ internal sealed class PresentMonProcess : IDisposable
             if (!inherit.Contains(childErr)) inherit.Add(childErr);
 
             IntPtr size = IntPtr.Zero;
-            FrameNative.InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+            FrameNative.InitializeProcThreadAttributeList(IntPtr.Zero, 2, 0, ref size);
             attrList = Marshal.AllocHGlobal(size);
-            if (!FrameNative.InitializeProcThreadAttributeList(attrList, 1, 0, ref size))
+            if (!FrameNative.InitializeProcThreadAttributeList(attrList, 2, 0, ref size))
             {
                 Marshal.FreeHGlobal(attrList);
                 attrList = IntPtr.Zero;
@@ -102,6 +108,14 @@ internal sealed class PresentMonProcess : IDisposable
             for (int i = 0; i < inherit.Count; i++) Marshal.WriteIntPtr(handleArray, i * IntPtr.Size, inherit[i]);
             if (!FrameNative.UpdateProcThreadAttribute(attrList, 0, FrameNative.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handleArray,
                     (IntPtr)(IntPtr.Size * inherit.Count), IntPtr.Zero, IntPtr.Zero))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            // DLL planting next to the exe: imports resolve from System32 first; no remote / low-label images.
+            mitigation = Marshal.AllocHGlobal(sizeof(ulong));
+            Marshal.WriteInt64(mitigation, unchecked((long)FrameNative.ChildMitigations));
+            if (!FrameNative.UpdateProcThreadAttribute(attrList, 0, FrameNative.PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, mitigation,
+                    (IntPtr)sizeof(ulong), IntPtr.Zero, IntPtr.Zero))
             {
                 throw new Win32Exception(Marshal.GetLastWin32Error());
             }
@@ -122,6 +136,13 @@ internal sealed class PresentMonProcess : IDisposable
                 throw new Win32Exception(Marshal.GetLastWin32Error());
             }
             processCreated = true;
+
+            // The suspended child must be the file that was verified (belt and braces for the handle lock).
+            string? image = ImagePath(pi.hProcess);
+            if (image is null || !string.Equals(image, exe, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException($"the started image ({image ?? "unknown"}) is not the verified file");
+            }
 
             // Into the job before the first instruction runs; never run PresentMon outside it.
             if (!FrameNative.AssignProcessToJobObject(job, pi.hProcess)) throw new Win32Exception(Marshal.GetLastWin32Error());
@@ -159,8 +180,18 @@ internal sealed class PresentMonProcess : IDisposable
                 Marshal.FreeHGlobal(attrList);
             }
             if (handleArray != IntPtr.Zero) Marshal.FreeHGlobal(handleArray);
+            if (mitigation != IntPtr.Zero) Marshal.FreeHGlobal(mitigation);
             if (cmdLine != IntPtr.Zero) Marshal.FreeHGlobal(cmdLine);
         }
+    }
+
+    private static string? ImagePath(IntPtr process)
+    {
+        var buf = new char[1100];
+        uint len = (uint)buf.Length;
+        return FrameNative.QueryFullProcessImageName(process, 0, buf, ref len) && len > 0 && len < buf.Length
+            ? new string(buf, 0, (int)len)
+            : null;
     }
 
     internal static string BuildCommandLine(string exe, string[] args)

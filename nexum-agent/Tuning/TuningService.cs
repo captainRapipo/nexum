@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
@@ -12,8 +13,9 @@ namespace NexumAgent.Tuning;
 /// rejects <c>{cmd:"tuningProbe", write:true}</c> without calling into this class, and Rust rejects it before
 /// that (CONTRACT §1.7.2, §2.14).
 /// </para>
-/// One private ADL context per call, destroyed before returning; buffers ADL allocates through our callback
-/// (<see cref="Marshal.AllocCoTaskMem"/>) are freed with <see cref="Marshal.FreeCoTaskMem"/>.
+/// One private ADL context per call, destroyed before returning. Buffers ADL allocates through our callback are
+/// zeroed, size-tracked and freed by us; a list pointer that did not come from the callback is never read or freed,
+/// and a list is never read beyond the bytes the callback actually allocated.
 /// </summary>
 public static class TuningService
 {
@@ -24,7 +26,64 @@ public static class TuningService
     private static readonly SemaphoreSlim Session = new(1, 1);
 
     /// <summary>Kept alive for the whole process: ADL may call it during any call on a context created with it.</summary>
-    private static readonly AdlNative.AdlMainMallocCallback Alloc = size => size > 0 ? Marshal.AllocCoTaskMem(size) : IntPtr.Zero;
+    private static readonly AdlNative.AdlMainMallocCallback Alloc = AllocForAdl;
+
+    /// <summary>Every live callback allocation and its size in bytes.</summary>
+    private static readonly ConcurrentDictionary<IntPtr, int> Allocations = new();
+
+    /// <summary>Largest single callback allocation honoured (the OD8 lists are about 1.3 KB).</summary>
+    internal const int MaxCallbackBytes = 1 << 20;
+
+    private static readonly byte[] Zeros = new byte[4096];
+
+    /// <summary>
+    /// ADL_MAIN_MALLOC_CALLBACK. Runs on a native frame: it must never throw (an exception crossing back into the
+    /// driver would end the elevated agent), so every failure returns NULL, which ADL reports as an error code.
+    /// </summary>
+    internal static IntPtr AllocForAdl(int size)
+    {
+        IntPtr p = IntPtr.Zero;
+        try
+        {
+            if (size <= 0 || size > MaxCallbackBytes) return IntPtr.Zero;
+            p = Marshal.AllocCoTaskMem(size);
+            for (int off = 0; off < size; off += Zeros.Length)
+            {
+                Marshal.Copy(Zeros, 0, p + off, Math.Min(Zeros.Length, size - off));
+            }
+            Allocations[p] = size;
+            return p;
+        }
+        catch
+        {
+            if (p != IntPtr.Zero)
+            {
+                try { Marshal.FreeCoTaskMem(p); } catch { /* ignore */ }
+            }
+            return IntPtr.Zero;
+        }
+    }
+
+    /// <summary>Bytes the callback allocated at <paramref name="p"/>, or -1 when it did not come from the callback.</summary>
+    internal static int AllocatedBytes(IntPtr p) => p != IntPtr.Zero && Allocations.TryGetValue(p, out int n) ? n : -1;
+
+    /// <summary>Frees a callback allocation. A pointer the callback did not hand out is left alone (never freed with the wrong allocator).</summary>
+    internal static bool FreeAdl(IntPtr p)
+    {
+        if (p == IntPtr.Zero || !Allocations.TryRemove(p, out _)) return false;
+        Marshal.FreeCoTaskMem(p);
+        return true;
+    }
+
+    /// <summary>
+    /// Entries that may be read from a driver-returned list: the reported count, capped by <paramref name="max"/> and
+    /// by the bytes actually allocated. 0 when the list did not come from our callback. Pure (self-tested).
+    /// </summary>
+    internal static int ReadableEntries(int reportedCount, int allocatedBytes, int entrySize, int max)
+    {
+        if (reportedCount <= 0 || allocatedBytes <= 0 || entrySize <= 0) return 0;
+        return Math.Min(Math.Min(reportedCount, max), allocatedBytes / entrySize);
+    }
 
     private const int AmdVendorId = 0x1002;
 
@@ -371,7 +430,15 @@ public static class TuningService
                     report?.Errors.Add($"ADL2_Overdrive8_Init_SettingX2_Get returned {rc} ({count} features).");
                     return (rc != AdlNative.ADL_OK ? rc : -1, caps, null);
                 }
-                count = Math.Min(count, MaxFeatures);
+                int allocated = AllocatedBytes(list);
+                if (allocated < 0)
+                {
+                    report?.Errors.Add("ADL2_Overdrive8_Init_SettingX2_Get returned a list that Nexum did not allocate; it was not read.");
+                    list = IntPtr.Zero; // never freed with the wrong allocator
+                    return (-1, caps, null);
+                }
+                count = ReadableEntries(count, allocated, AdlNative.SingleInitSettingSize, MaxFeatures);
+                if (count == 0) return (-1, caps, null);
                 var table = new AdlNative.ADLOD8SingleInitSetting[count];
                 for (int i = 0; i < count; i++)
                 {
@@ -381,7 +448,7 @@ public static class TuningService
             }
             finally
             {
-                if (list != IntPtr.Zero) Marshal.FreeCoTaskMem(list);
+                FreeAdl(list);
             }
         }
         catch (EntryPointNotFoundException)
@@ -440,14 +507,22 @@ public static class TuningService
                     report?.Errors.Add($"ADL2_Overdrive8_Current_SettingX2_Get returned {rc} ({count} features).");
                     return (rc != AdlNative.ADL_OK ? rc : -1, null);
                 }
-                count = Math.Min(count, MaxFeatures);
+                int allocated = AllocatedBytes(list);
+                if (allocated < 0)
+                {
+                    report?.Errors.Add("ADL2_Overdrive8_Current_SettingX2_Get returned a list that Nexum did not allocate; it was not read.");
+                    list = IntPtr.Zero; // never freed with the wrong allocator
+                    return (-1, null);
+                }
+                count = ReadableEntries(count, allocated, sizeof(int), MaxFeatures);
+                if (count == 0) return (-1, null);
                 var table = new int[count];
                 Marshal.Copy(list, table, 0, count);
                 return (rc, table);
             }
             finally
             {
-                if (list != IntPtr.Zero) Marshal.FreeCoTaskMem(list);
+                FreeAdl(list);
             }
         }
         catch (EntryPointNotFoundException)

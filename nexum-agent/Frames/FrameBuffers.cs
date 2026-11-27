@@ -92,6 +92,12 @@ internal sealed class FrameBuffers
     public const double TargetKeepMs = 5000;
     public const double EvictMs = 10000;
     public const int FrametimeBatchMax = 1000;
+    /// <summary>
+    /// Upper bound on buffered processes. Each ring may grow to <see cref="PidTrack.MaxCapacity"/> rows (16 MiB), so
+    /// many presenting processes (hostile or not) could otherwise grow the elevated agent without limit. A new
+    /// process beyond the cap is ignored until silent ones are evicted (10 s).
+    /// </summary>
+    public const int MaxTracks = 64;
 
     public FrameCsv Csv { get; } = new();
     public bool HeaderParsed { get; private set; }
@@ -131,6 +137,7 @@ internal sealed class FrameBuffers
 
         if (!Tracks.TryGetValue(row.Pid, out var track))
         {
+            if (Tracks.Count >= MaxTracks) return false;
             track = new PidTrack(row.Pid, process.ToString());
             Tracks[row.Pid] = track;
         }

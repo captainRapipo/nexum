@@ -51,6 +51,19 @@ internal static class FrameNative
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool GetFileInformationByHandle(SafeFileHandle hFile, out BY_HANDLE_FILE_INFORMATION info);
 
+    /// <summary>FILE_NAME_NORMALIZED | VOLUME_NAME_DOS: every junction / symbolic link on the way resolved.</summary>
+    public const uint FILE_NAME_NORMALIZED_DOS = 0;
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "GetFinalPathNameByHandleW")]
+    public static extern uint GetFinalPathNameByHandle(SafeFileHandle hFile, char[] lpszFilePath, uint cchFilePath, uint dwFlags);
+
+    public const uint DRIVE_UNKNOWN = 0;
+    public const uint DRIVE_NO_ROOT_DIR = 1;
+    public const uint DRIVE_REMOTE = 4;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetDriveTypeW")]
+    public static extern uint GetDriveType(string lpRootPathName);
+
     // ------------------------------------------------------------------------------------------
     // Processes, pipes and the job object (own children only)
 
@@ -62,6 +75,16 @@ internal static class FrameNative
     public const int STARTF_USESTDHANDLES = 0x00000100;
     public const uint HANDLE_FLAG_INHERIT = 0x1;
     public static readonly IntPtr PROC_THREAD_ATTRIBUTE_HANDLE_LIST = (IntPtr)0x00020002;
+    public static readonly IntPtr PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY = (IntPtr)0x00020007;
+
+    // winbase.h PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_* (Windows 10 1511+): the child resolves its DLL
+    // imports from System32 before its own folder, and never maps an image from a network share or a
+    // low-integrity file.
+    public const ulong MITIGATION_IMAGE_LOAD_NO_REMOTE_ALWAYS_ON = 1UL << 52;
+    public const ulong MITIGATION_IMAGE_LOAD_NO_LOW_LABEL_ALWAYS_ON = 1UL << 56;
+    public const ulong MITIGATION_IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON = 1UL << 60;
+    public const ulong ChildMitigations =
+        MITIGATION_IMAGE_LOAD_NO_REMOTE_ALWAYS_ON | MITIGATION_IMAGE_LOAD_NO_LOW_LABEL_ALWAYS_ON | MITIGATION_IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON;
     public const uint WAIT_OBJECT_0 = 0;
     public const uint WAIT_TIMEOUT = 0x102;
     public const uint STILL_ACTIVE = 259;
@@ -158,6 +181,25 @@ internal static class FrameNative
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool GetExitCodeProcess(SafeProcessHandle hProcess, out uint lpExitCode);
+
+    /// <summary>Image path of Nexum's own (still suspended) child; Win32 path form (flags 0).</summary>
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "QueryFullProcessImageNameW")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool QueryFullProcessImageName(IntPtr hProcess, uint dwFlags, char[] lpExeName, ref uint lpdwSize);
+
+    // ------------------------------------------------------------------------------------------
+    // ETW session control (Nexum's own fixed-name session only, CONTRACT §1.6.6)
+
+    public const uint EVENT_TRACE_CONTROL_STOP = 1;
+    public const uint ERROR_WMI_INSTANCE_NOT_FOUND = 4201;
+
+    /// <summary>sizeof(EVENT_TRACE_PROPERTIES) on x64 (evntrace.h): WNODE_HEADER 48 + 14 ULONGs + HANDLE + 2 offsets.</summary>
+    public const int EventTracePropertiesSize = 120;
+    public const int EtpLogFileNameOffsetAt = 112;
+    public const int EtpLoggerNameOffsetAt = 116;
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "ControlTraceW")]
+    public static extern uint ControlTrace(ulong traceHandle, string instanceName, byte[] properties, uint controlCode);
 
     public const int JobObjectExtendedLimitInformation = 9;
     public const uint JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION = 0x00000400;

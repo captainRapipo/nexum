@@ -19,8 +19,10 @@
     * frames enabled:true -> starting/running with signature valid, Intel signer, hash match;
     * the agent is killed; the PresentMon child must die with it (Job Object
       KILL_ON_JOB_CLOSE). The ETW session may be orphaned here, on purpose.
+  Run 2b (--presentmon), frames never enabled, only when run 2 left an orphaned session:
+    * the elevated agent removes the orphan at start (ControlTraceW stop) without spawning PresentMon.
   Run 3 (--presentmon), graceful:
-    * frames enabled:true (cleans the orphan via --stop_existing_session), then
+    * frames enabled:true (--stop_existing_session cleans any leftover), then
       frames enabled:false -> ack "Frame capture stopped" + frameSession stopped;
     * shutdown -> exit 0, no PresentMon process left, and 'logman query -ets' shows no
       NexumFrames session (ROADMAP §4.3 gate 3).
@@ -185,7 +187,23 @@ if (-not $h -or -not $isAdmin) {
       Fail "PresentMon survived a hard kill of the agent (Job Object KILL_ON_JOB_CLOSE missing): pid $($left.Id -join ', ')"
       $left | Stop-Process -Force -ErrorAction SilentlyContinue
     }
-    Write-Host "ETW session NexumFrames after the hard kill: $(if (Test-EtwSession) { 'present (orphan, expected; run 3 must clean it)' } else { 'gone' })"
+    Write-Host "ETW session NexumFrames after the hard kill: $(if (Test-EtwSession) { 'present (orphan, expected; run 2b must clean it)' } else { 'gone' })"
+  }
+
+  # ------------------------------------------------------------ run 2b
+  # An elevated agent start with frame capture left off must remove the orphan itself (ControlTraceW stop,
+  # CONTRACT §1.6.6), without starting PresentMon.
+  if ($started -and (Test-EtwSession)) {
+    Write-Host "=== run 2b: --presentmon, frames never enabled, orphaned session from run 2 ==="
+    $a = Start-Agent @('--presentmon', $PresentMon)
+    if (Test-Hello $a) {
+      $sw = [System.Diagnostics.Stopwatch]::StartNew()
+      while ((Test-EtwSession) -and $sw.Elapsed.TotalSeconds -lt 15) { Start-Sleep -Milliseconds 500 }
+      if (Test-EtwSession) { Fail "the orphaned NexumFrames session survived an elevated agent start (CONTRACT §1.6.6 leftover session fallback)" }
+      else { Write-Host "orphaned NexumFrames session removed at agent start" }
+      if (Get-PresentMonProcs) { Fail "PresentMon is running although frame capture was never enabled in run 2b" }
+    }
+    Stop-Agent $a
   }
 
   # ------------------------------------------------------------ run 3
