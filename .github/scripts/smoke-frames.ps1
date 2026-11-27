@@ -204,7 +204,9 @@ if (-not $h -or -not $isAdmin) {
     }
     $st = $null
     if ($a.Lines.Count -gt $mark) {
-      $st = @($a.Lines)[$mark..($a.Lines.Count - 1)] | Where-Object { $_.type -eq 'frameSession' -and $_.state -eq 'stopped' } | Select-Object -Last 1
+      # GetRange, not @($a.Lines)[$mark..$n]: slicing a List[object] of PSCustomObjects
+      # throws "Argument types do not match" in PowerShell 7.
+      $st = $a.Lines.GetRange($mark, $a.Lines.Count - $mark) | Where-Object { $_.type -eq 'frameSession' -and $_.state -eq 'stopped' } | Select-Object -Last 1
     }
     if (-not $st) { $st = Wait-Line $a { param($o) $o.type -eq 'frameSession' -and $o.state -eq 'stopped' } 10 }
     if (-not $st) { Fail "no frameSession stopped after frames enabled:false" }
