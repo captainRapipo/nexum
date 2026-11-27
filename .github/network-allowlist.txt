@@ -1,0 +1,14 @@
+# MF-11 network allow-list (read by .github/scripts/check-network.mjs).
+#
+# Nexum has no network code: no telemetry, no analytics, no update checks, no
+# localhost listeners. CI fails on any network-client API in src-tauri/src/**,
+# nexum-agent/**/*.cs and src-frontend/** (reqwest, ureq, hyper, HttpClient,
+# WebClient, HttpWebRequest, TcpClient, TcpListener, TcpStream, UdpClient,
+# UdpSocket, HttpListener, WebSocket, XMLHttpRequest, EventSource(, sendBeacon,
+# fetch(, axios) unless the exact line is listed here.
+#
+# Format: one entry per line, "<repo-relative path>:<line number>", followed by a
+# comment saying why the use is not network traffic or who approved it, e.g.
+#   src-frontend/lib/example.ts:12   # reads a bundled asset via fetch("/x.json"); approved in PR #NN
+#
+# An entry needs the maintainer's approval in review. Keep this list empty.

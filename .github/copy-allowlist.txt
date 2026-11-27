@@ -1,0 +1,11 @@
+# Copy-rules allow-list (read by .github/scripts/check-copy.mjs, CONTRACT §4.8 / §7.4).
+#
+# Banned in user-visible text (case-insensitive, whole word): boost, optimize/optimise,
+# speed up, free RAM, junk, trash, purge (as a button/CTA or heading), deep purge,
+# outdated. Identifiers in code are exempt automatically.
+#
+# Format, one entry per line, followed by a comment saying why it is acceptable:
+#   <repo-relative path>:<line>           allow every banned word on that line
+#   <repo-relative path>:<line>:<word>    allow one banned word on that line
+# Example:
+#   src-frontend/components/system/CpuTab.tsx:40:boost   # AMD "Precision Boost" is a CPU feature name

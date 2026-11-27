@@ -1,5 +1,14 @@
 # Nexum: BIOS-Style PC Telemetry, Driver & Optimization System
 
+> **Historical document.** This is the original design spec, kept for reference. The current plan and the v1.0 release gate are in [`ROADMAP.md`](ROADMAP.md), and the authoritative interfaces are in [`CONTRACT.md`](../CONTRACT.md). Where this spec disagrees with either of them, they win. In particular:
+>
+> * Nexum never uses or ships the WinRing0 driver. Sensor access goes through the separately installed, vendor-signed [PawnIO](https://pawnio.eu/) driver (ROADMAP MF-3).
+> * The RAM standby-list flush has been removed (ROADMAP C5).
+> * The cleaner is "Clean caches" with conservative defaults and no "trash"/"purge" wording (ROADMAP MF-4).
+> * IPC is stdio only: no localhost port and no WebSocket (ROADMAP C3, C6).
+> * The keymap is F1 Dashboard · F2 Sensors · F3 System · F4 Storage · F5 Rescan · F6 Cooling · F7 Drivers · F9 Clean caches (ROADMAP C2).
+> * §9 "Future V2 Enhancements" is superseded by ROADMAP §3.
+
 **Project Name:** Nexum (`Nexum.exe`)
 **Project Type:** Native Windows Desktop System Monitoring & Maintenance Suite (Windows 10/11)
 **Design Language:** Dark Glassmorphic Telemetry HUD (Inspired by Modern UEFI/BIOS, Animus-Style Precision & Executive Analytics Dashboards)
@@ -93,7 +102,7 @@ To compile **Nexum** into a fast, native `.exe` (~15–30 MB) while keeping the 
 | **Data Visualization** | **Apache ECharts** or **Recharts** | Handles smooth 60 FPS stacked bar/area telemetry charts, radial gauges, and custom dark tooltips. |
 | **Hardware Telemetry Engine** | **LibreHardwareMonitorLib (C# .NET 8 Sidecar)** | The gold standard open-source library for reading Windows CPU/GPU loads, VRAM, motherboard Super I/O fan RPMs, and temps. |
 | **OS & Driver Queries** | **Windows WMI / CIM, PowerShell / Win32 API** | Native, zero-dependency access to all drivers (`Win32_PnPSignedDriver`), BIOS (`Win32_BIOS`), and disk space (`Win32_LogicalDisk`). |
-| **IPC / Live Stream** | **Localhost Stdout / WebSocket JSON** | Streams telemetry packets from the bundled hardware sidecar to the UI every $1000\text{ ms}$ (configurable). |
+| **IPC / Live Stream** | **NDJSON over stdio** (no localhost port, no WebSocket) | Streams telemetry packets from the bundled hardware sidecar to the Rust core every $1000\text{ ms}$ (configurable); the UI receives them as Tauri events. See [`CONTRACT.md`](../CONTRACT.md). |
 
 ### High-Level System Architecture
 
@@ -184,7 +193,7 @@ Before compiling `Nexum.exe`, install the following free developer tools on your
 1. **Run the Installer:** Double-click `Nexum_1.0.0_x64-setup.exe`.
    * *Note on Windows Defender SmartScreen:* Because a personal build is not signed with a paid EV Code Signing Certificate, Windows SmartScreen may show *"Windows protected your PC"* on the first run. Click **More info → Run anyway** (or create a local self-signed certificate and trust it on your own machine).
 2. **Choose Install Directory:** Installs cleanly to `C:\Program Files\Nexum\` along with an automatic uninstaller in Windows **Installed Apps**.
-3. **First Launch & UAC Prompt:** Accept the Administrator UAC prompt so Nexum can initialize the hardware sensor drivers (`WinRing0` / `LibreHardwareMonitor`) and scan your BIOS/drivers.
+3. **First Launch & UAC Prompt:** Accept the Administrator UAC prompt so Nexum can read hardware sensors through `LibreHardwareMonitorLib` and scan your BIOS/drivers. Full sensor access (CPU temperature and power, Super I/O fan headers, fan control) also needs the vendor-signed **PawnIO** driver ≥ 2.1.0, installed separately from [pawnio.eu](https://pawnio.eu/) after a consent screen. Nexum never bundles or installs a kernel driver itself and never uses WinRing0 (CVE-2020-14979; ROADMAP MF-3).
 4. **Enable Background & Startup Mode:**
    * Inside Nexum Settings, toggle **"Launch Nexum on Windows Startup"** (implemented via Windows Task Scheduler with *"Run with highest privileges"* so it starts silently without a UAC popup every time you reboot).
    * Toggle **"Minimize to System Tray"** so Nexum monitors temperatures and fan speeds quietly in the background.
