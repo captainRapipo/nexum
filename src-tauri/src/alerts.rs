@@ -2214,12 +2214,13 @@ mod tests {
         };
         let all = notifiable_ids(Some(&snap), &[]);
         assert_eq!(all.len(), 2);
-        // D: is dismissed at its current severity after being held: it is never sent.
-        let ids = notifiable_ids(Some(&snap), &["space:D:crit".to_string()]);
+        // D: is dismissed at its current severity (`<id>:<state>`, id `space:D:`) after being
+        // held: it is never sent.
+        let ids = notifiable_ids(Some(&snap), &["space:D::crit".to_string()]);
         assert!(ids.contains("space:C:") && !ids.contains("space:D:"));
         // A dismissal of the other severity does not apply.
         assert_eq!(
-            notifiable_ids(Some(&snap), &["space:D:warn".to_string()]).len(),
+            notifiable_ids(Some(&snap), &["space:D::warn".to_string()]).len(),
             2
         );
         assert!(notifiable_ids(None, &[]).is_empty());
