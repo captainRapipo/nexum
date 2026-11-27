@@ -29,11 +29,16 @@ internal static class FanFlag
     private static readonly SecurityIdentifier AdminsSid = new(WellKnownSidType.BuiltinAdministratorsSid, null);
     private static readonly SecurityIdentifier UsersSid = new(WellKnownSidType.BuiltinUsersSid, null);
 
-    /// <summary>Rights that must never be granted to a non-admin SID on the state folder.</summary>
+    /// <summary>
+    /// Rights that must never be granted to a non-admin SID on the state folder. Includes the raw
+    /// GENERIC_ALL (0x10000000) and GENERIC_WRITE (0x40000000) bits, which an ACE can carry unmapped
+    /// and which <see cref="FileSystemRights"/> has no named member for.
+    /// </summary>
     private const FileSystemRights DangerousRights =
         FileSystemRights.WriteData | FileSystemRights.AppendData | FileSystemRights.WriteExtendedAttributes |
         FileSystemRights.WriteAttributes | FileSystemRights.Delete | FileSystemRights.DeleteSubdirectoriesAndFiles |
-        FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership;
+        FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership |
+        (FileSystemRights)0x10000000 | (FileSystemRights)0x40000000;
 
     public static string FolderPath =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "Nexum");
@@ -89,6 +94,36 @@ internal static class FanFlag
         try
         {
             if (!File.Exists(path) && !IsLink(path)) return FlagNone;
+        }
+        catch (Exception ex)
+        {
+            // Present but unreadable: same boot (safe side).
+            Program.Log($"Fan flag check failed: {ex.Message}");
+            return FlagInterrupted;
+        }
+
+        // Only a flag inside a folder this agent secured can come from Nexum: the agent writes the flag
+        // only after EnsureSecureFolder() made the folder admin-only, and a standard user cannot undo
+        // that. A flag in a folder that is a link, or that a non-admin controls, was planted (e.g. a
+        // standard user pre-created C:\ProgramData\Nexum before the first elevated run) and must not
+        // force fans to 100% (or, if corrupt, lock fan control on every boot).
+        if (elevated && FolderIsUntrusted(out var why))
+        {
+            Program.Log($"Ignoring a fan flag that Nexum did not write ({why})");
+            try
+            {
+                if (EnsureSecureFolder(out var err)) File.Delete(path);
+                else Program.Log($"Could not secure the Nexum state folder ({err}); fan control stays unavailable");
+            }
+            catch (Exception ex)
+            {
+                Program.Log($"Could not delete the untrusted fan flag: {ex.Message}");
+            }
+            return FlagNone;
+        }
+
+        try
+        {
             attrs = File.GetAttributes(path);
         }
         catch (Exception ex)
@@ -122,29 +157,95 @@ internal static class FanFlag
         }
         catch (Exception ex)
         {
+            // Corrupt counts as "same boot" (safe side), unless the file was last written before this
+            // boot began: then it cannot describe this boot, and treating it as interrupted would latch
+            // fans at 100% on every boot with no way out.
+            if (LastWriteBeforeCurrentBoot(path))
+            {
+                Program.Log($"Fan flag corrupt ({ex.Message}) but written before this boot; treating it as a previous boot");
+                if (elevated) DeleteSecured(path);
+                return FlagPreviousBoot;
+            }
             Program.Log($"Fan flag unreadable or corrupt ({ex.Message}); treating it as an interrupted session");
             return FlagInterrupted;
         }
 
-        if (IsSameBoot(bootId, bootTs, CurrentBootId(), CurrentBootTs()))
+        long? currentBootId = CurrentBootId();
+        bool sameBoot = IsSameBoot(bootId, bootTs, currentBootId, CurrentBootTs());
+        // An incomplete flag (no usable boot identity) is "same boot" by default; its write time can
+        // still prove it older than this boot (same reasoning as for a corrupt flag).
+        bool incomplete = !bootTs.HasValue && !(bootId.HasValue && currentBootId.HasValue);
+        if (sameBoot && incomplete && LastWriteBeforeCurrentBoot(path)) sameBoot = false;
+
+        if (sameBoot)
         {
             Program.Log("Fan flag from this boot found: fan control was interrupted");
             return FlagInterrupted;
         }
 
         Program.Log("Fan flag from a previous boot found");
-        if (elevated)
-        {
-            try
-            {
-                if (EnsureSecureFolder(out _)) File.Delete(path);
-            }
-            catch (Exception ex)
-            {
-                Program.Log($"Could not delete the previous-boot fan flag: {ex.Message}");
-            }
-        }
+        if (elevated) DeleteSecured(path);
         return FlagPreviousBoot;
+    }
+
+    private static void DeleteSecured(string path)
+    {
+        try
+        {
+            if (EnsureSecureFolder(out _)) File.Delete(path);
+        }
+        catch (Exception ex)
+        {
+            Program.Log($"Could not delete the previous-boot fan flag: {ex.Message}");
+        }
+    }
+
+    /// <summary>True when the flag's last-write time is clearly before the current boot started.</summary>
+    private static bool LastWriteBeforeCurrentBoot(string path)
+    {
+        try
+        {
+            var info = new FileInfo(path);
+            if ((info.Attributes & FileAttributes.ReparsePoint) != 0) return false;
+            long written = new DateTimeOffset(info.LastWriteTimeUtc).ToUnixTimeMilliseconds();
+            return written < CurrentBootTs() - SameBootToleranceMs;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Elevated start-up check: the state folder is a reparse point, or its owner/DACL is not the one
+    /// <see cref="EnsureSecureFolder"/> sets (so a non-admin could have written the flag).
+    /// </summary>
+    private static bool FolderIsUntrusted(out string why)
+    {
+        why = "";
+        try
+        {
+            var dir = new DirectoryInfo(FolderPath);
+            if (!dir.Exists) return false;
+            if ((dir.Attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                why = "state folder is a reparse point";
+                return true;
+            }
+            if (!IsCompliant(dir))
+            {
+                why = "state folder is not admin-only";
+                return true;
+            }
+            return false;
+        }
+        catch (Exception ex)
+        {
+            // Cannot even read the folder's security: an admin can always read an admin-only folder it
+            // secured, so this folder is not one Nexum secured.
+            why = $"state folder security unreadable: {ex.Message}";
+            return true;
+        }
     }
 
     private static bool IsLink(string path)

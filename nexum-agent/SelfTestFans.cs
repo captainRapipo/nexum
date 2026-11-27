@@ -261,8 +261,23 @@ internal static class SelfTestFans
         Check("failsafe.fanSetLocked", !lockedSet.Ok && lockedSet.Message == FanSafety.MsgLocked);
         s5.Evaluate(40, none);
         Check("failsafe.evalKeeps100", ctl5.SoftwareValue == 100);
+        // A write LHM dropped / another tool rewrote the register: the latch re-asserts 100% (forced,
+        // because LHM only writes on a value change).
+        int writesBefore = ctl5.Writes;
+        ((FakeSensor)ctl5.Sensor).Value = 30;
+        s5.Evaluate(40, none);
+        Check("failsafe.reasserts", ctl5.SoftwareValue == 100 && ctl5.Sensor.Value == 100 && ctl5.Writes == writesBefore + 2, $"writes {ctl5.Writes - writesBefore}");
+        s5.Evaluate(40, none);
+        Check("failsafe.noRewriteAt100", ctl5.Writes == writesBefore + 2);
+        Check("failsafe.gpuStillUntouched", gctl5.Writes == 0);
         s5.OnShutdown();
         Check("failsafe.noRestore", ctl5.ControlMode == ControlMode.Software && fsStore.Exists);
+
+        // LHM settings: fan controls start from 100% (never a 0% transient), mode keys untouched.
+        var lhmSettings = new AgentSettings();
+        Check("settings.controlValue100", lhmSettings.GetValue("/lpc/it8688e/0/control/0/control/value", "0") == "100");
+        Check("settings.modeDefault", lhmSettings.GetValue("/lpc/it8688e/0/control/0/control/mode", "0") == "0");
+        Check("settings.otherDefault", lhmSettings.GetValue("/lpc/it8688e/0/temperature/0/values", "x") == "x");
 
         // Non-elevated agent with an interrupted flag: reports it, cannot force fans.
         var s6 = new FanSafety(new FanController(), elevated: false, FanFlag.FlagInterrupted, new MemoryFlagStore());

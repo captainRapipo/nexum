@@ -263,7 +263,15 @@ internal sealed class FanSafety
     public void Evaluate(double? cpuTemp, IReadOnlyDictionary<string, (double? Hotspot, double? Edge)> gpuTemps)
     {
         _lastEvalMs = Environment.TickCount64;
-        if (!_elevated || _failsafe) return;
+        if (!_elevated) return;
+        if (_failsafe)
+        {
+            // Keep the latch true: re-assert 100% on any control that reads back lower (a write LHM
+            // dropped, or another tool rewrote the register).
+            var (_, errors) = _fans.ForceAll(100f, onlyIfBelow: true);
+            if (errors.Count > 0) Program.LogThrottled("failsafe-reassert", $"Failsafe: {errors.Count} fan(s) could not be set to 100%: {string.Join("; ", errors)}");
+            return;
+        }
         if (!_fans.HasTouched)
         {
             if (OverrideActive) ResetOverride("no manual fans");

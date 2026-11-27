@@ -38,7 +38,7 @@ internal sealed class TelemetryService : IDisposable
 
     public TelemetryService()
     {
-        _computer = new Computer
+        _computer = new Computer(new AgentSettings())
         {
             IsCpuEnabled = true,
             IsGpuEnabled = true,
@@ -428,17 +428,34 @@ internal sealed class TelemetryService : IDisposable
 
     // ---------------------------------------------------------------------------------------------
 
-    /// <summary>Closes the LHM Computer (unloads the driver). Caller restores fans first.</summary>
-    public void Close()
+    /// <summary>
+    /// Closes the LHM Computer (unloads the driver). Caller restores fans first.
+    /// <para>
+    /// LHM's <c>SuperIOHardware.Close()</c> writes every fan control back to the register values this
+    /// <b>process</b> captured before its first write. With <paramref name="restoreFans"/> false
+    /// (failsafe, CONTRACT §1.5.4) those "defaults" are the stale manual duty left by a killed agent, so
+    /// the Computer is not closed at all: the fans stay latched at 100% and the OS releases the driver
+    /// handles at process exit.
+    /// </para>
+    /// </summary>
+    public void Close(bool restoreFans = true)
     {
         if (_closed) return;
         _closed = true;
         _windowsDisks.Dispose();
-        if (_opened)
+        if (!_opened) return;
+        if (!restoreFans)
         {
-            try { _computer.Close(); }
-            catch (Exception ex) { Program.Log($"Computer.Close failed: {ex.Message}"); }
+            Program.Log("Failsafe: leaving the hardware open so LHM does not restore stale fan values");
+            return;
         }
+        try
+        {
+            // Second chance for any restore LHM dropped (see IsaBusGuard).
+            using var isa = IsaBusGuard.Acquire();
+            _computer.Close();
+        }
+        catch (Exception ex) { Program.Log($"Computer.Close failed: {ex.Message}"); }
     }
 
     public void Dispose() => Close();

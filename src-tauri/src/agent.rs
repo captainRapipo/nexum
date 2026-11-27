@@ -23,9 +23,10 @@ const SIDECAR_NAME: &str = "nexum-agent";
 const MAX_RESTARTS: usize = 5;
 const RESTART_WINDOW: Duration = Duration::from_secs(60);
 // The sidecar restores BIOS fan control before closing hardware, but may first have to
-// wait for an in-flight sensor tick to release its lock. A hard kill skips the restore,
-// so give it generous time.
-const SHUTDOWN_GRACE: Duration = Duration::from_millis(3000);
+// wait (up to 2 s, `ShutdownLockWaitMs` in Program.cs) for an in-flight sensor tick to release
+// its lock, then up to 1.5 s per restore for the shared ISA-bus mutex. A hard kill before the
+// restore leaves the fans at their manual duty, so the grace must exceed those waits.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(6000);
 const MAX_LINE_BUFFER: usize = 8 * 1024 * 1024;
 /// `hello.protocol` of an agent that implements CONTRACT 1.0.0-gate.
 pub const AGENT_PROTOCOL: u64 = 2;

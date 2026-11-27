@@ -283,14 +283,15 @@ Evaluated whenever `manualActive` is true, on every telemetry tick, and **at lea
 - **Content** (one JSON line, UTF-8): `{"v":1,"pid":1234,"bootTs":1764200000000,"bootId":null,"ts":1764230000000,"mode":"preset"|"fanSet"|"override"|"failsafe","agentVersion":"1.0.0"}`. `bootTs` = `now − Environment.TickCount64` (unix ms); `bootId` = DWORD `BootId` from `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters` if present, else null.
 - **Write-ahead:** before the first manual write of a session the agent writes the flag (`FileOptions.WriteThrough`, then flush). If the flag cannot be written, the manual write is refused (`ack ok:false`, `Fan control is unavailable: could not record the fan-control state`).
 - **Delete:** only after `SetDefault()` succeeded for every control the agent touched (auto preset or graceful shutdown).
-- **Check at agent start** (sets `hello.fanFlag`): flag absent → `"none"`. Flag present and *same boot* → `"interrupted"`. Flag present from another boot → delete it, `"previousBoot"`. Same boot = (`bootId` non-null in both and equal) or (`bootId` null in either and `|flag.bootTs − current bootTs| ≤ 120000`). An unreadable/corrupt flag counts as same boot. Non-elevated agents only read the flag (report `interrupted`/`previousBoot`, never delete, cannot force fans).
+- **Check at agent start** (sets `hello.fanFlag`): flag absent → `"none"`. Flag present and *same boot* → `"interrupted"`. Flag present from another boot → delete it, `"previousBoot"`. Same boot = (`bootId` non-null in both and equal) or (`bootId` null in either and `|flag.bootTs − current bootTs| ≤ 120000`). An unreadable/corrupt flag counts as same boot, unless its last-write time is more than 120 s before the current `bootTs` (then `previousBoot`). An elevated agent trusts a flag only inside a folder that already has the owner/DACL above: if the folder is a reparse point or not admin-only, the flag cannot have been written by Nexum (a standard user could have planted it), so the agent secures the folder, deletes the flag and reports `"none"`. Non-elevated agents only read the flag (report `interrupted`/`previousBoot`, never delete, cannot force fans).
 
 #### 1.5.4 Failsafe mode (agent)
 
 Entered at start when `fanFlag == "interrupted"` and the agent is elevated:
 - Writes 100% to every controllable control, rewrites the flag with `mode:"failsafe"`, sets `fanSafety.failsafe = overrideActive = manualActive = true`, `reason:"failsafe"`.
 - Latched until process exit. Every `fanPreset` (including `auto`) and `fanSet` → `ack ok:false`, message exactly `Fan control is locked at 100% after an interruption. Restart the PC to return fans to BIOS control.`
-- On `shutdown`/EOF in failsafe mode the agent does **not** call `SetDefault()` (it would restore the stale manual values captured at this process's init) and leaves the flag in place.
+- On `shutdown`/EOF in failsafe mode the agent does **not** call `SetDefault()` (it would restore the stale manual values captured at this process's init) and leaves the flag in place. It also does not close the LHM `Computer`, because LHM's `SuperIOHardware.Close()` writes those same stale values back.
+- While latched, every evaluation re-writes 100% to any control whose read-back is below 99%.
 
 Rationale: after a hard kill on boards like the IT8688E the original PWM registers and Gigabyte controller state exist only in the dead process (ROADMAP MF-13), so only a reboot restores BIOS control.
 

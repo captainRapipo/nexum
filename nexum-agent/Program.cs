@@ -23,6 +23,9 @@ internal static class Program
     private const int MinIntervalMs = 250;
     private const int MaxIntervalMs = 10000;
 
+    /// <summary>Shutdown waits this long for an in-flight tick before restoring fans without the lock.</summary>
+    private const int ShutdownLockWaitMs = 2000;
+
     private static readonly Version MinPawnIoVersion = new(2, 1, 0);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -37,6 +40,11 @@ internal static class Program
 
     private static readonly object StdoutLock = new();
     private static StreamWriter? _stdout;
+    private static readonly BlockingCollection<string> OutQueue = new(new ConcurrentQueue<string>());
+    private static Thread? _writer;
+
+    /// <summary>Backlog above which periodic packets are dropped instead of queued (parent not reading).</summary>
+    private const int MaxQueuedLines = 64;
 
     private static readonly ManualResetEventSlim ExitSignal = new(false);
     private static readonly ManualResetEventSlim InitDone = new(false);
@@ -74,6 +82,8 @@ internal static class Program
         };
         Console.SetOut(Console.Error);
         RedirectNativeStdoutToStderr();
+        _writer = new Thread(WriteLoop) { IsBackground = true, Name = "stdout-writer" };
+        _writer.Start();
 
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
         {
@@ -158,6 +168,7 @@ internal static class Program
 
         ExitSignal.Wait();
         Shutdown("exit requested");
+        FlushOutput(1000);
         Log("nexum-agent exited cleanly");
         return 0;
     }
@@ -228,6 +239,9 @@ internal static class Program
                 // Never let a tick kill the loop.
                 Log($"Tick failed: {ex}");
                 EmitErrorThrottled("tick", $"Telemetry tick failed: {ex.Message}");
+                // A tick that cannot read the sensors must not leave fixed-duty fans unwatched: it counts
+                // as a missing reading (3 in a row → override to 100%, CONTRACT §1.5.2).
+                EvaluateAsMissing();
             }
 
             // Wait until the next deadline; an interval change re-evaluates it from this tick's start.
@@ -335,6 +349,30 @@ internal static class Program
         catch (Exception ex)
         {
             LogThrottled("extra-eval", $"Extra fan safety evaluation failed: {ex.Message}");
+            EvaluateAsMissing();
+        }
+    }
+
+    /// <summary>An evaluation whose sensor read failed: every temperature counts as missing.</summary>
+    private static void EvaluateAsMissing()
+    {
+        var svc = _telemetry;
+        var safety = _safety;
+        if (svc is null || safety is null) return;
+        bool locked = false;
+        try
+        {
+            Monitor.TryEnter(svc.SyncRoot, 1000, ref locked);
+            if (!locked || Cts.IsCancellationRequested) return;
+            safety.Evaluate(null, new Dictionary<string, (double? Hotspot, double? Edge)>(StringComparer.OrdinalIgnoreCase));
+        }
+        catch (Exception ex)
+        {
+            LogThrottled("missing-eval", $"Fan safety evaluation (sensors unreadable) failed: {ex.Message}");
+        }
+        finally
+        {
+            if (locked) Monitor.Exit(svc.SyncRoot);
         }
     }
 
@@ -625,10 +663,12 @@ internal static class Program
         }
 
         // Wait for an in-flight tick/command; if one is wedged, restore anyway (fans matter more).
+        // Keep this well under the parent's shutdown grace (src-tauri agent.rs SHUTDOWN_GRACE, 6 s):
+        // a parent that kills us mid-wait leaves the fans at their manual duty.
         bool locked = false;
         try
         {
-            Monitor.TryEnter(svc.SyncRoot, TimeSpan.FromSeconds(5), ref locked);
+            Monitor.TryEnter(svc.SyncRoot, TimeSpan.FromMilliseconds(ShutdownLockWaitMs), ref locked);
             if (!locked) Log("Hardware lock busy; restoring fan control without it");
 
             if (safety is not null)
@@ -637,7 +677,10 @@ internal static class Program
                 catch (Exception ex) { Log($"Fan restore failed: {ex.Message}"); }
             }
 
-            try { svc.Close(); }
+            // In failsafe the Computer must stay open: LHM's Close() would write back the stale manual
+            // values this process captured (CONTRACT §1.5.4).
+            bool failsafe = safety?.Failsafe ?? false;
+            try { svc.Close(restoreFans: !failsafe); }
             catch (Exception ex) { Log($"Close failed: {ex.Message}"); }
         }
         finally
@@ -675,24 +718,53 @@ internal static class Program
             json = JsonSerializer.Serialize(new ErrorMessage { Message = $"Serialization failed: {ex.Message}" }, JsonOptions);
         }
 
-        var w = _stdout;
-        if (w is null) return;
-        lock (StdoutLock)
+        if (_stdout is null || OutQueue.IsAddingCompleted) return;
+
+        // MF-13: callers emit while holding the hardware lock, so a parent that stops reading stdout
+        // (hung, not dead) must never block them: that would also stop the fan thermal override.
+        // Lines go through a FIFO (order preserved) drained by one writer thread; while the pipe is
+        // stuck, periodic telemetry/sensorValues beyond the backlog limit are dropped.
+        if (message is TelemetryPacket or SensorValuesMessage && OutQueue.Count >= MaxQueuedLines)
         {
-            try
+            LogThrottled("stdout-backlog", $"stdout backlog of {OutQueue.Count} lines (parent not reading); dropping periodic packets");
+            return;
+        }
+        try { OutQueue.Add(json); }
+        catch (InvalidOperationException) { /* completed during shutdown */ }
+    }
+
+    /// <summary>The only stdout writer: one complete line per flush so the reader never sees a partial object.</summary>
+    private static void WriteLoop()
+    {
+        bool broken = false;
+        foreach (var json in OutQueue.GetConsumingEnumerable())
+        {
+            var w = _stdout;
+            if (w is null || broken) continue;
+            lock (StdoutLock)
             {
-                // One complete line per flush so the reader never observes a partial object.
-                w.Write(json);
-                w.Write('\n');
-                w.Flush();
-            }
-            catch (Exception ex) when (ex is IOException or ObjectDisposedException)
-            {
-                // Parent is gone: nothing left to talk to.
-                Log($"stdout closed: {ex.Message}");
-                ExitSignal.Set();
+                try
+                {
+                    w.Write(json);
+                    w.Write('\n');
+                    w.Flush();
+                }
+                catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+                {
+                    // Parent is gone: nothing left to talk to.
+                    Log($"stdout closed: {ex.Message}");
+                    broken = true;
+                    ExitSignal.Set();
+                }
             }
         }
+    }
+
+    /// <summary>Lets the writer drain queued lines (e.g. the last acks) before the process exits.</summary>
+    private static void FlushOutput(int timeoutMs)
+    {
+        try { OutQueue.CompleteAdding(); } catch { /* ignore */ }
+        try { _writer?.Join(timeoutMs); } catch { /* ignore */ }
     }
 
     internal static string Serialize(object message) => JsonSerializer.Serialize(message, message.GetType(), JsonOptions);

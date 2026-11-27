@@ -256,6 +256,7 @@ internal sealed class FanController
     /// <summary>Writes the intent: every target control gets its duty; touched controls without a target return to default.</summary>
     public (int Applied, List<string> Errors) ApplyIntent()
     {
+        using var isa = IsaBusGuard.Acquire();
         int applied = 0;
         var errors = new List<string>();
         foreach (var (cid, duty) in _intent.ToList())
@@ -291,6 +292,21 @@ internal sealed class FanController
     /// </summary>
     public (int Count, List<string> Errors) ForceAll(float pct, bool onlyIfBelow = false)
     {
+        // Taken only when something is written: this runs on every evaluation while the override or
+        // the failsafe holds, and must not contend for the shared bus when every fan is already at pct.
+        IsaBusGuard.Lease? isa = null;
+        try
+        {
+            return ForceAllCore(pct, onlyIfBelow, ref isa);
+        }
+        finally
+        {
+            isa?.Dispose();
+        }
+    }
+
+    private (int Count, List<string> Errors) ForceAllCore(float pct, bool onlyIfBelow, ref IsaBusGuard.Lease? isa)
+    {
         int count = 0;
         var errors = new List<string>();
         var targets = _fans.Where(f => f.PresetEligible).ToList();
@@ -301,13 +317,19 @@ internal sealed class FanController
 
         foreach (var f in targets)
         {
+            // Retry path: the control reads back (Control sensor = PWM register) below the target, so
+            // the earlier write did not take (or something else rewrote the register). LHM only writes
+            // on a value/mode *change*, so the rewrite must be forced.
+            bool force = false;
             if (onlyIfBelow && _touched.ContainsKey(f.ControlId))
             {
                 float? current = null;
                 try { current = Finite(f.Control?.Value); } catch { /* ignore */ }
                 if (current.HasValue && current.Value >= pct - 1f) { count++; continue; }
+                force = current.HasValue;
             }
-            if (TrySetSoftware(f, pct, out var err)) count++;
+            isa ??= IsaBusGuard.Acquire();
+            if (TrySetSoftware(f, pct, out var err, force)) count++;
             else errors.Add(err);
         }
         return (count, errors);
@@ -320,6 +342,7 @@ internal sealed class FanController
     /// </summary>
     public (int Restored, bool AllOk) ReleaseAll(bool includeAllEligible)
     {
+        using var isa = IsaBusGuard.Acquire();
         var targets = new Dictionary<string, ISensor>(_touched, StringComparer.OrdinalIgnoreCase);
         if (includeAllEligible)
         {
@@ -348,7 +371,7 @@ internal sealed class FanController
         return (restored, _touched.Count == 0);
     }
 
-    private bool TrySetSoftware(FanEntry f, float pct, out string error)
+    private bool TrySetSoftware(FanEntry f, float pct, out string error, bool forceRewrite = false)
     {
         error = "";
         if (!f.Controllable)
@@ -385,8 +408,16 @@ internal sealed class FanController
                 error = $"{f.Fan.Name}: control range does not allow a safe duty (>= {MinSafeDutyPct}%)";
                 return false;
             }
-            float target = float.IsFinite(pct) ? pct : 100f;
-            ctrl.SetSoftware(Math.Clamp(target, min, max));
+            float target = Math.Clamp(float.IsFinite(pct) ? pct : 100f, min, max);
+            if (forceRewrite && ctrl.ControlMode == ControlMode.Software && Math.Abs(ctrl.SoftwareValue - target) < 0.01f)
+            {
+                // LHM's Control raises its write event only when the mode or value changes: step one
+                // byte (0.5% > 1/2.55) towards the inside of the window, then back, so the register is
+                // written again.
+                float nudge = target - 0.5f >= min ? target - 0.5f : Math.Min(max, target + 0.5f);
+                ctrl.SetSoftware(nudge);
+            }
+            ctrl.SetSoftware(target);
             _touched[f.ControlId] = sensor;
             return true;
         }
