@@ -12,12 +12,16 @@ import {
   type ReactNode,
 } from "react";
 import { AlertTriangle, RotateCcw } from "lucide-react";
-import type { ViewId } from "./types";
+import { FKEY_MAP, VIEW_LABELS, VIEW_ORDER, type NavRequest, type NavTarget, type ViewId } from "./types";
 import { isTauri, subscribe } from "./lib/api";
+import { isViewId, NAV_EVENT, parseNavPayload, RESCAN_EVENT, setPendingFocus } from "./lib/nav";
 import { SettingsProvider, useSettings } from "./hooks/useSettings";
 import { SystemInfoProvider, useSystemInfo } from "./hooks/useSystemInfo";
 import { DriverScanProvider, useDriverScan } from "./hooks/useDriverScan";
 import { TelemetryProvider } from "./hooks/useTelemetryStream";
+import { SensorsProvider, useSensors } from "./hooks/useSensors";
+import { SystemSpecProvider, useSystemSpecRefresh } from "./hooks/useSystemSpec";
+import { HealthProvider } from "./hooks/useHealth";
 import { TopBar } from "./components/layout/TopBar";
 import { HeaderStrip } from "./components/layout/HeaderStrip";
 import { StatusFooter } from "./components/layout/StatusFooter";
@@ -25,16 +29,13 @@ import { SettingsModal } from "./components/layout/SettingsModal";
 import { Button } from "./components/ui/Button";
 import { isModalOpen } from "./components/ui/Modal";
 import { ToastHost } from "./components/feedback/Toast";
+import { FanFailsafeBanner, LimitedModeBanner } from "./components/feedback/AppBanners";
+import { PawnIoConsent } from "./components/feedback/PawnIoConsent";
+import { api } from "./lib/api";
 
 /* ------------------------------------------------------------------ */
 /* Lazy modules                                                        */
 /* ------------------------------------------------------------------ */
-
-const VIEW_IDS: readonly ViewId[] = ["dashboard", "drivers", "storage", "fans", "cleaner"];
-
-function isViewId(v: unknown): v is ViewId {
-  return typeof v === "string" && (VIEW_IDS as readonly string[]).includes(v);
-}
 
 /** Lazy component accepting either a default export or a same-named export. */
 function lazyModule<P extends object>(loader: () => Promise<unknown>, exportName: string) {
@@ -48,26 +49,22 @@ function lazyModule<P extends object>(loader: () => Promise<unknown>, exportName
 
 const viewLoaders: Record<ViewId, () => Promise<unknown>> = {
   dashboard: () => import("./views/DashboardView"),
-  drivers: () => import("./views/DriversView"),
+  sensors: () => import("./views/SensorsView"),
+  system: () => import("./views/SystemView"),
   storage: () => import("./views/StorageView"),
-  fans: () => import("./views/FanControlView"),
+  cooling: () => import("./views/CoolingView"),
+  drivers: () => import("./views/DriversView"),
   cleaner: () => import("./views/CleanerView"),
 };
 
-const VIEWS = {
+const VIEWS: Record<ViewId, ComponentType<object>> = {
   dashboard: lazyModule(viewLoaders.dashboard, "DashboardView"),
-  drivers: lazyModule(viewLoaders.drivers, "DriversView"),
+  sensors: lazyModule(viewLoaders.sensors, "SensorsView"),
+  system: lazyModule(viewLoaders.system, "SystemView"),
   storage: lazyModule(viewLoaders.storage, "StorageView"),
-  fans: lazyModule(viewLoaders.fans, "FanControlView"),
+  cooling: lazyModule(viewLoaders.cooling, "CoolingView"),
+  drivers: lazyModule(viewLoaders.drivers, "DriversView"),
   cleaner: lazyModule(viewLoaders.cleaner, "CleanerView"),
-} satisfies Record<ViewId, unknown>;
-
-const VIEW_LABEL: Record<ViewId, string> = {
-  dashboard: "Dashboard",
-  drivers: "Drivers",
-  storage: "Storage",
-  fans: "Fan Control",
-  cleaner: "Cleaner",
 };
 
 interface PurgeModalProps {
@@ -142,7 +139,7 @@ function ViewLoader({ label }: { label: string }) {
   return (
     <div className="flex min-h-[320px] flex-1 flex-col items-center justify-center gap-3" role="status" aria-live="polite">
       <div className="relative h-[3px] w-48 overflow-hidden rounded-full bg-white/[0.06]">
-        <span className="absolute inset-y-0 left-0 w-1/3 animate-sweep rounded-full bg-teal shadow-[0_0_12px_rgba(45,212,191,0.8)]" />
+        <span className="absolute inset-x-0 left-0 w-1/3 animate-sweep rounded-full bg-teal shadow-[0_0_12px_rgba(45,212,191,0.8)]" />
       </div>
       <span className="label-caps">Loading module · {label}</span>
     </div>
@@ -150,142 +147,170 @@ function ViewLoader({ label }: { label: string }) {
 }
 
 /**
- * Deep-link support: `?view=drivers` opens a module directly and `?purge=1` opens the
- * 1-Click Purge modal on start (handy for screenshots, the tray and debugging).
+ * Deep links: `?view=sensors` opens a view directly (`fans` is accepted as an alias of `cooling`),
+ * `&focus=<id>` hands a focus target to it, and `?clean=1` opens the cache-cleanup dialog.
  */
-function readInitialRoute(): { view: ViewId; purge: boolean } {
+function readInitialRoute(): { view: ViewId; focus: string | null; clean: boolean } {
   try {
     const q = new URLSearchParams(window.location.search);
-    const v = q.get("view");
-    const p = q.get("purge");
-    return { view: isViewId(v) ? v : "dashboard", purge: p === "1" || p === "true" };
+    const raw = q.get("view");
+    const v = raw === "fans" ? "cooling" : raw;
+    const c = q.get("clean");
+    return {
+      view: isViewId(v) ? v : "dashboard",
+      focus: q.get("focus"),
+      clean: c === "1" || c === "true",
+    };
   } catch {
-    return { view: "dashboard", purge: false };
+    return { view: "dashboard", focus: null, clean: false };
   }
 }
 
-interface PurgeState {
+interface CleanState {
   open: boolean;
   autoStart: boolean;
+}
+
+/** Focus is in a text field: global hotkeys must not act (Esc excepted). */
+function isTypingTarget(t: EventTarget | null): boolean {
+  if (!(t instanceof Element)) return false;
+  return !!t.closest("input, textarea, select, [contenteditable=''], [contenteditable='true']");
 }
 
 function Shell() {
   const [initial] = useState(readInitialRoute);
   const [view, setView] = useState<ViewId>(initial.view);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [purge, setPurge] = useState<PurgeState>({ open: initial.purge, autoStart: false });
-  const [purgeMounted, setPurgeMounted] = useState(initial.purge);
+  const [clean, setClean] = useState<CleanState>({ open: initial.clean, autoStart: false });
+  const [cleanMounted, setCleanMounted] = useState(initial.clean);
 
   const { settings } = useSettings();
   const { refresh: refreshSystem, loading: systemLoading } = useSystemInfo();
   const { rescan, loading: scanLoading } = useDriverScan();
+  const { refreshTree } = useSensors();
+  const refreshSpec = useSystemSpecRefresh();
 
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
-  const purgeOpenRef = useRef(purge.open);
-  purgeOpenRef.current = purge.open;
+  const cleanOpenRef = useRef(clean.open);
+  cleanOpenRef.current = clean.open;
+  const viewRef = useRef(view);
+  viewRef.current = view;
+
+  useEffect(() => {
+    if (initial.focus) setPendingFocus({ view: initial.view, focus: initial.focus });
+  }, [initial]);
 
   const navigate = useCallback((next: ViewId) => {
     // Transition keeps the current view on screen while a lazy view loads.
     startTransition(() => setView(next));
   }, []);
 
-  const refreshAll = useCallback(async () => {
-    await Promise.allSettled([refreshSystem(), rescan()]);
-  }, [refreshSystem, rescan]);
+  /** F5 / refresh button: inventory always; drivers / spec / tree / cleaner for the active view. */
+  const rescanAll = useCallback(async () => {
+    const v = viewRef.current;
+    const jobs: Array<Promise<unknown>> = [refreshSystem()];
+    if (v === "drivers") jobs.push(rescan());
+    if (v === "sensors") jobs.push(refreshTree());
+    if (v === "system") jobs.push(refreshSpec());
+    // Views with their own scan (the Cleaner) listen via lib/nav onRescanRequest().
+    window.dispatchEvent(new CustomEvent(RESCAN_EVENT, { detail: v }));
+    await Promise.allSettled(jobs);
+  }, [refreshSystem, rescan, refreshTree, refreshSpec]);
 
-  const openPurge = useCallback((viaHotkey: boolean) => {
-    if (purgeOpenRef.current) return;
-    setPurgeMounted(true);
-    setPurge({ open: true, autoStart: viaHotkey && !settingsRef.current.confirmBeforePurge });
+  const openClean = useCallback((viaHotkey: boolean) => {
+    if (cleanOpenRef.current) return;
+    setCleanMounted(true);
+    setClean({ open: true, autoStart: viaHotkey && !settingsRef.current.confirmBeforePurge });
   }, []);
 
-  const closePurge = useCallback(() => setPurge((p) => ({ ...p, open: false })), []);
+  const closeClean = useCallback(() => setClean((p) => ({ ...p, open: false })), []);
   const openSettings = useCallback(() => setSettingsOpen(true), []);
   const closeSettings = useCallback(() => setSettingsOpen(false), []);
 
-  // Global BIOS-style hotkeys.
+  const handleNav = useCallback(
+    (target: NavTarget | NavRequest | null) => {
+      if (!target) return;
+      if (typeof target === "object") {
+        if (target.focus) setPendingFocus(target);
+        navigate(target.view);
+        return;
+      }
+      if (isViewId(target)) navigate(target);
+      // quick-clean (tray menu or an in-app link) always asks first: autoStart only for the F9 key.
+      else if (target === "quick-clean") openClean(false);
+      else if (target === "settings") setSettingsOpen(true);
+    },
+    [navigate, openClean],
+  );
+
+  // Global keymap (CONTRACT §4.6).
   useEffect(() => {
     const production = isTauri && !import.meta.env.DEV;
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented) return;
-      // F5 in any combination (Ctrl+F5 / Shift+F5 are hard reloads in WebView2) must never reload.
-      if (e.key === "F5") {
+      const key = e.key;
+      const typing = isTypingTarget(e.target);
+
+      // Never reload the WebView: F5 in any combination, Ctrl+R / Ctrl+Shift+R in the packaged app.
+      if (key === "F5") {
         e.preventDefault();
-        if (!e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey) void refreshAll();
+        if (!typing && !e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && !isModalOpen()) void rescanAll();
         return;
       }
-      if (e.ctrlKey || e.altKey || e.metaKey) {
-        // Block WebView reload shortcuts (Ctrl+R / Ctrl+Shift+R) in the packaged app.
-        if (production && e.ctrlKey && (e.key === "r" || e.key === "R")) e.preventDefault();
+      if (production && e.ctrlKey && (key === "r" || key === "R")) {
+        e.preventDefault();
         return;
       }
+      // Caret-browsing prompt in WebView2.
+      if (key === "F7") e.preventDefault();
+
+      if (typing) return;
+
+      // Ctrl+1..7 → VIEW_ORDER[n-1]
+      if (e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && /^[1-7]$/.test(key)) {
+        e.preventDefault();
+        if (isModalOpen()) return;
+        navigate(VIEW_ORDER[Number(key) - 1]);
+        return;
+      }
+      if (e.ctrlKey || e.altKey || e.metaKey) return;
+
+      const action = FKEY_MAP[key];
+      if (!action) return;
+      // In the Sensors view F2 means "rename selected row"; the view handles it.
+      if (key === "F2" && viewRef.current === "sensors") return;
+      e.preventDefault();
       // While a dialog is open, view switching / opening another dialog would act behind it.
-      if (isModalOpen() && (e.key === "F1" || e.key === "F2" || e.key === "F3" || e.key === "F4" || e.key === "F9")) {
-        e.preventDefault();
-        return;
-      }
-      switch (e.key) {
-        case "F1":
-          e.preventDefault();
-          navigate("dashboard");
-          break;
-        case "F2":
-          e.preventDefault();
-          navigate("drivers");
-          break;
-        case "F3":
-          e.preventDefault();
-          navigate("storage");
-          break;
-        case "F4":
-          e.preventDefault();
-          navigate("fans");
-          break;
-        case "F9":
-          e.preventDefault();
-          if (!e.repeat) openPurge(true);
-          break;
-        case "F7":
-          // Caret-browsing prompt in WebView2.
-          if (production) e.preventDefault();
-          break;
-        default:
-          break;
-      }
+      if (isModalOpen() || e.repeat) return;
+      if (action.type === "view") navigate(action.view);
+      else if (action.type === "cleanCaches") openClean(true);
+      else if (action.type === "rescan") void rescanAll();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [navigate, refreshAll, openPurge]);
+  }, [navigate, rescanAll, openClean]);
 
   // Navigation requests from the tray menu / Rust core.
   useEffect(
     () =>
       subscribe<unknown>("navigate", (payload) => {
-        const target =
-          typeof payload === "string"
-            ? payload
-            : payload && typeof payload === "object" && "view" in payload
-              ? String((payload as { view: unknown }).view)
-              : "";
-        if (isViewId(target)) navigate(target);
-        else if (target === "purge" || target === "quick-clean") openPurge(true);
-        else if (target === "settings") setSettingsOpen(true);
+        const legacy = payload === "fans" ? "cooling" : payload;
+        handleNav(parseNavPayload(legacy));
       }),
-    [navigate, openPurge],
+    [handleNav],
   );
 
-  // In-app navigation requests from widgets ("View all", "Control", …) via a DOM CustomEvent.
+  // In-app navigation requests ("View drive", "System →", …) via lib/nav requestNavigate().
   useEffect(() => {
     const onNav = (e: Event) => {
-      const target = (e as CustomEvent<unknown>).detail;
-      if (isViewId(target)) navigate(target);
-      else if (target === "purge") openPurge(false);
-      else if (target === "settings") setSettingsOpen(true);
+      const detail = (e as CustomEvent<unknown>).detail;
+      const legacy = detail === "fans" ? "cooling" : detail;
+      handleNav(parseNavPayload(legacy));
     };
-    window.addEventListener("nexum:navigate", onNav);
-    return () => window.removeEventListener("nexum:navigate", onNav);
-  }, [navigate, openPurge]);
+    window.addEventListener(NAV_EVENT, onNav);
+    return () => window.removeEventListener(NAV_EVENT, onNav);
+  }, [handleNav]);
 
   // Disable the WebView context menu in the packaged app (keep it for text fields).
   useEffect(() => {
@@ -302,29 +327,39 @@ function Shell() {
   // Warm the other modules once the first view is up so switching is instant.
   useEffect(() => {
     const t = window.setTimeout(() => {
-      for (const id of VIEW_IDS) viewLoaders[id]().catch(() => undefined);
+      for (const id of VIEW_ORDER) viewLoaders[id]().catch(() => undefined);
       purgeLoader().catch(() => undefined);
     }, 1200);
     return () => window.clearTimeout(t);
   }, []);
 
+  // Keep the backend's poll interval in step with the saved setting on start.
+  useEffect(() => {
+    if (!isTauri) return;
+    api.setPollInterval(settings.pollIntervalMs).catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- once, after settings load
+  }, []);
+
   const ActiveView = VIEWS[view];
+  const label = VIEW_LABELS[view];
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
       <TopBar
         view={view}
         onNavigate={navigate}
-        onPurge={() => openPurge(false)}
-        onRefresh={refreshAll}
+        onCleanCaches={() => openClean(false)}
+        onRefresh={rescanAll}
         onSettings={openSettings}
         refreshing={systemLoading || scanLoading}
       />
       <HeaderStrip />
+      <FanFailsafeBanner />
+      <LimitedModeBanner />
 
       <main id="nexum-main" className="relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto">
-        <ModuleErrorBoundary label={VIEW_LABEL[view]}>
-          <Suspense fallback={<ViewLoader label={VIEW_LABEL[view]} />}>
+        <ModuleErrorBoundary label={label}>
+          <Suspense fallback={<ViewLoader label={label} />}>
             <div key={view} className="flex min-h-full flex-1 flex-col animate-view-in p-4">
               <ActiveView />
             </div>
@@ -332,17 +367,18 @@ function Shell() {
         </ModuleErrorBoundary>
       </main>
 
-      <StatusFooter view={view} onNavigate={navigate} onRescan={() => void refreshAll()} onQuickClean={() => openPurge(true)} />
+      <StatusFooter view={view} onNavigate={navigate} onRescan={() => void rescanAll()} onQuickClean={() => openClean(false)} />
 
-      {purgeMounted && (
-        <ModuleErrorBoundary label="1-Click Purge" silent>
+      {cleanMounted && (
+        <ModuleErrorBoundary label="Cache cleanup" silent>
           <Suspense fallback={null}>
-            <OneClickPurgeModal open={purge.open} onClose={closePurge} autoStart={purge.autoStart} />
+            <OneClickPurgeModal open={clean.open} onClose={closeClean} autoStart={clean.autoStart} />
           </Suspense>
         </ModuleErrorBoundary>
       )}
 
       <SettingsModal open={settingsOpen} onClose={closeSettings} />
+      <PawnIoConsent />
       <ToastHost />
     </div>
   );
@@ -354,7 +390,13 @@ export default function App() {
       <SystemInfoProvider>
         <DriverScanProvider>
           <TelemetryProvider>
-            <Shell />
+            <SensorsProvider>
+              <SystemSpecProvider>
+                <HealthProvider>
+                  <Shell />
+                </HealthProvider>
+              </SystemSpecProvider>
+            </SensorsProvider>
           </TelemetryProvider>
         </DriverScanProvider>
       </SystemInfoProvider>

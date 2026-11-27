@@ -1,4 +1,4 @@
-import type { DriverCategory, DriverInfo } from "../../types";
+import type { DriverCategory, DriverInfo, DriverStatus } from "../../types";
 
 export const DRIVER_CATEGORIES: DriverCategory[] = [
   "Display",
@@ -14,7 +14,89 @@ export const DRIVER_CATEGORIES: DriverCategory[] = [
   "Other",
 ];
 
-export type DriverStatusFilter = "all" | "ok" | "outdated" | "unsigned";
+export type DriverStatusFilter = "all" | DriverStatus;
+
+/** Sort rank: problems first, then unsigned, then ok (MF-5). */
+export const STATUS_RANK: Record<DriverStatus, number> = { problem: 0, unsigned: 1, ok: 2 };
+
+/** Codes Windows uses for a device the user disabled (22) or that is not plugged in (45): shown neutrally. */
+export const NEUTRAL_CODES: ReadonlySet<number> = new Set([22, 45]);
+
+/** Win32_PnPEntity.ConfigManagerErrorCode → short plain-English text (Device Manager wording, shortened). */
+const PROBLEM_TEXT: Record<number, string> = {
+  1: "Not configured correctly",
+  3: "Driver may be corrupted or the system is low on memory",
+  9: "Firmware reported invalid resources",
+  10: "Device cannot start",
+  12: "Not enough free resources",
+  14: "Needs a restart",
+  16: "Resources not fully identified",
+  18: "Drivers need to be reinstalled",
+  19: "Configuration in the registry is damaged",
+  21: "Windows is removing this device",
+  22: "Disabled",
+  24: "Not present or not working",
+  28: "Drivers are not installed",
+  29: "Disabled by the firmware",
+  31: "Not working properly",
+  32: "Driver service is disabled",
+  33: "Required resources could not be determined",
+  34: "Needs manual configuration",
+  35: "Firmware is missing information",
+  37: "Driver failed to initialize",
+  38: "Previous driver instance still loaded",
+  39: "Driver is missing or corrupted",
+  40: "Registry information is missing or wrong",
+  41: "Driver loaded but the device was not found",
+  42: "Duplicate device",
+  43: "Stopped after reporting problems",
+  44: "Stopped by an application or service",
+  45: "Not connected",
+  46: "Unavailable while Windows shuts down",
+  47: "Prepared for safe removal",
+  48: "Blocked: known compatibility problem",
+  49: "Registry is too large",
+  50: "Cannot apply all properties",
+  51: "Waiting for another device to start",
+  52: "Signature could not be verified",
+  53: "Reserved by the kernel debugger",
+  54: "Failed and is resetting",
+};
+
+/** "Code 43 · Stopped after reporting problems". */
+export function problemText(code: number | null | undefined): string {
+  if (code == null) return "";
+  const t = PROBLEM_TEXT[code];
+  return t ? `Code ${code} · ${t}` : `Code ${code}`;
+}
+
+/** A group of identical driver rows (same device name, version and provider): "Processor × 16". */
+export interface DriverRow {
+  key: string;
+  /** Representative member (the one with the most severe status). */
+  driver: DriverInfo;
+  members: DriverInfo[];
+  status: DriverStatus;
+}
+
+/** Group identical rows (deviceName + version + provider), keeping input order of first appearance. */
+export function groupDrivers(drivers: readonly DriverInfo[]): DriverRow[] {
+  const map = new Map<string, DriverRow>();
+  for (const d of drivers) {
+    const k = `${(d.deviceName || "").toLowerCase()}|${d.version}|${(d.provider || "").toLowerCase()}`;
+    const g = map.get(k);
+    if (!g) {
+      map.set(k, { key: `${k}|${driverKey(d)}`, driver: d, members: [d], status: d.status });
+    } else {
+      g.members.push(d);
+      if (STATUS_RANK[d.status] < STATUS_RANK[g.status]) {
+        g.status = d.status;
+        g.driver = d;
+      }
+    }
+  }
+  return [...map.values()];
+}
 
 /** Stable identity for a driver row (deviceId alone may repeat for multi-function devices). */
 export function driverKey(d: DriverInfo): string {
@@ -111,6 +193,7 @@ const PORTALS: { test: RegExp; vendor: string; url: string }[] = [
     vendor: "Samsung",
     url: "https://semiconductor.samsung.com/consumer-storage/support/tools/",
   },
+  { test: /gigabyte|giga-byte/i, vendor: "Gigabyte", url: "https://www.gigabyte.com/Support" },
   { test: /microsoft/i, vendor: "Microsoft", url: MS_MANUAL_DRIVERS },
 ];
 

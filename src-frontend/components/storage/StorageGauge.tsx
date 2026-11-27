@@ -6,11 +6,8 @@ import { GlassCard } from "../layout/GlassCard";
 import { useSystemInfo } from "../../hooks/useSystemInfo";
 import { useTrashEstimate } from "../../hooks/useTrashEstimate";
 import { cn, fmtBytes } from "../../lib/format";
-import type { Volume } from "../../types";
+import { HEALTH_THRESHOLDS, type Volume } from "../../types";
 
-/** Disk fill at/above which the volume is critical (rose). */
-export const DISK_CRIT_PCT = 90;
-export const DISK_WARN_PCT = 75;
 
 /** The Windows system volume: isSystem flag, else C:, else the largest fixed volume. */
 export function pickSystemVolume(volumes: Volume[] | null | undefined): Volume | null {
@@ -31,11 +28,12 @@ export function usedPctOf(v: Volume): number {
 }
 
 const C = {
-  teal: "#2DD4BF",
-  gold: "#D4A359",
-  rose: "#E11D48",
+  used: "#2DD4BF",
+  reclaimable: "#22D3EE",
   free: "rgba(148,163,184,0.16)",
 };
+
+const SPACE_RULE = `Attention below ${HEALTH_THRESHOLDS.freeSpaceWarnPct}% free, critical below ${HEALTH_THRESHOLDS.freeSpaceCritPct}% free.`;
 
 export default function StorageGauge() {
   const { volumes } = useSystemInfo();
@@ -54,11 +52,7 @@ export default function StorageGauge() {
     return { total, used, free, trash, usedNet, usedPct };
   }, [vol, trashBytes]);
 
-  const usedColor = !model
-    ? C.teal
-    : model.usedPct >= DISK_CRIT_PCT
-      ? C.rose
-      : C.teal;
+  const usedColor = C.used;
 
   const option = useMemo<EChartsOption>(() => {
     const m = model;
@@ -68,7 +62,7 @@ export default function StorageGauge() {
     const parts = m
       ? [
           { name: "Used", value: Math.max(0, m.usedNet - (minTrash - m.trash)), real: m.usedNet, color: usedColor },
-          { name: "Reclaimable", value: minTrash, real: m.trash, color: C.gold },
+          { name: "Reclaimable", value: minTrash, real: m.trash, color: C.reclaimable },
           { name: "Free", value: m.free, real: m.free, color: C.free },
         ]
       : [{ name: "Free", value: 1, real: 0, color: C.free }];
@@ -144,17 +138,18 @@ export default function StorageGauge() {
     } as EChartsOption;
   }, [model, usedColor]);
 
-  const crit = !!model && model.usedPct >= DISK_CRIT_PCT;
-  const warn = !!model && model.usedPct >= DISK_WARN_PCT;
+  const freePct = model ? 100 - model.usedPct : null;
+  const crit = freePct !== null && freePct < HEALTH_THRESHOLDS.freeSpaceCritPct;
+  const warn = freePct !== null && freePct < HEALTH_THRESHOLDS.freeSpaceWarnPct;
 
   return (
     <GlassCard
-      title="Storage & Junk"
+      title="Storage"
       icon={<HardDrive size={14} />}
-      accent={crit ? "rose" : "gold"}
+      accent="teal"
       actions={
         vol ? (
-          <StatusPill tone={crit ? "crit" : warn ? "warn" : "ok"} pulse={crit}>
+          <StatusPill tone={crit ? "crit" : warn ? "warn" : "ok"} title={`${vol.letter || "System volume"}: ${SPACE_RULE}`}>
             {vol.letter || "SYS"}
           </StatusPill>
         ) : null
@@ -165,11 +160,7 @@ export default function StorageGauge() {
         <div className="pointer-events-none absolute inset-x-0 bottom-0 flex flex-col items-center">
           <div className="flex items-baseline gap-0.5">
             <span
-              className={cn(
-                "font-mono text-[30px] font-semibold leading-none tabular-nums",
-                crit ? "text-rose" : "text-ink",
-              )}
-              style={{ textShadow: crit ? "0 0 18px rgba(225,29,72,0.45)" : "0 0 18px rgba(45,212,191,0.25)" }}
+              className={cn("font-mono text-[30px] font-semibold leading-none tabular-nums", "text-ink")}
             >
               {model ? model.usedPct.toFixed(0) : "—"}
             </span>
@@ -184,8 +175,9 @@ export default function StorageGauge() {
       <div className="mt-3 grid grid-cols-3 gap-2 border-t border-line pt-3">
         <Legend color={usedColor} label="Used" value={model ? fmtBytes(model.usedNet) : "—"} />
         <Legend
-          color={C.gold}
-          label="Trash"
+          color={C.reclaimable}
+          label="Caches"
+          title="Reclaimable caches (measured by the cleaner)"
           value={trashBytes === null ? (trashLoading ? "Scanning" : "—") : fmtBytes(model ? model.trash : trashBytes)}
           dim={trashBytes === null}
         />
@@ -195,12 +187,24 @@ export default function StorageGauge() {
   );
 }
 
-function Legend({ color, label, value, dim = false }: { color: string; label: string; value: string; dim?: boolean }) {
+function Legend({
+  color,
+  label,
+  value,
+  dim = false,
+  title,
+}: {
+  color: string;
+  label: string;
+  value: string;
+  dim?: boolean;
+  title?: string;
+}) {
   return (
-    <div className="min-w-0">
-      <div className="flex items-center gap-1.5">
+    <div className="min-w-0" title={title}>
+      <div className="flex min-w-0 items-center gap-1.5">
         <span className="h-2 w-2 shrink-0 rounded-[2px]" style={{ background: color, boxShadow: `0 0 6px ${color}` }} />
-        <span className="text-[9.5px] uppercase tracking-[0.2em] text-muted">{label}</span>
+        <span className="truncate text-[9.5px] uppercase tracking-[0.2em] text-muted">{label}</span>
       </div>
       <div className={cn("mt-0.5 truncate font-mono text-[12px] tabular-nums", dim ? "text-muted" : "text-ink")}>
         {value}

@@ -17,9 +17,9 @@ export interface DriverFiltersProps {
 
 const STATUS_OPTIONS: { id: DriverStatusFilter; label: string; tone: string }[] = [
   { id: "all", label: "All", tone: "text-silver" },
-  { id: "ok", label: "OK", tone: "text-teal" },
-  { id: "outdated", label: "Outdated", tone: "text-rose" },
-  { id: "unsigned", label: "Unsigned", tone: "text-gold" },
+  { id: "problem", label: "Problem", tone: "text-crit" },
+  { id: "unsigned", label: "Unsigned", tone: "text-warn" },
+  { id: "ok", label: "OK", tone: "text-ok" },
 ];
 
 export default function DriverFilters({
@@ -44,6 +44,7 @@ export default function DriverFilters({
             value={query}
             onChange={(e) => onQuery(e.target.value)}
             placeholder="Search device, provider, version, INF, hardware ID…"
+            aria-label="Search drivers"
             spellCheck={false}
             className="w-full rounded-lg border border-line bg-canvas-0/70 py-2 pl-9 pr-8 text-[13px] text-ink placeholder:text-muted/80 outline-none transition focus:border-gold/50 focus:shadow-[0_0_0_3px_rgba(212,163,89,0.12)]"
           />

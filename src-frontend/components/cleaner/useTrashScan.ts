@@ -62,21 +62,27 @@ export function useTrashScan(): TrashScanState {
   return { phase, scan, error, rescan, reset };
 }
 
-/** Purgeable (file) categories: everything except the RAM standby pseudo-category. */
+/** Every category of the scan, in backend order. */
 export function fileCategories(scan: TrashScan | null): TrashCategory[] {
-  return (scan?.categories ?? []).filter((c) => c.id !== "standby");
+  return scan?.categories ?? [];
+}
+
+/** Categories that can run in this session (admin-only ones are unavailable without elevation). */
+export function availableCategories(scan: TrashScan | null): TrashCategory[] {
+  return fileCategories(scan).filter((c) => c.available !== false);
 }
 
 /**
  * Selection model: defaults to each category's `enabled` flag, with per-id user overrides that
- * survive re-scans. `forced` pins specific ids (e.g. 'browser' bound to a setting).
+ * survive re-scans. `forced` pins specific ids (e.g. 'browser' bound to a setting). Unavailable
+ * categories are never selected.
  */
 export function useCategorySelection(scan: TrashScan | null, forced?: Partial<Record<TrashCategoryId, boolean>>) {
   const [overrides, setOverrides] = useState<Partial<Record<TrashCategoryId, boolean>>>({});
 
   const selected = useMemo(() => {
     const s = new Set<TrashCategoryId>();
-    for (const c of fileCategories(scan)) {
+    for (const c of availableCategories(scan)) {
       const f = forced?.[c.id];
       const o = overrides[c.id];
       const on = f !== undefined ? f : o !== undefined ? o : c.enabled;
@@ -92,7 +98,7 @@ export function useCategorySelection(scan: TrashScan | null, forced?: Partial<Re
   const setAll = useCallback(
     (on: boolean) => {
       const next: Partial<Record<TrashCategoryId, boolean>> = {};
-      for (const c of fileCategories(scan)) next[c.id] = on;
+      for (const c of availableCategories(scan)) next[c.id] = on;
       setOverrides(next);
     },
     [scan],
@@ -101,7 +107,7 @@ export function useCategorySelection(scan: TrashScan | null, forced?: Partial<Re
   const resetOverrides = useCallback(() => setOverrides({}), []);
 
   const selectedCategories = useMemo(
-    () => fileCategories(scan).filter((c) => selected.has(c.id)),
+    () => availableCategories(scan).filter((c) => selected.has(c.id)),
     [scan, selected],
   );
   const selectedBytes = useMemo(

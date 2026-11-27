@@ -1,14 +1,16 @@
 import { Fragment } from "react";
-import type { ViewId } from "../../types";
+import { FKEY_MAP, VIEW_LABELS, type ViewId } from "../../types";
 import { isTauri } from "../../lib/api";
 import { cn, fmtClock } from "../../lib/format";
+import { useNow } from "../../hooks/useNow";
+import { fmtSelfUsage, useSelfUsage } from "../../hooks/useSelfUsage";
 import { useTelemetry } from "../../hooks/useTelemetryStream";
-import { useNow } from "./HeaderStrip";
 
 export interface StatusFooterProps {
   view: ViewId;
   onNavigate: (view: ViewId) => void;
   onRescan: () => void;
+  /** F9 / "Clean caches". */
   onQuickClean: () => void;
 }
 
@@ -19,26 +21,29 @@ interface KeyDef {
   action?: "rescan" | "clean";
 }
 
-const KEYS: readonly KeyDef[] = [
-  { key: "F1", label: "Dashboard", view: "dashboard" },
-  { key: "F2", label: "Drivers", view: "drivers" },
-  { key: "F3", label: "Storage", view: "storage" },
-  { key: "F4", label: "Fans", view: "fans" },
-  { key: "F5", label: "Rescan", action: "rescan" },
-  { key: "F9", label: "Quick Clean", action: "clean" },
-];
+/** Footer key legend, generated from FKEY_MAP (CONTRACT §4.6): F1 … F7, F9. */
+const KEYS: readonly KeyDef[] = Object.entries(FKEY_MAP)
+  .sort(([a], [b]) => Number(a.slice(1)) - Number(b.slice(1)))
+  .map(([key, action]) =>
+    action.type === "view"
+      ? { key, label: VIEW_LABELS[action.view], view: action.view }
+      : action.type === "rescan"
+        ? { key, label: "Rescan", action: "rescan" as const }
+        : { key, label: "Clean caches", action: "clean" as const },
+  );
 
-/** BIOS-style key legend + live link status. */
+/** BIOS-style key legend + Nexum's own footprint + live link status. */
 export function StatusFooter({ view, onNavigate, onRescan, onQuickClean }: StatusFooterProps) {
   const { agent, latest } = useTelemetry();
+  const usage = useSelfUsage();
   const now = useNow(1000);
 
   const online = agent?.running ?? latest != null;
   const packetAge = latest ? Math.max(0, (now - latest.ts) / 1000) : null;
 
   return (
-    <footer className="relative z-10 flex h-8 shrink-0 select-none items-center gap-4 border-t border-line bg-[#05090b]/85 px-4 text-[11px] backdrop-blur-md">
-      <nav aria-label="Keyboard shortcuts" className="flex min-w-0 items-center gap-2">
+    <footer className="relative z-10 flex h-8 shrink-0 select-none items-center gap-3 border-t border-line bg-[#05090b]/85 px-3 text-[11px] backdrop-blur-md min-[1440px]:gap-4 min-[1440px]:px-4">
+      <nav aria-label="Keyboard shortcuts" className="flex min-w-0 items-center gap-1 overflow-hidden min-[1440px]:gap-1.5">
         {KEYS.map((k, i) => {
           const active = k.view != null && k.view === view;
           const onClick = () => {
@@ -56,20 +61,13 @@ export function StatusFooter({ view, onNavigate, onRescan, onQuickClean }: Statu
               <button
                 type="button"
                 onClick={onClick}
-                className="group flex items-center gap-1.5 rounded px-1 py-0.5 transition-colors hover:bg-white/[0.04]"
+                title={`${k.label} (${k.key})`}
+                className="group flex shrink-0 items-center gap-1 rounded px-1 py-0.5 transition-colors hover:bg-white/[0.04]"
               >
-                <kbd
-                  className={cn(
-                    "kbd",
-                    active && "[--kbd-color:var(--color-teal)] [--kbd-border:rgba(45,212,191,0.45)]",
-                    k.action === "clean" && "[--kbd-color:var(--color-gold)] [--kbd-border:rgba(212,163,89,0.45)]",
-                  )}
-                >
-                  {k.key}
-                </kbd>
+                <kbd className={cn("kbd", active && "[--kbd-color:var(--color-teal)] [--kbd-border:rgba(45,212,191,0.45)]")}>{k.key}</kbd>
                 <span
                   className={cn(
-                    "whitespace-nowrap uppercase tracking-[0.1em]",
+                    "whitespace-nowrap uppercase tracking-[0.06em] min-[1440px]:tracking-[0.1em]",
                     active ? "text-teal" : "text-slate-400 group-hover:text-slate-200",
                   )}
                 >
@@ -79,10 +77,10 @@ export function StatusFooter({ view, onNavigate, onRescan, onQuickClean }: Statu
             </Fragment>
           );
         })}
-        <span aria-hidden="true" className="text-slate-700">
+        <span aria-hidden="true" className="hidden text-slate-700 min-[1440px]:inline">
           ·
         </span>
-        <span className="flex items-center gap-1.5 px-1">
+        <span className="hidden shrink-0 items-center gap-1.5 px-1 min-[1440px]:flex">
           <kbd className="kbd">Esc</kbd>
           <span className="uppercase tracking-[0.1em] text-slate-500">Close</span>
         </span>
@@ -90,15 +88,23 @@ export function StatusFooter({ view, onNavigate, onRescan, onQuickClean }: Statu
 
       <div className="ml-auto flex shrink-0 items-center gap-3 text-slate-500">
         {!isTauri && (
-          <span className="rounded border border-gold/30 bg-gold/[0.06] px-1.5 py-px font-mono text-[9.5px] uppercase tracking-[0.14em] text-gold/90">
+          <span className="hidden rounded border border-gold/30 bg-gold/[0.06] px-1.5 py-px font-mono text-[9.5px] uppercase tracking-[0.14em] text-gold/90 min-[1800px]:inline">
             Preview · Simulated data
           </span>
         )}
+        <span
+          className="num whitespace-nowrap text-slate-400"
+          title={
+            usage
+              ? `Nexum's own usage: ${usage.processCount} processes (Nexum, hardware agent, WebView2). CPU is a share of the whole machine.`
+              : "Nexum's own CPU and memory use appears a few seconds after start."
+          }
+        >
+          {fmtSelfUsage(usage)}
+        </span>
+        <span aria-hidden="true" className="h-3 w-px bg-line" />
         <span className="flex items-center gap-1.5" title={agent?.message}>
-          <span
-            aria-hidden="true"
-            className={cn("size-1.5 rounded-full", online ? "led-teal animate-led-pulse" : "led-rose")}
-          />
+          <span aria-hidden="true" className={cn("size-1.5 rounded-full", online ? "led-ok animate-led-pulse" : "led-crit")} />
           <span className="font-mono uppercase tracking-[0.12em]">{online ? "Agent link" : "Agent offline"}</span>
           {packetAge != null && online && <span className="num text-slate-400">{packetAge < 10 ? packetAge.toFixed(1) : Math.round(packetAge)}s</span>}
         </span>

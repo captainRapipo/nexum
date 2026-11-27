@@ -1,63 +1,63 @@
-import ThermalLoadCard from "../components/telemetry/ThermalLoadCard";
-import HardwareSnapshotGrid from "../components/telemetry/HardwareSnapshotGrid";
+import type { ReactNode } from "react";
+import { ScrollFade } from "../components/ui";
 import KpiStrip from "../components/telemetry/KpiStrip";
-import StackedLiveChart from "../components/telemetry/StackedLiveChart";
+import LiveChart from "../components/telemetry/LiveChart";
+import HealthAlertsCard from "../components/telemetry/HealthAlertsCard";
+import PinnedSensorsCard from "../components/telemetry/PinnedSensorsCard";
+import SystemSummaryCard from "../components/telemetry/SystemSummaryCard";
+import DriveWearBanners from "../components/telemetry/DriveWearBanners";
 import FanList from "../components/telemetry/FanList";
 import StorageGauge from "../components/storage/StorageGauge";
-import SegmentedDriveBar from "../components/storage/SegmentedDriveBar";
-import BiosDetailsCard from "../components/drivers/BiosDetailsCard";
-import DriverStatusList from "../components/drivers/DriverStatusList";
+import DrivesCard from "../components/storage/DrivesCard";
 
 /**
- * Dashboard — START.md §2.2 three-column command grid.
- *   Left   (~300px): Thermal & Load Index · Storage & Junk gauge · 2×2 hardware snapshot
- *   Center (fluid) : 5-card KPI strip · live stacked telemetry chart
- *   Right  (~360px): System & BIOS · primary drive LED bar · cooling list · driver status
- * Below 1440px the side rails narrow so the grid fits a 1280×800 window without horizontal scroll.
- * Each column scrolls independently when its content exceeds the viewport height.
+ * Dashboard (ROADMAP §3 "Dashboard slim-down", §6.5):
+ *   Banners: one per drive-wear condition (dismissible)
+ *   Left   (~300px): Health alerts · Pinned sensors · Storage gauge
+ *   Center (fluid) : KPI strip · live chart
+ *   Right  (~360px): 3-line System summary · Drives with life chips · Active cooling
+ * Side columns scroll independently with a fade mask (MF-10). Fits a 1280×800 window without horizontal scroll.
  */
 export default function DashboardView() {
   return (
-    <div className="h-full min-h-0 w-full min-w-0 overflow-hidden">
+    <div className="flex h-full min-h-0 w-full min-w-0 flex-col gap-3 overflow-hidden">
+      <DriveWearBanners />
       <div
         className={[
-          "grid h-full min-h-0 w-full",
+          "grid min-h-0 w-full flex-1",
           "grid-cols-[300px_minmax(0,1fr)_360px] gap-4",
           "max-[1439px]:grid-cols-[268px_minmax(0,1fr)_312px] max-[1439px]:gap-3",
         ].join(" ")}
       >
-        {/* Left — health & quick KPIs */}
-        <section
-          aria-label="Health overview"
-          className="nexum-scroll flex min-h-0 min-w-0 flex-col gap-4 overflow-y-auto overflow-x-hidden pb-1 pr-1 max-[1439px]:gap-3 [&>*]:shrink-0"
-        >
-          <ThermalLoadCard />
+        <Column label="Health overview">
+          <HealthAlertsCard />
+          <PinnedSensorsCard />
           <StorageGauge />
-          <HardwareSnapshotGrid />
-        </section>
+        </Column>
 
-        {/* Center — live telemetry command */}
-        <section
-          aria-label="Live telemetry"
-          className="nexum-scroll flex min-h-0 min-w-0 flex-col gap-4 overflow-y-auto overflow-x-hidden pb-1 max-[1439px]:gap-3"
-        >
+        <section aria-label="Live telemetry" className="flex min-h-0 min-w-0 flex-col gap-4 overflow-hidden max-[1439px]:gap-3">
           <KpiStrip />
-          <div className="flex min-h-[340px] flex-1 flex-col">
-            <StackedLiveChart />
+          <div className="flex min-h-[300px] flex-1 flex-col">
+            <LiveChart />
           </div>
         </section>
 
-        {/* Right — BIOS metadata, storage, cooling, drivers */}
-        <section
-          aria-label="System details"
-          className="nexum-scroll flex min-h-0 min-w-0 flex-col gap-4 overflow-y-auto overflow-x-hidden pb-1 pr-1 max-[1439px]:gap-3 [&>*]:shrink-0"
-        >
-          <BiosDetailsCard />
-          <SegmentedDriveBar />
+        <Column label="System details">
+          <SystemSummaryCard />
+          <DrivesCard />
           <FanList />
-          <DriverStatusList />
-        </section>
+        </Column>
       </div>
     </div>
+  );
+}
+
+function Column({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <section aria-label={label} className="flex min-h-0 min-w-0 flex-col">
+      <ScrollFade className="h-full pr-1">
+        <div className="flex flex-col gap-4 pb-1 max-[1439px]:gap-3 [&>*]:shrink-0">{children}</div>
+      </ScrollFade>
+    </section>
   );
 }

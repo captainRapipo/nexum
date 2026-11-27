@@ -1,24 +1,19 @@
-import { useEffect, useState, type ReactNode } from "react";
-import { Activity, Clock, Monitor, ScanLine, ShieldAlert, ShieldCheck } from "lucide-react";
+import { useId, useState, type ReactNode } from "react";
+import { Activity, Monitor, ScanLine, ShieldCheck, ShieldOff } from "lucide-react";
 import { useDriverScan } from "../../hooks/useDriverScan";
+import { useHealth } from "../../hooks/useHealth";
 import { useSettings } from "../../hooks/useSettings";
 import { useSystemInfo } from "../../hooks/useSystemInfo";
 import { useTelemetry } from "../../hooks/useTelemetryStream";
-import { cn, DASH, fmtDateTime, fmtTemp, fmtUptime, pickPrimaryGpu, shortCpuName, shortGpuName } from "../../lib/format";
-import { StatusPill, type StatusTone } from "../ui/StatusPill";
+import { cn, DASH, fmtDateTime, pickPrimaryGpu, shortCpuName, shortGpuName } from "../../lib/format";
+import { requestNavigate } from "../../lib/nav";
+import { alertState, healthLevelTone, healthPillText } from "../../lib/status";
+import { StatusPill, STATUS_ICON } from "../ui/StatusPill";
+import { renderIcon } from "../ui/icon";
+import type { SystemHealth } from "../../types";
 
-/** Re-render every `intervalMs` with the current epoch ms. */
-export function useNow(intervalMs = 1000): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), intervalMs);
-    return () => window.clearInterval(id);
-  }, [intervalMs]);
-  return now;
-}
-
-/** Thermal alert threshold (°C) for CPU package / GPU core. */
-export const THERMAL_ALERT_C = 85;
+/** Kept for existing imports; the hook lives in hooks/useNow.ts. */
+export { useNow } from "../../hooks/useNow";
 
 function Segment({ icon, label, children, className, title }: { icon: ReactNode; label: string; children: ReactNode; className?: string; title?: string }) {
   return (
@@ -30,59 +25,87 @@ function Segment({ icon, label, children, className, title }: { icon: ReactNode;
   );
 }
 
-const Divider = () => <span aria-hidden="true" className="h-4 w-px shrink-0 bg-line" />;
+const Divider = ({ className }: { className?: string }) => (
+  <span aria-hidden="true" className={cn("h-4 w-px shrink-0 bg-line", className)} />
+);
+
+const SEV_TEXT = { crit: "text-rose-400", warn: "text-warn", info: "text-cyan" } as const;
+
+/** Rule-backed status pill (MF-6). Hover / focus shows the active conditions and every rule. */
+function HealthPill({ health }: { health: SystemHealth }) {
+  const [open, setOpen] = useState(false);
+  const panelId = useId();
+  const tone = healthLevelTone(health.level);
+  const text = healthPillText(health);
+  return (
+    <div
+      className="relative"
+      onMouseEnter={() => setOpen(true)}
+      onMouseLeave={() => setOpen(false)}
+      onFocus={() => setOpen(true)}
+      onBlur={() => setOpen(false)}
+    >
+      <button
+        type="button"
+        aria-describedby={open ? panelId : undefined}
+        aria-label={`System status: ${text}. Open Dashboard health alerts.`}
+        onClick={() => requestNavigate("dashboard")}
+        className="rounded-full focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal"
+      >
+        <StatusPill tone={tone} pulse={tone === "crit"}>
+          {text}
+        </StatusPill>
+      </button>
+      {open && (
+        <div
+          id={panelId}
+          role="tooltip"
+          className="glass-strong absolute left-0 top-[calc(100%+8px)] z-50 w-[440px] max-w-[calc(100vw-32px)] p-3.5 text-[12px] normal-case tracking-normal shadow-2xl animate-fade-in"
+        >
+          {health.conditions.length > 0 ? (
+            <>
+              <div className="label-caps mb-1.5">Active</div>
+              <ul className="mb-3 space-y-1.5">
+                {health.conditions.map((c) => (
+                  <li key={c.id} className="flex items-start gap-2">
+                    <span className={cn("mt-px shrink-0", SEV_TEXT[c.severity])}>{renderIcon(STATUS_ICON[alertState(c.severity)], 13)}</span>
+                    <span className="min-w-0">
+                      <span className="text-ink">{c.title}</span>
+                      {c.detail && <span className="block text-[11.5px] leading-snug text-slate-400">{c.detail}</span>}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : (
+            <p className="mb-3 text-slate-300">No active alerts. Every rule below is satisfied.</p>
+          )}
+          <div className="label-caps mb-1.5">Rules</div>
+          <ul className="list-disc space-y-1 pl-4 text-[11.5px] leading-snug text-slate-400">
+            {health.rules.map((r) => (
+              <li key={r}>{r}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function HeaderStrip() {
-  const { info, infoFetchedAt } = useSystemInfo();
+  const { info } = useSystemInfo();
   const { latest, agent } = useTelemetry();
   const { lastScan, loading: scanning } = useDriverScan();
   const { settings } = useSettings();
-  const now = useNow(1000);
+  const health = useHealth();
 
   const hostname = info?.hostname || DASH;
   const cpu = shortCpuName(info?.cpuName || latest?.cpu.name);
   const gpuFull = pickPrimaryGpu(info?.gpuNames) ?? latest?.gpu?.name ?? null;
   const gpu = gpuFull ? shortGpuName(gpuFull) : DASH;
 
-  // Live uptime: snapshot from get_system_info + time elapsed since it was fetched.
-  const uptimeSecs =
-    info && infoFetchedAt != null ? info.uptimeSecs + Math.max(0, (now - infoFetchedAt) / 1000) : null;
-
   const scanStamp = lastScan ?? (info?.lastDriverScan ? new Date(info.lastDriverScan) : null);
-
-  // Overall status
-  const cpuT = latest?.cpu.packageTempC ?? null;
-  const gpuT = latest?.gpu?.tempC ?? null;
-  const thermal = (cpuT != null && cpuT >= THERMAL_ALERT_C) || (gpuT != null && gpuT >= THERMAL_ALERT_C);
-  const staleAfter = Math.max(5000, settings.pollIntervalMs * 4);
-  const stale = latest != null && now - latest.ts > staleAfter;
-
-  let tone: StatusTone;
-  let statusLabel: string;
-  let statusTitle: string | undefined;
-  if (thermal) {
-    tone = "crit";
-    statusLabel = "Thermal Alert";
-    statusTitle = `CPU ${fmtTemp(cpuT, settings.tempUnit)} · GPU ${fmtTemp(gpuT, settings.tempUnit)} (alert at ${fmtTemp(THERMAL_ALERT_C, settings.tempUnit)})`;
-  } else if (agent && !agent.running) {
-    tone = "warn";
-    statusLabel = "Degraded";
-    statusTitle = agent.message || "Hardware agent is not running";
-  } else if (stale) {
-    tone = "warn";
-    statusLabel = "Degraded";
-    statusTitle = `No telemetry for ${Math.round((now - (latest?.ts ?? now)) / 1000)} s`;
-  } else if (!latest) {
-    tone = "info";
-    statusLabel = "Connecting";
-    statusTitle = agent?.message;
-  } else {
-    tone = "ok";
-    statusLabel = "Synced / Optimal";
-    statusTitle = agent?.message;
-  }
-
-  const isAdmin = info?.isAdmin ?? agent?.isAdmin ?? null;
+  const isAdmin = agent?.running ? agent.isAdmin : (info?.isAdmin ?? null);
   const hz = settings.pollIntervalMs > 0 ? 1000 / settings.pollIntervalMs : 0;
 
   return (
@@ -93,19 +116,13 @@ export function HeaderStrip() {
         <span className="shrink-0 font-semibold uppercase tracking-[0.1em] text-ink">{hostname}</span>
         <span className="shrink-0 text-muted">—</span>
         <span className="min-w-0 truncate text-slate-300" title={[info?.cpuName, gpuFull].filter(Boolean).join(" / ")}>
-          {cpu} <span className="text-muted">/</span> <span className="text-gold">{gpu}</span>
+          {cpu} <span className="text-muted">/</span> <span className="text-slate-200">{gpu}</span>
         </span>
       </div>
 
-      <StatusPill tone={tone} pulse={tone === "ok" || tone === "crit"} title={statusTitle}>
-        {statusLabel}
-      </StatusPill>
+      <HealthPill health={health} />
 
       <div className="ml-auto flex min-w-0 items-center gap-4">
-        <Segment icon={<Clock size={13} aria-hidden="true" />} label="Uptime">
-          {fmtUptime(uptimeSecs)}
-        </Segment>
-        <Divider />
         <Segment
           icon={<ScanLine size={13} aria-hidden="true" />}
           label="Driver Scan"
@@ -124,16 +141,16 @@ export function HeaderStrip() {
         </Segment>
         {isAdmin != null && <Divider />}
         {isAdmin == null ? null : isAdmin ? (
-          <StatusPill tone="ok" icon={<ShieldCheck size={12} aria-hidden="true" />} title="Running with administrator privileges">
-            Admin
+          <StatusPill tone="ok" icon={<ShieldCheck size={12} aria-hidden="true" />} title="Nexum runs with administrator rights.">
+            Administrator
           </StatusPill>
         ) : (
           <StatusPill
-            tone="warn"
-            icon={<ShieldAlert size={12} aria-hidden="true" />}
-            title="Not elevated: fan control, Windows Temp / Update cache cleanup and some sensors are unavailable. Restart Nexum as administrator."
+            tone="unknown"
+            icon={<ShieldOff size={12} aria-hidden="true" />}
+            title="Nexum runs without administrator rights: some sensors, fan control and some cache cleanup are unavailable."
           >
-            Limited Mode
+            Not elevated
           </StatusPill>
         )}
       </div>

@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { cn } from "../../lib/format";
+import { STATUS_CLASS, type StatusTone } from "../ui";
 
 export type StatAccent = "teal" | "gold" | "purple" | "rose" | "cyan" | "silver";
 
@@ -20,8 +21,12 @@ export interface StatTileProps {
   accent?: StatAccent;
   icon?: ReactNode;
   className?: string;
-  /** Colour the big number with the accent (e.g. for alert counts). */
+  /** Colour the big number with the accent (decoration only). */
   tintValue?: boolean;
+  /** State colour for the big number (status tokens). Use with `title` so the rule is visible on hover. */
+  valueTone?: StatusTone;
+  /** Hover text, e.g. the rule behind a status number. */
+  title?: string;
 }
 
 /** Compact KPI tile with a vertical glowing accent line (matches the dashboard telemetry strip). */
@@ -34,6 +39,8 @@ export default function StatTile({
   icon,
   className,
   tintValue,
+  valueTone,
+  title,
 }: StatTileProps) {
   const a = ACCENT[accent];
   return (
@@ -42,6 +49,7 @@ export default function StatTile({
         "relative overflow-hidden rounded-xl border border-line bg-card px-4 py-3 backdrop-blur-xl",
         className,
       )}
+      title={title}
     >
       <span className={cn("absolute left-0 top-3 bottom-3 w-[3px] rounded-r", a.line)} />
       <div className="flex items-center justify-between gap-2 pl-1.5">
@@ -49,7 +57,12 @@ export default function StatTile({
         {icon && <span className={cn("shrink-0 opacity-80", a.text)}>{icon}</span>}
       </div>
       <div className="mt-1.5 flex items-baseline gap-1.5 pl-1.5">
-        <span className={cn("font-mono text-[26px] font-semibold leading-none", tintValue ? a.text : "text-ink")}>
+        <span
+          className={cn(
+            "font-mono text-[26px] font-semibold leading-none max-[1439px]:text-[22px]",
+            valueTone ? STATUS_CLASS[valueTone].text : tintValue ? a.text : "text-ink",
+          )}
+        >
           {value}
         </span>
         {unit && <span className="font-mono text-[12px] text-muted">{unit}</span>}

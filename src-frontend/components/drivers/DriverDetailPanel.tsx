@@ -4,18 +4,19 @@ import { Check, Copy, Cpu, ExternalLink, X } from "lucide-react";
 import type { DriverInfo } from "../../types";
 import { api } from "../../lib/api";
 import { DottedLeaderRow } from "../ui";
-import { cn } from "../../lib/format";
 import { toast } from "../feedback/Toast";
 import { DriverStatusBadge, SignatureBadge } from "./DriverTable";
-import { fmtAge, signatureKind, signatureLabel, vendorPortalFor } from "./driverUtils";
+import { fmtAge, NEUTRAL_CODES, problemText, signatureKind, signatureLabel, vendorPortalFor } from "./driverUtils";
 
 export interface DriverDetailPanelProps {
   driver: DriverInfo | null;
+  /** All identical devices when the table row is a group ("Processor × 16"). */
+  members?: DriverInfo[];
   onClose: () => void;
 }
 
-/** Right-hand slide-over with the full metadata of one driver. */
-export default function DriverDetailPanel({ driver, onClose }: DriverDetailPanelProps) {
+/** Right-hand slide-over with the full metadata of one driver (INF lives here, not in the table). */
+export default function DriverDetailPanel({ driver, members, onClose }: DriverDetailPanelProps) {
   const [copied, setCopied] = useState(false);
   const open = driver !== null;
 
@@ -39,10 +40,12 @@ export default function DriverDetailPanel({ driver, onClose }: DriverDetailPanel
 
   const portal = vendorPortalFor(driver);
   const sig = signatureKind(driver);
+  const group = members && members.length > 1 ? members : null;
+  const neutralCode = driver.problemCode != null && NEUTRAL_CODES.has(driver.problemCode);
 
   const copyId = async () => {
     try {
-      await navigator.clipboard.writeText(driver.deviceId);
+      await navigator.clipboard.writeText(group ? group.map((m) => m.deviceId).join("\n") : driver.deviceId);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
     } catch {
@@ -71,12 +74,15 @@ export default function DriverDetailPanel({ driver, onClose }: DriverDetailPanel
 
         {/* Header */}
         <div className="flex items-start gap-3 border-b border-line px-5 py-4">
-          <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-gold/30 bg-gold/10 text-gold">
+          <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-line bg-white/[0.04] text-silver">
             <Cpu size={18} />
           </div>
           <div className="min-w-0 flex-1">
             <div className="text-[10.5px] uppercase tracking-[0.18em] text-muted">{driver.category} · Driver</div>
-            <h2 className="mt-0.5 text-[15px] font-semibold leading-snug text-ink">{driver.deviceName || "Unknown device"}</h2>
+            <h2 className="mt-0.5 text-[15px] font-semibold leading-snug text-ink">
+              {driver.deviceName || "Unknown device"}
+              {group && <span className="ml-1.5 font-mono text-[13px] font-normal text-silver">× {group.length}</span>}
+            </h2>
             <div className="mt-2 flex flex-wrap items-center gap-2">
               <DriverStatusBadge driver={driver} />
               <SignatureBadge driver={driver} />
@@ -86,6 +92,7 @@ export default function DriverDetailPanel({ driver, onClose }: DriverDetailPanel
             type="button"
             onClick={onClose}
             aria-label="Close"
+            title="Close"
             className="rounded-md p-1.5 text-muted transition hover:bg-white/5 hover:text-ink"
           >
             <X size={16} />
@@ -94,20 +101,35 @@ export default function DriverDetailPanel({ driver, onClose }: DriverDetailPanel
 
         {/* Body */}
         <div className="nx-scroll flex-1 space-y-5 overflow-y-auto px-5 py-4">
+          {driver.status === "problem" && (
+            <p className="rounded-md border border-crit/40 bg-crit/[0.07] px-3 py-2 text-[12px] leading-relaxed text-rose-300">
+              Windows reports a problem with this device: {problemText(driver.problemCode)}. Open Device Manager for
+              Windows' own troubleshooting steps.
+            </p>
+          )}
+          {neutralCode && (
+            <p className="rounded-md border border-line bg-white/[0.03] px-3 py-2 text-[12px] leading-relaxed text-silver">
+              {problemText(driver.problemCode)}. This is not a fault.
+            </p>
+          )}
+
           <section>
             <SectionLabel>Driver package</SectionLabel>
             <div className="space-y-1.5">
               <DottedLeaderRow label="Provider" value={driver.provider || "—"} />
               <DottedLeaderRow label="Manufacturer" value={driver.manufacturer || "—"} />
               <DottedLeaderRow label="Version" value={driver.version || "—"} valueClassName="font-mono" />
-              <DottedLeaderRow
-                label="Release date"
-                value={driver.date || "—"}
-                valueClassName={cn("font-mono", driver.status === "outdated" && "text-rose")}
-              />
-              <DottedLeaderRow label="Age" value={fmtAge(driver.ageDays)} valueClassName="font-mono" />
+              <DottedLeaderRow label="Release date" value={driver.date || "—"} valueClassName="font-mono whitespace-nowrap" />
+              <DottedLeaderRow label="Age" value={fmtAge(driver.ageDays)} valueClassName="font-mono text-slate-400" />
               <DottedLeaderRow label="INF file" value={driver.infName || "—"} valueClassName="font-mono" />
+              <DottedLeaderRow
+                label="Origin"
+                value={driver.isInbox ? "In-box (ships with Windows)" : "Third-party package"}
+              />
             </div>
+            <p className="mt-2 text-[11px] leading-relaxed text-muted">
+              Driver age is information only. An older driver that works is not a problem.
+            </p>
           </section>
 
           <section>
@@ -118,7 +140,9 @@ export default function DriverDetailPanel({ driver, onClose }: DriverDetailPanel
             </div>
             <div className="mt-3 rounded-lg border border-line bg-canvas-0/70 p-3">
               <div className="mb-1.5 flex items-center justify-between">
-                <span className="text-[10.5px] uppercase tracking-[0.16em] text-muted">Hardware / Device ID</span>
+                <span className="text-[10.5px] uppercase tracking-[0.16em] text-muted">
+                  {group ? `Device IDs (${group.length})` : "Hardware / Device ID"}
+                </span>
                 <button
                   type="button"
                   onClick={copyId}
@@ -129,30 +153,29 @@ export default function DriverDetailPanel({ driver, onClose }: DriverDetailPanel
                   {copied ? "Copied" : "Copy"}
                 </button>
               </div>
-              <code className="block break-all font-mono text-[11.5px] leading-relaxed text-cyan">
-                {driver.deviceId || "—"}
-              </code>
+              {group ? (
+                <ul className="nx-scroll max-h-40 space-y-1 overflow-y-auto">
+                  {group.map((m) => (
+                    <li key={m.deviceId} className="break-all font-mono text-[11px] leading-relaxed text-cyan">
+                      {m.deviceId || "—"}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <code className="block break-all font-mono text-[11.5px] leading-relaxed text-cyan">{driver.deviceId || "—"}</code>
+              )}
             </div>
           </section>
 
           <section>
             <SectionLabel>Digital signature</SectionLabel>
             <div className="space-y-1.5">
-              <DottedLeaderRow
-                label="Status"
-                value={signatureLabel(sig)}
-                valueClassName={sig === "unsigned" ? "text-gold" : sig === "whql" ? "text-teal" : "text-cyan"}
-              />
+              <DottedLeaderRow label="Status" value={signatureLabel(sig)} valueClassName={sig === "unsigned" ? "text-warn" : "text-silver"} />
               <DottedLeaderRow label="Signer" value={driver.signer || "—"} />
             </div>
             {sig === "unsigned" && (
-              <p className="mt-2 rounded-md border border-gold/30 bg-gold/[0.06] px-3 py-2 text-[12px] leading-relaxed text-gold/90">
-                This driver has no valid digital signature. Prefer a WHQL-certified package from the vendor.
-              </p>
-            )}
-            {driver.status === "outdated" && (
-              <p className="mt-2 rounded-md border border-rose/30 bg-rose/[0.06] px-3 py-2 text-[12px] leading-relaxed text-rose/90">
-                Released more than 3 years ago. Check the vendor portal for a newer version.
+              <p className="mt-2 rounded-md border border-warn/35 bg-warn/[0.06] px-3 py-2 text-[12px] leading-relaxed text-warn">
+                This driver has no valid digital signature. Prefer a WHQL-certified package from the device maker.
               </p>
             )}
           </section>
@@ -163,14 +186,15 @@ export default function DriverDetailPanel({ driver, onClose }: DriverDetailPanel
           <button
             type="button"
             onClick={openPortal}
-            className="flex w-full items-center justify-center gap-2 rounded-lg border border-gold/60 bg-gold/10 px-4 py-2.5 text-[13px] font-semibold text-gold shadow-[0_0_18px_rgba(212,163,89,0.15)] transition hover:bg-gold/20"
+            className="flex w-full items-center justify-center gap-2 rounded-lg border border-white/15 bg-white/[0.04] px-4 py-2.5 text-[13px] font-semibold text-ink transition hover:bg-white/[0.08]"
           >
             <ExternalLink size={15} />
-            Vendor update portal · {portal.vendor}
+            Open {portal.vendor} support page
           </button>
           <div className="mt-2 truncate text-center font-mono text-[10.5px] text-muted" title={portal.url}>
             {portal.url}
           </div>
+          <p className="mt-2 text-center text-[11px] text-muted">Nexum never installs drivers.</p>
         </div>
       </aside>
     </div>,
@@ -180,8 +204,8 @@ export default function DriverDetailPanel({ driver, onClose }: DriverDetailPanel
 
 function SectionLabel({ children }: { children: string }) {
   return (
-    <div className="mb-2 flex items-center gap-2 text-[10.5px] font-semibold uppercase tracking-[0.18em] text-gold/80">
-      <span className="h-px w-3 bg-gold/50" />
+    <div className="mb-2 flex items-center gap-2 text-[10.5px] font-semibold uppercase tracking-[0.18em] text-silver">
+      <span className="h-px w-3 bg-white/25" />
       {children}
     </div>
   );

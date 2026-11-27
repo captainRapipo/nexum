@@ -1,6 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Fan, HardDrive, LayoutDashboard, Cpu, RefreshCw, Settings, Sparkles, Zap, type LucideIcon } from "lucide-react";
-import type { ViewId } from "../../types";
+import {
+  Activity,
+  CircuitBoard,
+  Cpu,
+  Eraser,
+  Fan,
+  HardDrive,
+  LayoutDashboard,
+  RefreshCw,
+  Settings,
+  type LucideIcon,
+} from "lucide-react";
+import { FKEY_MAP, VIEW_LABELS, VIEW_ORDER, type ViewId } from "../../types";
 import { cn } from "../../lib/format";
 import { Button } from "../ui/Button";
 import { NexumEmblem } from "./NexumEmblem";
@@ -8,7 +19,8 @@ import { NexumEmblem } from "./NexumEmblem";
 export interface TopBarProps {
   view: ViewId;
   onNavigate: (view: ViewId) => void;
-  onPurge: () => void;
+  /** [BREAKING] was onPurge. Opens the cache-cleanup modal (same as F9). */
+  onCleanCaches: () => void;
   /** May return a promise; the refresh icon spins until it settles. */
   onRefresh: () => void | Promise<unknown>;
   onSettings: () => void;
@@ -20,20 +32,41 @@ interface TabDef {
   id: ViewId;
   label: string;
   icon: LucideIcon;
-  hotkey?: string;
+  /** Function key from FKEY_MAP, if any. */
+  hotkey: string | null;
+  /** Ctrl+N alias (index in VIEW_ORDER + 1). */
+  ctrl: string;
 }
 
-export const VIEW_TABS: readonly TabDef[] = [
-  { id: "dashboard", label: "Dashboard", icon: LayoutDashboard, hotkey: "F1" },
-  { id: "drivers", label: "Drivers", icon: Cpu, hotkey: "F2" },
-  { id: "storage", label: "Storage", icon: HardDrive, hotkey: "F3" },
-  { id: "fans", label: "Fan Control", icon: Fan, hotkey: "F4" },
-  { id: "cleaner", label: "Cleaner", icon: Sparkles },
-];
+const VIEW_ICONS: Record<ViewId, LucideIcon> = {
+  dashboard: LayoutDashboard,
+  sensors: Activity,
+  system: Cpu,
+  storage: HardDrive,
+  cooling: Fan,
+  drivers: CircuitBoard,
+  cleaner: Eraser,
+};
+
+/** F-key bound to a view (CONTRACT §4.6). */
+export function fkeyFor(view: ViewId): string | null {
+  for (const [key, action] of Object.entries(FKEY_MAP)) {
+    if (action.type === "view" && action.view === view) return key;
+  }
+  return null;
+}
+
+export const VIEW_TABS: readonly TabDef[] = VIEW_ORDER.map((id, i) => ({
+  id,
+  label: VIEW_LABELS[id],
+  icon: VIEW_ICONS[id],
+  hotkey: fkeyFor(id),
+  ctrl: `Ctrl+${i + 1}`,
+}));
 
 const MIN_SPIN_MS = 700;
 
-export function TopBar({ view, onNavigate, onPurge, onRefresh, onSettings, refreshing = false }: TopBarProps) {
+export function TopBar({ view, onNavigate, onCleanCaches, onRefresh, onSettings, refreshing = false }: TopBarProps) {
   const [busy, setBusy] = useState(false);
   const alive = useRef(true);
   useEffect(() => {
@@ -61,7 +94,7 @@ export function TopBar({ view, onNavigate, onPurge, onRefresh, onSettings, refre
   const spinning = busy || refreshing;
 
   return (
-    <header className="relative z-20 flex h-14 shrink-0 select-none items-center gap-5 border-b border-line bg-[#081114]/75 px-5 backdrop-blur-xl">
+    <header className="relative z-20 flex h-14 shrink-0 select-none items-center gap-4 border-b border-line bg-[#081114]/75 px-4 backdrop-blur-xl min-[1440px]:gap-5 min-[1440px]:px-5">
       {/* bottom hairline glow */}
       <span
         aria-hidden="true"
@@ -86,15 +119,16 @@ export function TopBar({ view, onNavigate, onPurge, onRefresh, onSettings, refre
         {VIEW_TABS.map((tab) => {
           const active = tab.id === view;
           const Icon = tab.icon;
+          const keys = tab.hotkey ? `${tab.hotkey} or ${tab.ctrl}` : tab.ctrl;
           return (
             <button
               key={tab.id}
               type="button"
               aria-current={active ? "page" : undefined}
-              title={tab.hotkey ? `${tab.label} (${tab.hotkey})` : tab.label}
+              title={`${tab.label} (${keys})`}
               onClick={() => onNavigate(tab.id)}
               className={cn(
-                "group relative flex items-center gap-2 px-3 text-[12.5px] font-medium tracking-[0.02em] transition-colors duration-150",
+                "group relative flex items-center gap-1.5 px-2.5 text-[12.5px] font-medium tracking-[0.02em] transition-colors duration-150 min-[1440px]:gap-2 min-[1440px]:px-3",
                 active ? "text-ink" : "text-slate-400 hover:text-slate-200",
               )}
             >
@@ -108,13 +142,16 @@ export function TopBar({ view, onNavigate, onPurge, onRefresh, onSettings, refre
                 size={15}
                 strokeWidth={1.9}
                 aria-hidden="true"
-                className={cn("relative transition-colors", active ? "text-teal drop-shadow-[0_0_6px_rgba(45,212,191,0.7)]" : "text-slate-500 group-hover:text-slate-300")}
+                className={cn(
+                  "relative shrink-0 transition-colors",
+                  active ? "text-teal drop-shadow-[0_0_6px_rgba(45,212,191,0.7)]" : "text-slate-500 group-hover:text-slate-300",
+                )}
               />
               <span className="relative whitespace-nowrap">{tab.label}</span>
               {tab.hotkey && (
                 <span
                   className={cn(
-                    "kbd-sm relative hidden min-[1440px]:inline-flex",
+                    "kbd-sm relative hidden min-[1600px]:inline-flex",
                     active && "[--kbd-color:var(--color-teal)] [--kbd-border:rgba(45,212,191,0.35)]",
                   )}
                 >
@@ -135,17 +172,15 @@ export function TopBar({ view, onNavigate, onPurge, onRefresh, onSettings, refre
 
       {/* Actions */}
       <div className="ml-auto flex shrink-0 items-center gap-2">
-        <Button variant="gold" icon={Zap} onClick={onPurge} title="1-Click Purge Trash (F9)" className="uppercase tracking-[0.08em]">
-          1-Click Purge Trash
-          <span className="kbd-sm ml-0.5 hidden [--kbd-border:rgba(212,163,89,0.4)] [--kbd-color:rgba(212,163,89,0.85)] min-[1440px]:inline-flex">
-            F9
-          </span>
+        {/* MF-4: ghost style, not a permanent gold call to action. */}
+        <Button variant="ghost" icon={Eraser} onClick={onCleanCaches} title="Clean caches (F9)">
+          Clean caches (F9)
         </Button>
         <span aria-hidden="true" className="mx-1 h-6 w-px bg-line" />
         <Button
           variant="ghost"
-          aria-label="Refresh sensors (F5)"
-          title="Refresh sensors (F5)"
+          aria-label="Rescan (F5)"
+          title="Rescan (F5)"
           onClick={() => void handleRefresh()}
           aria-busy={spinning || undefined}
           icon={<RefreshCw size={16} strokeWidth={1.9} aria-hidden="true" className={cn(spinning && "animate-spin text-teal")} />}

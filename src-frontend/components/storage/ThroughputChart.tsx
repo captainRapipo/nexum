@@ -3,7 +3,7 @@ import type { EChartsOption } from "echarts";
 import { EChart } from "../ui";
 
 const TEAL = "#2DD4BF";
-const GOLD = "#D4A359";
+const CYAN = "#22D3EE";
 
 export interface ThroughputChartProps {
   /** Unix ms timestamps aligned with read/write. */
@@ -77,7 +77,7 @@ export default function ThroughputChart({ ts, read, write, height = 70 }: Throug
           return [`<span style="color:#64748B">${time}</span>`, ...lines].join("<br/>");
         },
       },
-      series: [series("Read", TEAL, read), series("Write", GOLD, write)],
+      series: [series("Read", TEAL, read), series("Write", CYAN, write)],
     } as EChartsOption;
   }, [ts, read, write]);
 

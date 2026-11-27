@@ -9,7 +9,7 @@ const REFRESH_MS = 10 * 60 * 1000;
 const FRESH_MS = 5 * 60 * 1000;
 
 export interface TrashEstimate {
-  /** Bytes the 1-Click purge would reclaim (its default selection); null until the first scan completes. */
+  /** Bytes the quick cache cleanup would reclaim now (default selection, available categories only); null until the first scan completes. */
   totalBytes: number | null;
   /** True while a scan is in flight. */
   loading: boolean;
@@ -61,7 +61,8 @@ function runScan(includeBrowser: boolean): void {
         // The backend measures every category (browser caches included) but only pre-selects what the
         // 1-Click purge cleans by default; report that selection, not the grand total.
         const selected = scan.categories.reduce(
-          (s, c) => (c.enabled && Number.isFinite(c.bytes) && c.bytes > 0 ? s + c.bytes : s),
+          (s, c) =>
+            c.enabled && c.available !== false && Number.isFinite(c.bytes) && c.bytes > 0 ? s + c.bytes : s,
           0,
         );
         publish({ totalBytes: selected, at: Date.now(), includeBrowser });
@@ -103,7 +104,7 @@ subscribePurge(() => {
 });
 
 /**
- * Lightweight dry-run trash estimate for dashboard widgets.
+ * Lightweight dry-run reclaimable-cache estimate for dashboard widgets.
  * Calls `api.scanTrash(settings.includeBrowserCaches)` when no fresh value is cached, whenever the
  * browser-cache setting changes, every 10 minutes while mounted, and after every purge.
  * Errors are swallowed (the previous value is kept) — this is a passive estimate, not a workflow.

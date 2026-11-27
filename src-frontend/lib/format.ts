@@ -1,6 +1,8 @@
 // Formatting helpers shared by every view. All functions are null-safe and
 // return an em dash for missing / non-finite values.
 
+import type { SensorMeta } from "../types";
+
 export type TempUnit = "C" | "F";
 
 export const DASH = "—";
@@ -225,4 +227,92 @@ export function pickPrimaryGpu(names: Maybe<readonly string[]>): string | null {
   const real = names.filter((n) => n && !VIRTUAL_GPU.test(n));
   const pool = real.length > 0 ? real : names;
   return pool.find((n) => DISCRETE_GPU.test(n)) ?? pool[0] ?? null;
+}
+
+/* ------------------------------------------------------------------ */
+/* 1.0.0-gate additions (CONTRACT §4.5)                                */
+/* ------------------------------------------------------------------ */
+
+/** en-US thousands separators: `20,188`. */
+export function fmtCount(n: Maybe<number>): string {
+  if (!isNum(n)) return DASH;
+  return nf(0, 0).format(Math.round(n));
+}
+
+/** `••••3D4E` — serials are masked in every export and "Copy as text". */
+export function maskSerial(s: Maybe<string>): string {
+  const t = (s ?? "").trim();
+  if (!t) return DASH;
+  return `••••${t.slice(-4)}`;
+}
+
+const CORP_SUFFIX = /,?\s*(?:Inc\.?|LLC\.?|Ltd\.?|Co\.?,?\s*Ltd\.?|Corporation|Corp\.?)$/i;
+
+function stripCorpSuffix(raw: string): string {
+  let s = raw.trim();
+  // Repeat: "Foo Co., Ltd." / "Foo, Inc." / "Foo International, LLC."
+  for (let i = 0; i < 3; i++) {
+    const next = s.replace(CORP_SUFFIX, "").replace(/[\s,.]+$/, "").trim();
+    if (next === s) break;
+    s = next;
+  }
+  return s;
+}
+
+/** "American Megatrends International, LLC." → "AMI"; "Phoenix Technologies Ltd." → "Phoenix Technologies". */
+export function fmtBiosVendor(raw: Maybe<string>): string {
+  const t = (raw ?? "").trim();
+  if (!t) return DASH;
+  const s = stripCorpSuffix(t);
+  if (/^american\s+megatrends/i.test(s)) return "AMI";
+  return s || t;
+}
+
+const BOARD_VENDOR_ALIAS: ReadonlyArray<[RegExp, string]> = [
+  [/^gigabyte/i, "Gigabyte"],
+  [/^asustek|^asus\b/i, "ASUS"],
+  [/^micro-star|^msi\b/i, "MSI"],
+  [/^asrock/i, "ASRock"],
+];
+
+/** `Gigabyte Technology Co., Ltd.` + `B550 GAMING X` → `Gigabyte B550 GAMING X`. */
+export function fmtBoardName(manufacturer: Maybe<string>, product: Maybe<string>): string {
+  const m = (manufacturer ?? "").trim();
+  const p = (product ?? "").trim();
+  let vendor = "";
+  if (m) {
+    const alias = BOARD_VENDOR_ALIAS.find(([re]) => re.test(m));
+    vendor = alias ? alias[1] : stripCorpSuffix(m) || m;
+  }
+  if (!vendor && !p) return DASH;
+  if (!vendor) return p;
+  if (!p) return vendor;
+  // Avoid "MSI MSI MAG B550" when the product already carries the vendor.
+  if (p.toLowerCase().startsWith(vendor.toLowerCase())) return p;
+  return `${vendor} ${p}`;
+}
+
+/** Unit suffixes glued to the number (no space). */
+const TIGHT_UNITS = new Set(["%", "°C", "°F"]);
+
+/**
+ * Sensor value in its unit with `meta.decimals` decimals; `—` for null.
+ * Temperatures are converted to °F when `tempUnit === "F"`.
+ */
+export function fmtSensorValue(
+  v: number | null | undefined,
+  meta: Pick<SensorMeta, "unit" | "decimals" | "kind">,
+  tempUnit: TempUnit = "C",
+): string {
+  if (!isNum(v)) return DASH;
+  let value = v;
+  let unit: string = meta.unit;
+  if (meta.unit === "°C" && tempUnit === "F") {
+    value = toTempUnit(v, "F");
+    unit = "°F";
+  }
+  const d = Math.max(0, Math.min(6, Math.round(meta.decimals ?? 0)));
+  const num = nf(d, d).format(value);
+  if (!unit) return num;
+  return TIGHT_UNITS.has(unit) ? `${num}${unit}` : `${num} ${unit}`;
 }

@@ -3,12 +3,13 @@ import { ScanSearch } from "lucide-react";
 import LedProgress from "./LedProgress";
 
 const STAGES = [
-  "User & system temp folders",
+  "Temporary files",
+  "Windows Update cache",
+  "Error reports and old logs",
+  "Old crash dumps",
+  "Shader caches",
   "Recycle Bin",
-  "Windows Update & Delivery Optimization cache",
-  "DirectX / NVIDIA / AMD shader caches",
-  "Browser & app caches",
-  "Crash dumps, WER reports & Prefetch",
+  "Browser and Discord caches",
 ];
 
 const CSS = `
@@ -20,7 +21,7 @@ const CSS = `
 `;
 
 /** Dry-run scan animation: radar sweep + cycling stage label + indeterminate LED bar. */
-export default function ScanningState({ title = "Analyzing reclaimable space…" }: { title?: string }) {
+export default function ScanningState({ title = "Measuring reclaimable caches…" }: { title?: string }) {
   const [stage, setStage] = useState(0);
   useEffect(() => {
     const t = window.setInterval(() => setStage((s) => (s + 1) % STAGES.length), 650);
@@ -31,15 +32,15 @@ export default function ScanningState({ title = "Analyzing reclaimable space…"
     <div className="flex flex-col items-center gap-5 py-8">
       <style>{CSS}</style>
       <div className="relative h-28 w-28">
-        <span className="nx-ping absolute inset-0 rounded-full border border-gold/40" />
-        <span className="absolute inset-0 rounded-full border border-line bg-[radial-gradient(circle,rgba(212,163,89,0.10),transparent_70%)]" />
+        <span className="nx-ping absolute inset-0 rounded-full border border-teal/40" />
+        <span className="absolute inset-0 rounded-full border border-line bg-[radial-gradient(circle,rgba(45,212,191,0.10),transparent_70%)]" />
         <span className="absolute inset-4 rounded-full border border-white/[0.06]" />
         <span className="absolute inset-8 rounded-full border border-white/[0.06]" />
         <span
           className="nx-radar absolute inset-0 rounded-full"
-          style={{ background: "conic-gradient(from 0deg, rgba(212,163,89,0.55), rgba(212,163,89,0) 70deg, transparent 360deg)" }}
+          style={{ background: "conic-gradient(from 0deg, rgba(45,212,191,0.5), rgba(45,212,191,0) 70deg, transparent 360deg)" }}
         />
-        <span className="absolute inset-0 flex items-center justify-center text-gold">
+        <span className="absolute inset-0 flex items-center justify-center text-teal">
           <ScanSearch size={26} />
         </span>
       </div>
@@ -48,9 +49,9 @@ export default function ScanningState({ title = "Analyzing reclaimable space…"
         <div className="mt-1 h-4 font-mono text-[11.5px] text-muted">Scanning · {STAGES[stage]}</div>
       </div>
       <div className="w-full max-w-sm">
-        <LedProgress tone="gold" segments={32} height={6} />
+        <LedProgress tone="teal" segments={32} height={6} />
       </div>
-      <div className="text-[11px] text-muted">Dry run only — nothing is deleted until you confirm.</div>
+      <div className="text-[11px] text-muted">Measuring only. Nothing is deleted until you choose Clean.</div>
     </div>
   );
 }

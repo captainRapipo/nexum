@@ -1,19 +1,26 @@
-import { useEffect, useRef, useState } from "react";
-import { Fan, Lock } from "lucide-react";
-import type { FanTelemetry } from "../../types";
-import { cn } from "../../lib/format";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { Check, Fan, Lock, Pencil, X } from "lucide-react";
+import type { FanTelemetry, SensorLabelMeta } from "../../types";
+import { cn, fmtRpm } from "../../lib/format";
 import FanGauge from "./FanGauge";
 
 export const FAN_MIN_PCT = 20;
 export const FAN_MAX_PCT = 100;
 const DEBOUNCE_MS = 250;
+const MAX_LABEL_LEN = 64;
 
 export interface FanCardProps {
   fan: FanTelemetry;
-  /** Scale for the gauge (observed max or a sensible default). */
+  /** Display name: the user's label, else the LHM default name. */
+  label: string;
+  /** Saves a label ("" restores the default name). */
+  onRename?: (id: string, label: string, meta: SensorLabelMeta) => void;
+  /** Scale for the gauge (session max or a sensible default). */
   maxRpm: number;
-  /** Whether manual control is allowed right now (admin + controllable). */
+  /** Whether manual control is allowed right now (admin + controllable + not locked). */
   canControl: boolean;
+  /** True while the thermal override holds every header at 100%. */
+  held?: boolean;
   /** Called (debounced) with the new duty cycle. */
   onSetPct: (id: string, pct: number) => void;
 }
@@ -22,9 +29,11 @@ function isPump(name: string) {
   return /pump|aio/i.test(name);
 }
 
-export default function FanCard({ fan, maxRpm, canControl, onSetPct }: FanCardProps) {
+export default function FanCard({ fan, label, onRename, maxRpm, canControl, held = false, onSetPct }: FanCardProps) {
   const telemetryPct = fan.controlPct;
   const [draft, setDraft] = useState<number>(clampPct(telemetryPct ?? 50));
+  const [editing, setEditing] = useState(false);
+  const [labelDraft, setLabelDraft] = useState(label);
   const dirtyUntil = useRef(0);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onSetRef = useRef(onSetPct);
@@ -56,31 +65,86 @@ export default function FanCard({ fan, maxRpm, canControl, onSetPct }: FanCardPr
     }, DEBOUNCE_MS);
   };
 
-  const stalled = fan.rpm <= 0;
-  const pump = isPump(fan.name);
-  const color = pump ? "#9333EA" : "#22D3EE";
+  const startRename = () => {
+    setLabelDraft(label);
+    setEditing(true);
+  };
+  const saveRename = () => {
+    const next = labelDraft.trim().slice(0, MAX_LABEL_LEN);
+    onRename?.(fan.id, next === fan.name ? "" : next, { defaultName: fan.name, hardwareName: fan.hardware });
+    setEditing(false);
+  };
+  const onRenameKey = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      saveRename();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      setEditing(false);
+    }
+  };
+
+  const rpm = Number.isFinite(fan.rpm) ? fan.rpm : 0;
+  const stopped = rpm <= 0;
+  const pump = isPump(fan.name) || isPump(label);
+  const color = pump ? "#A855F7" : "#22D3EE";
   const fill = ((draft - FAN_MIN_PCT) / (FAN_MAX_PCT - FAN_MIN_PCT)) * 100;
 
   return (
-    <div
-      className={cn(
-        "group relative flex flex-col overflow-hidden rounded-xl border bg-white/[0.02] p-4 transition",
-        stalled ? "border-rose/30" : "border-line hover:border-cyan/25",
-      )}
-    >
+    <div className="group relative flex min-w-0 flex-col overflow-hidden rounded-xl border border-line bg-white/[0.02] p-4 transition hover:border-cyan/25">
       <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0">
-          <div className="flex items-center gap-1.5">
-            <Fan
-              size={14}
-              className={cn(pump ? "text-purple" : "text-cyan", !stalled && "nx-fan-spin")}
-              style={!stalled ? { animationDuration: `${Math.max(0.25, 3 - (fan.rpm / Math.max(1, maxRpm)) * 2.6)}s` } : undefined}
-            />
-            <span className="truncate text-[13px] font-semibold text-ink" title={fan.name}>
-              {fan.name}
-            </span>
-          </div>
+        <div className="min-w-0 flex-1">
+          {editing ? (
+            <div className="flex items-center gap-1">
+              <input
+                autoFocus
+                value={labelDraft}
+                maxLength={MAX_LABEL_LEN}
+                onChange={(e) => setLabelDraft(e.target.value)}
+                onKeyDown={onRenameKey}
+                aria-label={`Name for ${fan.name}`}
+                placeholder={fan.name}
+                className="min-w-0 flex-1 rounded border border-cyan/40 bg-canvas-0/80 px-1.5 py-0.5 text-[12.5px] text-ink outline-none"
+              />
+              <button type="button" onClick={saveRename} title="Save name" aria-label="Save name" className="rounded p-1 text-silver hover:text-ink">
+                <Check size={13} />
+              </button>
+              <button
+                type="button"
+                onClick={() => setEditing(false)}
+                title="Cancel"
+                aria-label="Cancel rename"
+                className="rounded p-1 text-muted hover:text-ink"
+              >
+                <X size={13} />
+              </button>
+            </div>
+          ) : (
+            <div className="flex items-center gap-1.5">
+              <Fan
+                size={14}
+                className={cn("shrink-0", pump ? "text-purple-400" : "text-cyan", !stopped && "nx-fan-spin")}
+                style={!stopped ? { animationDuration: `${Math.max(0.25, 3 - (rpm / Math.max(1, maxRpm)) * 2.6)}s` } : undefined}
+              />
+              <span className="truncate text-[13px] font-semibold text-ink" title={label !== fan.name ? `${label} (${fan.name})` : label}>
+                {label}
+              </span>
+              {onRename && (
+                <button
+                  type="button"
+                  onClick={startRename}
+                  title={`Rename ${label}`}
+                  aria-label={`Rename ${label}`}
+                  className="shrink-0 rounded p-0.5 text-muted opacity-0 transition hover:text-ink focus-visible:opacity-100 group-hover:opacity-100"
+                >
+                  <Pencil size={11} />
+                </button>
+              )}
+            </div>
+          )}
           <div className="mt-0.5 truncate text-[10.5px] text-muted" title={fan.hardware}>
+            {label !== fan.name ? `${fan.name} · ` : ""}
             {fan.hardware || "—"}
           </div>
         </div>
@@ -90,6 +154,7 @@ export default function FanCard({ fan, maxRpm, canControl, onSetPct }: FanCardPr
               "shrink-0 rounded border px-1.5 py-px text-[9.5px] font-semibold uppercase tracking-wider",
               canControl ? "border-teal/40 bg-teal/10 text-teal" : "border-line bg-white/5 text-muted",
             )}
+            title="This header accepts a PWM duty cycle"
           >
             PWM
           </span>
@@ -102,15 +167,24 @@ export default function FanCard({ fan, maxRpm, canControl, onSetPct }: FanCardPr
       </div>
 
       <div className="mt-2 flex justify-center">
-        <FanGauge rpm={fan.rpm} maxRpm={maxRpm} color={color} stalled={stalled} />
+        <FanGauge rpm={rpm} maxRpm={maxRpm} color={color} stalled={false} />
       </div>
-      {stalled && <div className="-mt-1 text-center text-[10.5px] uppercase tracking-[0.16em] text-rose">Stopped / 0 RPM</div>}
+      <div className="-mt-1 text-center font-mono text-[10.5px] text-muted">
+        {stopped ? (
+          <span>Not spinning</span>
+        ) : (
+          <span>
+            Min {fan.rpmMin != null ? Math.round(fan.rpmMin).toLocaleString("en-US") : "—"} · Max{" "}
+            {fan.rpmMax != null ? fmtRpm(fan.rpmMax) : "—"}
+          </span>
+        )}
+      </div>
 
       <div className="mt-3">
         <div className="mb-1.5 flex items-center justify-between text-[10.5px]">
           <span className="uppercase tracking-[0.16em] text-muted">Duty cycle</span>
           <span className="font-mono text-[12px] text-ink">
-            {fan.controllable ? `${Math.round(canControl ? draft : (telemetryPct ?? draft))}%` : "—"}
+            {fan.controllable ? (held ? "100% (held)" : `${Math.round(canControl ? draft : (telemetryPct ?? draft))}%`) : "—"}
           </span>
         </div>
         {fan.controllable && canControl ? (
@@ -120,7 +194,7 @@ export default function FanCard({ fan, maxRpm, canControl, onSetPct }: FanCardPr
             max={FAN_MAX_PCT}
             step={1}
             value={draft}
-            aria-label={`${fan.name} duty cycle`}
+            aria-label={`${label} duty cycle`}
             onChange={(e) => change(Number(e.target.value))}
             className="nx-range w-full"
             style={{
@@ -129,10 +203,7 @@ export default function FanCard({ fan, maxRpm, canControl, onSetPct }: FanCardPr
           />
         ) : (
           <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/[0.06]">
-            <div
-              className="h-full rounded-full bg-white/20"
-              style={{ width: `${clampPct(telemetryPct ?? 0)}%` }}
-            />
+            <div className="h-full rounded-full bg-white/20" style={{ width: `${clampPct(telemetryPct ?? 0)}%` }} />
           </div>
         )}
         <div className="mt-1 flex justify-between font-mono text-[9.5px] text-muted">

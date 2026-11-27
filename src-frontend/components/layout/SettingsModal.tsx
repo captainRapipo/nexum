@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { Cpu, Info, Power, RotateCcw, Save, Settings as SettingsIcon, Sparkles, Thermometer } from "lucide-react";
+import { Activity, Cpu, Eraser, ExternalLink, Info, Power, RotateCcw, Save, Settings as SettingsIcon, ShieldCheck, Thermometer } from "lucide-react";
 import type { Settings } from "../../types";
-import { api, errorMessage, isTauri } from "../../lib/api";
+import { api, errorMessage, isTauri, PAWNIO_URL } from "../../lib/api";
 import { fmtRelative } from "../../lib/format";
+import { useNow } from "../../hooks/useNow";
 import { useSettings } from "../../hooks/useSettings";
 import { useTelemetry } from "../../hooks/useTelemetryStream";
 import { Button } from "../ui/Button";
@@ -11,7 +12,6 @@ import { Modal } from "../ui/Modal";
 import { Segmented } from "../ui/Segmented";
 import { StatusPill } from "../ui/StatusPill";
 import { Toggle } from "../ui/Toggle";
-import { useNow } from "./HeaderStrip";
 
 export interface SettingsModalProps {
   open: boolean;
@@ -30,16 +30,23 @@ const UNIT_OPTIONS = [
   { value: "F" as const, label: "°F" },
 ];
 
-const SETTING_KEYS: Array<keyof Settings> = [
+/** Fields edited in this dialog. Only these are saved, so labels / pins changed elsewhere are never overwritten. */
+const SETTING_KEYS = [
   "launchOnStartup",
   "minimizeToTray",
   "pollIntervalMs",
   "includeBrowserCaches",
   "confirmBeforePurge",
-  "flushStandbyOnPurge",
   "tempUnit",
   "startMinimized",
-];
+  "hideUnusedSensors",
+] as const satisfies ReadonlyArray<keyof Settings>;
+
+const DRIVER_CHOICE_TEXT: Record<Settings["sensorDriverChoice"], string> = {
+  undecided: "Not chosen yet",
+  pawnio: "Use PawnIO",
+  none: "No kernel driver",
+};
 
 function Section({ icon, title, children }: { icon: ReactNode; title: string; children: ReactNode }) {
   return (
@@ -110,7 +117,9 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     setSaving(true);
     setSaveError(null);
     try {
-      await update(draft);
+      const patch: Partial<Settings> = {};
+      for (const k of SETTING_KEYS) (patch as Record<string, unknown>)[k] = draft[k];
+      await update(patch);
       onClose();
     } catch (err) {
       setSaveError(errorMessage(err));
@@ -132,16 +141,31 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     }
   };
 
+  const handleElevate = async () => {
+    try {
+      await api.restartAsAdmin();
+    } catch (err) {
+      setRestartMsg({ ok: false, text: errorMessage(err) });
+    }
+  };
+
   const lastPacketTs = latest?.ts ?? agent?.lastPacketTs ?? null;
-  const agentTone = agent == null ? "info" : agent.running ? "ok" : "warn";
+  const agentTone = agent == null ? "unknown" : agent.running ? "ok" : "warn";
   const agentLabel = agent == null ? "Unknown" : agent.running ? "Running" : "Stopped";
+  const driver = agent?.sensorDriver ?? null;
+  const driverText =
+    driver == null
+      ? "—"
+      : driver.kind === "none"
+        ? "Not installed"
+        : `PawnIO ${driver.version ?? "(version unknown)"}${agent?.limitedReasons.includes("pawnIoOutdated") ? ` · needs ${driver.minVersion} or newer` : ""}`;
 
   return (
     <Modal
       open={open}
       onClose={onClose}
-      title="System Settings"
-      subtitle="Startup, telemetry and Deep Purge preferences"
+      title="Settings"
+      subtitle="Startup, telemetry, sensors and cache cleanup preferences"
       icon={SettingsIcon}
       size="lg"
       footer={
@@ -152,7 +176,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                 {saveError}
               </span>
             ) : dirty ? (
-              <span className="text-gold/90">Unsaved changes</span>
+              <span className="text-warn">Unsaved changes</span>
             ) : (
               <span className="text-muted">All changes saved</span>
             )}
@@ -160,7 +184,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
           <Button variant="ghost" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
-          <Button variant="gold" icon={Save} onClick={() => void handleSave()} loading={saving} disabled={!dirty}>
+          <Button variant="teal" icon={Save} onClick={() => void handleSave()} loading={saving} disabled={!dirty}>
             Save
           </Button>
         </>
@@ -211,50 +235,82 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                 onChange={(v) => set("tempUnit", v)}
               />
             </FieldRow>
+            <Toggle
+              label="Hide unused sensors"
+              description="Sensors view: hide sensors with no reading, and fans or voltages that never reported a value."
+              checked={draft.hideUnusedSensors}
+              onChange={(v) => set("hideUnusedSensors", v)}
+            />
+          </Section>
+
+          <Section icon={<Activity size={14} aria-hidden="true" />} title="Sensor driver">
+            <div>
+              <DottedLeaderRow label="Installed" value={driverText} />
+              <DottedLeaderRow label="Your choice" value={DRIVER_CHOICE_TEXT[settings.sensorDriverChoice] ?? "—"} />
+              <p className="mt-1.5 text-[11.5px] leading-snug text-muted">
+                PawnIO is a signed kernel driver from its own website. It gives Nexum CPU, motherboard and fan sensors. Nexum
+                never installs or removes it.
+              </p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <Button variant="ghost" size="sm" icon={ExternalLink} onClick={() => void api.openExternal(PAWNIO_URL)}>
+                  Get PawnIO
+                </Button>
+                {settings.sensorDriverChoice !== "undecided" && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    title="Show the sensor driver choice again the next time it applies"
+                    onClick={() => void update({ sensorDriverChoice: "undecided" }).catch(() => undefined)}
+                  >
+                    Ask me again
+                  </Button>
+                )}
+              </div>
+            </div>
           </Section>
         </div>
 
         <div className="flex flex-col gap-3">
-          <Section icon={<Sparkles size={14} aria-hidden="true" />} title="Deep Purge">
+          <Section icon={<Eraser size={14} aria-hidden="true" />} title="Cache cleanup">
             <Toggle
-              label="Include browser & app caches"
-              description="Chrome, Edge, Firefox and Discord caches. Logins and cookies are kept."
+              label="List browser and Discord caches"
+              description="Chrome, Edge, Firefox and Discord caches. Logins, cookies and history are kept. F9 never cleans them without asking."
               checked={draft.includeBrowserCaches}
               onChange={(v) => set("includeBrowserCaches", v)}
             />
             <Toggle
-              label="Confirm before purge"
-              description="When off, F9 starts the purge immediately."
+              label="Confirm before cleaning"
+              description="When off, F9 cleans temporary files, the Windows Update cache and error reports right away."
               checked={draft.confirmBeforePurge}
               onChange={(v) => set("confirmBeforePurge", v)}
-            />
-            <Toggle
-              label="Flush RAM standby list"
-              description="Free cached standby memory after a purge (administrator)."
-              checked={draft.flushStandbyOnPurge}
-              onChange={(v) => set("flushStandbyOnPurge", v)}
             />
           </Section>
 
           <Section icon={<Cpu size={14} aria-hidden="true" />} title="Hardware Agent">
             <div className="flex items-center justify-between gap-3">
-              <StatusPill tone={agentTone} pulse={agent?.running}>
+              <StatusPill tone={agentTone} pulse={agent?.running} title={agent?.message}>
                 {agentLabel}
               </StatusPill>
-              <Button
-                variant="teal"
-                size="sm"
-                icon={RotateCcw}
-                onClick={() => void handleRestart()}
-                loading={restarting}
-              >
-                Restart Agent
+              <Button variant="teal" size="sm" icon={RotateCcw} onClick={() => void handleRestart()} loading={restarting}>
+                Restart agent
               </Button>
             </div>
             <div>
-              <DottedLeaderRow label="Privileges" value={agent == null ? "—" : agent.isAdmin ? "Administrator" : "Limited"} valueClassName={agent && !agent.isAdmin ? "text-gold" : undefined} />
+              <DottedLeaderRow
+                label="Privileges"
+                value={agent == null ? "—" : agent.isAdmin ? "Administrator" : "Not elevated"}
+                valueClassName={agent && !agent.isAdmin ? "text-warn" : undefined}
+              />
               <DottedLeaderRow label="Last packet" value={lastPacketTs ? fmtRelative(lastPacketTs, now) : "—"} />
+              {agent?.protocol != null && <DottedLeaderRow label="Agent protocol" value={String(agent.protocol)} />}
               {agent?.message && <p className="mt-1.5 break-words font-mono text-[10.5px] leading-relaxed text-slate-500">{agent.message}</p>}
+              {agent && !agent.isAdmin && (
+                <div className="mt-2">
+                  <Button variant="ghost" size="sm" icon={ShieldCheck} onClick={() => void handleElevate()}>
+                    Restart as administrator
+                  </Button>
+                </div>
+              )}
               {restartMsg && (
                 <p className={restartMsg.ok ? "mt-1.5 text-[11.5px] text-teal" : "mt-1.5 text-[11.5px] text-rose-400"} role="status">
                   {restartMsg.text}

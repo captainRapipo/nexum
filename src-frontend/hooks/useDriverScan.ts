@@ -5,7 +5,8 @@ import type { DriverInfo } from "../types";
 export interface DriverCounts {
   total: number;
   ok: number;
-  outdated: number;
+  /** Device reports a Windows problem code (not 22 "disabled" / 45 "not connected"). */
+  problem: number;
   unsigned: number;
 }
 
@@ -55,14 +56,14 @@ export function DriverScanProvider({ children }: { children: ReactNode }) {
 
   const counts = useMemo<DriverCounts>(() => {
     let ok = 0;
-    let outdated = 0;
+    let problem = 0;
     let unsigned = 0;
     for (const d of drivers) {
-      if (d.status === "unsigned") unsigned++;
-      else if (d.status === "outdated") outdated++;
+      if (d.status === "problem") problem++;
+      else if (d.status === "unsigned") unsigned++;
       else ok++;
     }
-    return { total: drivers.length, ok, outdated, unsigned };
+    return { total: drivers.length, ok, problem, unsigned };
   }, [drivers]);
 
   const value = useMemo<DriverScanContextValue>(

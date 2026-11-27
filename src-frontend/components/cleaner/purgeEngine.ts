@@ -5,10 +5,10 @@ import { fmtBytes } from "../../lib/format";
 import { toast } from "../feedback/Toast";
 
 /**
- * Module-level purge runner shared by the 1-Click modal and the Cleaner page.
- * Living outside React means a purge keeps reporting progress (and lands in the session history)
+ * Module-level cleanup runner shared by the "Clean caches" modal and the Cleaner page.
+ * Living outside React means a run keeps reporting progress (and lands in the session history)
  * even if the modal is closed or the view is switched mid-run, and two surfaces can never start
- * overlapping purges.
+ * overlapping runs. (Identifiers keep the backend's `purge` naming; UI copy never says "purge".)
  */
 
 export interface PurgeHistoryEntry {
@@ -16,7 +16,6 @@ export interface PurgeHistoryEntry {
   at: number;
   source: string;
   categories: string[];
-  flushStandby: boolean;
   result: PurgeResult;
 }
 
@@ -26,7 +25,6 @@ export interface PurgeEngineState {
   startedAt: number | null;
   /** Labels/ids of what the current/last run purges, for the progress checklist. */
   plan: { id: TrashCategoryId; label: string }[];
-  flushStandby: boolean;
   progress: PurgeProgress | null;
   /** Monotonic running total of freed bytes reported by `purge-progress`. */
   freedSoFar: number;
@@ -48,7 +46,6 @@ let state: PurgeEngineState = {
   runId: 0,
   startedAt: null,
   plan: [],
-  flushStandby: false,
   progress: null,
   freedSoFar: 0,
   touched: [],
@@ -126,20 +123,16 @@ export function fmtDuration(ms: number): string {
 }
 
 /**
- * Start a purge of `categories` (the 'standby' pseudo-category is always stripped; RAM standby
- * flushing is requested via `flushStandby`). Resolves with the result, or rejects on failure.
- * Rejects immediately if another purge is already running.
+ * Start a cache cleanup of `categories`. Categories that are not available in this session
+ * (`available === false`) are never sent. Resolves with the result, or rejects on failure.
+ * Rejects immediately if another cleanup is already running.
  */
-export async function startPurge(
-  categories: TrashCategory[],
-  flushStandby: boolean,
-  source: string,
-): Promise<PurgeResult> {
-  if (state.running) throw new Error("A purge is already running");
+export async function startPurge(categories: TrashCategory[], source: string): Promise<PurgeResult> {
+  if (state.running) throw new Error("A cleanup is already running");
 
-  const plan = categories.filter((c) => c.id !== "standby").map((c) => ({ id: c.id, label: c.label }));
+  const plan = categories.filter((c) => c.available !== false).map((c) => ({ id: c.id, label: c.label }));
   const ids = plan.map((c) => c.id);
-  if (ids.length === 0 && !flushStandby) throw new Error("Nothing selected to purge");
+  if (ids.length === 0) throw new Error("Nothing selected to clean");
 
   const runId = state.runId + 1;
   set({
@@ -147,7 +140,6 @@ export async function startPurge(
     runId,
     startedAt: Date.now(),
     plan,
-    flushStandby,
     progress: null,
     freedSoFar: 0,
     touched: [],
@@ -179,13 +171,12 @@ export async function startPurge(
       unlisten = null; // progress overlay will fall back to the indeterminate animation
     }
 
-    const result = await api.purgeTrash(ids, flushStandby);
+    const result = await api.purgeTrash(ids);
     const entry: PurgeHistoryEntry = {
       id: historySeq++,
       at: Date.now(),
       source,
       categories: plan.map((c) => c.label),
-      flushStandby,
       result,
     };
     set({
@@ -197,7 +188,7 @@ export async function startPurge(
       history: [entry, ...state.history].slice(0, 50),
     });
     if (viewers === 0) {
-      toast(`Purge complete — freed ${fmtBytes(result.freedBytes)} in ${fmtDuration(result.durationMs)}`, "ok", {
+      toast(`Cleanup finished: freed ${fmtBytes(result.freedBytes)} in ${fmtDuration(result.durationMs)}`, "ok", {
         detail: `${result.filesDeleted.toLocaleString()} files deleted · ${result.filesSkipped.toLocaleString()} skipped`,
       });
     }
@@ -205,7 +196,7 @@ export async function startPurge(
   } catch (e) {
     const message = errMsg(e);
     set({ running: false, error: message, lastRunId: runId, lastResult: null });
-    if (viewers === 0) toast(`Purge failed: ${message}`, "crit");
+    if (viewers === 0) toast(`Cleanup failed: ${message}`, "crit");
     throw e instanceof Error ? e : new Error(message);
   } finally {
     if (unlisten) {

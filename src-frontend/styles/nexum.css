@@ -17,6 +17,13 @@
   --color-ink: #f8fafc;
   --color-muted: #64748b;
 
+  /* Semantic status tokens (CONTRACT §4.9, ROADMAP §6.1). State only; never used for chart series.
+     Gold is brand + GPU series only and never conveys state. Info uses --color-cyan. */
+  --color-ok: #2dd4bf;
+  --color-warn: #f59e0b;
+  --color-crit: #e11d48;
+  --color-unknown: #64748b;
+
   /* Typography: Inter for UI, JetBrains Mono for numeric readouts */
   --font-sans: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
@@ -315,6 +322,40 @@
 .led-silver {
   background-color: var(--color-silver);
   box-shadow: 0 0 5px rgba(203, 213, 225, 0.55), 0 0 1px rgba(203, 213, 225, 1);
+}
+
+/* Status LEDs (semantic tokens) */
+.led-ok {
+  background-color: var(--color-ok);
+  box-shadow: 0 0 6px rgba(45, 212, 191, 0.7), 0 0 1px rgba(45, 212, 191, 1);
+}
+.led-warn {
+  background-color: var(--color-warn);
+  box-shadow: 0 0 6px rgba(245, 158, 11, 0.7), 0 0 1px rgba(245, 158, 11, 1);
+}
+.led-crit {
+  background-color: var(--color-crit);
+  box-shadow: 0 0 7px rgba(225, 29, 72, 0.8), 0 0 1px rgba(225, 29, 72, 1);
+}
+.led-unknown {
+  background-color: var(--color-unknown);
+}
+
+/* Independently scrolling column: thin visible scrollbar + bottom fade while more content is below */
+.scroll-fade {
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
+}
+.scroll-fade::-webkit-scrollbar {
+  width: 6px;
+}
+.scroll-fade::-webkit-scrollbar-thumb {
+  background-color: rgba(148, 163, 184, 0.32);
+}
+.scroll-fade[data-fade="true"] {
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent);
 }
 
 /* Soft outer glow for containers */

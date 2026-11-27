@@ -15,14 +15,17 @@ import { StatusPill } from "../ui";
 import { cn } from "../../lib/format";
 import {
   compareVersions,
-  driverKey,
   fmtAge,
+  NEUTRAL_CODES,
+  problemText,
   signatureKind,
   signatureLabel,
+  STATUS_RANK,
+  type DriverRow,
   type SignatureKind,
 } from "./driverUtils";
 
-export type DriverSortKey = "device" | "category" | "provider" | "version" | "date" | "signature" | "inf";
+export type DriverSortKey = "device" | "category" | "provider" | "version" | "date" | "age" | "signature";
 
 interface Column {
   key: DriverSortKey;
@@ -30,14 +33,15 @@ interface Column {
   className: string;
 }
 
+/** Category is hidden below 1440 px; INF lives in the detail panel only (MF-5, MF-10). */
 const COLUMNS: Column[] = [
-  { key: "device", label: "Device", className: "w-[30%] min-w-[220px]" },
-  { key: "category", label: "Category", className: "w-[9%]" },
-  { key: "provider", label: "Provider", className: "w-[14%]" },
-  { key: "version", label: "Version", className: "w-[13%]" },
-  { key: "date", label: "Date", className: "w-[11%]" },
-  { key: "signature", label: "Signature", className: "w-[12%]" },
-  { key: "inf", label: "INF", className: "w-[11%]" },
+  { key: "device", label: "Device", className: "w-[31%] min-w-[200px]" },
+  { key: "category", label: "Category", className: "w-[9%] max-[1439px]:hidden" },
+  { key: "provider", label: "Provider", className: "w-[15%]" },
+  { key: "version", label: "Version", className: "w-[14%]" },
+  { key: "date", label: "Date", className: "w-[11%] min-w-[96px]" },
+  { key: "age", label: "Age", className: "w-[7%] min-w-[64px]" },
+  { key: "signature", label: "Signature", className: "w-[12%] min-w-[104px]" },
 ];
 
 const SIG_RANK: Record<SignatureKind, number> = { whql: 0, microsoft: 1, signed: 2, unsigned: 3 };
@@ -58,19 +62,19 @@ function compareBy(key: DriverSortKey, a: DriverInfo, b: DriverInfo): number {
       const db = b.date || "0000-00-00";
       return da < db ? -1 : da > db ? 1 : 0;
     }
+    case "age":
+      return (a.ageDays ?? -1) - (b.ageDays ?? -1);
     case "signature":
       return SIG_RANK[signatureKind(a)] - SIG_RANK[signatureKind(b)];
-    case "inf":
-      return (a.infName || "").localeCompare(b.infName || "", undefined, { numeric: true });
   }
 }
 
 const PAGE_SIZES = [25, 50, 100];
 
 export interface DriverTableProps {
-  drivers: DriverInfo[];
+  rows: DriverRow[];
   selectedKey: string | null;
-  onSelect: (d: DriverInfo) => void;
+  onSelect: (row: DriverRow) => void;
   loading?: boolean;
 }
 
@@ -82,11 +86,7 @@ export function SignatureBadge({ driver }: { driver: DriverInfo }) {
       title={driver.signer || (unsigned ? "No digital signature" : "Signed")}
       className={cn(
         "inline-flex items-center gap-1 whitespace-nowrap rounded-md border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider",
-        unsigned
-          ? "border-gold/40 bg-gold/10 text-gold"
-          : kind === "whql"
-            ? "border-teal/35 bg-teal/10 text-teal"
-            : "border-cyan/30 bg-cyan/10 text-cyan",
+        unsigned ? "border-warn/45 bg-warn/10 text-warn" : "border-line bg-white/[0.04] text-silver",
       )}
     >
       {unsigned ? <ShieldAlert size={11} /> : <ShieldCheck size={11} />}
@@ -95,14 +95,43 @@ export function SignatureBadge({ driver }: { driver: DriverInfo }) {
   );
 }
 
+const STATUS_RULE =
+  "Problem = Windows reports a device error (Device Manager code other than 22 Disabled or 45 Not connected). Unsigned = no valid digital signature. Driver age never changes the status.";
+
+/** Status pill for ok / unsigned / problem (MF-5). Codes 22 and 45 render as a neutral note, not a problem. */
 export function DriverStatusBadge({ driver }: { driver: DriverInfo }) {
-  // START.md §2.1: rose marks outdated drivers; unsigned is a gold warning (matches the dashboard list).
-  if (driver.status === "unsigned") return <StatusPill tone="warn">Unsigned</StatusPill>;
-  if (driver.status === "outdated") return <StatusPill tone="crit">Outdated</StatusPill>;
-  return <StatusPill tone="ok">OK</StatusPill>;
+  if (driver.status === "problem") {
+    return (
+      <StatusPill tone="crit" title={`${problemText(driver.problemCode)}. ${STATUS_RULE}`}>
+        Problem
+      </StatusPill>
+    );
+  }
+  if (driver.status === "unsigned") {
+    return (
+      <StatusPill tone="warn" title={`No valid digital signature. ${STATUS_RULE}`}>
+        Unsigned
+      </StatusPill>
+    );
+  }
+  if (driver.problemCode != null && NEUTRAL_CODES.has(driver.problemCode)) {
+    return (
+      <span
+        title={`${problemText(driver.problemCode)}. Not a fault.`}
+        className="inline-flex h-[22px] items-center whitespace-nowrap rounded-full border border-line bg-white/[0.04] px-2.5 text-[10.5px] font-semibold uppercase tracking-[0.12em] text-slate-400"
+      >
+        {driver.problemCode === 22 ? "Disabled" : "Not connected"}
+      </span>
+    );
+  }
+  return (
+    <StatusPill tone="ok" title={`Signed and Windows reports no device problem. ${STATUS_RULE}`}>
+      OK
+    </StatusPill>
+  );
 }
 
-export default function DriverTable({ drivers, selectedKey, onSelect, loading }: DriverTableProps) {
+export default function DriverTable({ rows: input, selectedKey, onSelect, loading }: DriverTableProps) {
   const [sortKey, setSortKey] = useState<DriverSortKey>("device");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [page, setPage] = useState(0);
@@ -110,20 +139,21 @@ export default function DriverTable({ drivers, selectedKey, onSelect, loading }:
 
   const sorted = useMemo(() => {
     const dir = sortDir === "asc" ? 1 : -1;
-    // Stable sort: tie-break on device name so pages don't reshuffle on refresh.
-    return [...drivers].sort((a, b) => {
-      const c = compareBy(sortKey, a, b) * dir;
+    // Problems always first (MF-5), then the chosen column; tie-break on device name so pages stay stable.
+    return [...input].sort((a, b) => {
+      const s = STATUS_RANK[a.status] - STATUS_RANK[b.status];
+      if (s !== 0) return s;
+      const c = compareBy(sortKey, a.driver, b.driver) * dir;
       if (c !== 0) return c;
-      return (a.deviceName || "").localeCompare(b.deviceName || "");
+      return (a.driver.deviceName || "").localeCompare(b.driver.deviceName || "");
     });
-  }, [drivers, sortKey, sortDir]);
+  }, [input, sortKey, sortDir]);
 
   const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize));
 
-  // Reset to the first page whenever the filtered set or ordering changes.
   useEffect(() => {
     setPage(0);
-  }, [drivers, sortKey, sortDir, pageSize]);
+  }, [input, sortKey, sortDir, pageSize]);
 
   useEffect(() => {
     if (page > pageCount - 1) setPage(pageCount - 1);
@@ -160,8 +190,8 @@ export default function DriverTable({ drivers, selectedKey, onSelect, loading }:
                       type="button"
                       onClick={() => toggleSort(c.key)}
                       className={cn(
-                        "inline-flex items-center gap-1 text-[10.5px] uppercase tracking-[0.14em] transition",
-                        active ? "text-gold" : "text-muted hover:text-silver",
+                        "inline-flex items-center gap-1 whitespace-nowrap text-[10.5px] uppercase tracking-[0.14em] transition",
+                        active ? "text-ink" : "text-muted hover:text-silver",
                       )}
                     >
                       {c.label}
@@ -178,7 +208,11 @@ export default function DriverTable({ drivers, selectedKey, onSelect, loading }:
                   </th>
                 );
               })}
-              <th scope="col" className="w-[84px] px-3 py-2.5 text-[10.5px] font-medium uppercase tracking-[0.14em] text-muted">
+              <th
+                scope="col"
+                className="w-[118px] px-3 py-2.5 text-[10.5px] font-medium uppercase tracking-[0.14em] text-muted"
+                title={STATUS_RULE}
+              >
                 Status
               </th>
             </tr>
@@ -191,57 +225,63 @@ export default function DriverTable({ drivers, selectedKey, onSelect, loading }:
                 </td>
               </tr>
             )}
-            {rows.map((d) => {
-              const key = driverKey(d);
-              const selected = key === selectedKey;
+            {rows.map((r) => {
+              const d = r.driver;
+              const selected = r.key === selectedKey;
+              const count = r.members.length;
               return (
                 <tr
-                  key={key}
+                  key={r.key}
                   tabIndex={0}
-                  onClick={() => onSelect(d)}
+                  onClick={() => onSelect(r)}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();
-                      onSelect(d);
+                      onSelect(r);
                     }
                   }}
                   className={cn(
                     "cursor-pointer border-b border-line/60 outline-none transition-colors",
                     "hover:bg-white/[0.035] focus-visible:bg-white/[0.05] focus-visible:shadow-[inset_0_0_0_1px_rgba(45,212,191,0.65)]",
-                    selected && "bg-gold/[0.07] shadow-[inset_2px_0_0_var(--color-gold)]",
+                    selected && "bg-white/[0.06] shadow-[inset_2px_0_0_var(--color-teal)]",
                   )}
                 >
                   <td className="px-3 py-2">
-                    <div className="truncate font-medium text-ink" title={d.deviceName}>
-                      {d.deviceName || "Unknown device"}
+                    <div className="flex min-w-0 items-baseline gap-1.5">
+                      <span className="truncate font-medium text-ink" title={d.deviceName}>
+                        {d.deviceName || "Unknown device"}
+                      </span>
+                      {count > 1 && (
+                        <span className="shrink-0 font-mono text-[11px] text-silver" title={`${count} identical devices`}>
+                          × {count}
+                        </span>
+                      )}
                     </div>
-                    <div className="truncate text-[11px] text-muted" title={d.deviceClass}>
-                      {d.deviceClass || "—"}
+                    <div className="flex min-w-0 items-center gap-1.5 text-[11px] text-muted">
+                      <span className="truncate" title={d.deviceClass}>
+                        {d.deviceClass || "—"}
+                      </span>
+                      {d.isInbox && (
+                        <span
+                          className="shrink-0 rounded border border-line px-1 text-[9px] font-semibold uppercase tracking-wider text-slate-400"
+                          title="In-box driver: ships with Windows"
+                        >
+                          In-box
+                        </span>
+                      )}
                     </div>
                   </td>
-                  <td className="truncate px-3 py-2 text-silver">{d.category}</td>
+                  <td className="truncate px-3 py-2 text-silver max-[1439px]:hidden">{d.category}</td>
                   <td className="truncate px-3 py-2 text-silver" title={d.provider}>
                     {d.provider || "—"}
                   </td>
                   <td className="truncate px-3 py-2 font-mono text-[12px] text-ink" title={d.version}>
                     {d.version || "—"}
                   </td>
-                  <td className="px-3 py-2">
-                    <div
-                      className={cn(
-                        "font-mono text-[12px]",
-                        d.status === "outdated" ? "text-rose" : "text-ink",
-                      )}
-                    >
-                      {d.date || "—"}
-                    </div>
-                    <div className="font-mono text-[10.5px] text-muted">{fmtAge(d.ageDays)}</div>
-                  </td>
+                  <td className="whitespace-nowrap px-3 py-2 font-mono text-[12px] text-ink">{d.date || "—"}</td>
+                  <td className="whitespace-nowrap px-3 py-2 font-mono text-[11.5px] text-muted">{fmtAge(d.ageDays)}</td>
                   <td className="px-3 py-2">
                     <SignatureBadge driver={d} />
-                  </td>
-                  <td className="truncate px-3 py-2 font-mono text-[11.5px] text-muted" title={d.infName}>
-                    {d.infName || "—"}
                   </td>
                   <td className="px-3 py-2">
                     <DriverStatusBadge driver={d} />
@@ -256,17 +296,15 @@ export default function DriverTable({ drivers, selectedKey, onSelect, loading }:
       {/* Pager */}
       <div className="mt-3 flex flex-wrap items-center justify-between gap-3 text-[12px] text-muted">
         <div className="font-mono">
-          {sorted.length === 0
-            ? "0 rows"
-            : `${start + 1}–${Math.min(start + pageSize, sorted.length)} of ${sorted.length}`}
+          {sorted.length === 0 ? "0 rows" : `${start + 1}–${Math.min(start + pageSize, sorted.length)} of ${sorted.length}`}
         </div>
         <div className="flex items-center gap-3">
           <label className="flex items-center gap-2">
-            <span className="uppercase tracking-wider text-[10.5px]">Rows</span>
+            <span className="text-[10.5px] uppercase tracking-wider">Rows</span>
             <select
               value={pageSize}
               onChange={(e) => setPageSize(Number(e.target.value))}
-              className="rounded-md border border-line bg-canvas-0/80 px-2 py-1 font-mono text-ink outline-none focus:border-gold/50"
+              className="rounded-md border border-line bg-canvas-0/80 px-2 py-1 font-mono text-ink outline-none focus:border-teal/50"
             >
               {PAGE_SIZES.map((n) => (
                 <option key={n} value={n}>
@@ -317,9 +355,10 @@ function PagerBtn({
     <button
       type="button"
       aria-label={label}
+      title={label}
       disabled={disabled}
       onClick={onClick}
-      className="rounded-md border border-line bg-white/[0.03] p-1.5 text-silver transition hover:border-gold/40 hover:text-gold disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:border-line disabled:hover:text-silver"
+      className="rounded-md border border-line bg-white/[0.03] p-1.5 text-silver transition hover:border-white/25 hover:text-ink disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:border-line disabled:hover:text-silver"
     >
       {children}
     </button>

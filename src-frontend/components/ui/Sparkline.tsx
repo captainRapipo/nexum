@@ -2,7 +2,8 @@ import { useId, useMemo } from "react";
 import { cn } from "../../lib/format";
 
 export interface SparklineProps {
-  data: number[];
+  /** null = no reading; when every point is null (or there are none) nothing is rendered (MF-2). */
+  data: readonly (number | null | undefined)[];
   /** Any CSS colour, including `var(--color-teal)`. */
   color: string;
   height?: number;
@@ -30,7 +31,7 @@ export function Sparkline({
   const gradId = `spark-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
 
   const paths = useMemo(() => {
-    const pts = data.filter((v) => Number.isFinite(v));
+    const pts = data.filter((v): v is number => typeof v === "number" && Number.isFinite(v));
     if (pts.length < 2) return null;
     let lo = min ?? Math.min(...pts);
     let hi = max ?? Math.max(...pts);
@@ -49,6 +50,9 @@ export function Sparkline({
     const area = `${line} L${VB_W} ${height} L0 ${height} Z`;
     return { line, area };
   }, [data, height, min, max]);
+
+  const hasData = data.some((v) => typeof v === "number" && Number.isFinite(v));
+  if (!hasData) return null;
 
   return (
     <svg
