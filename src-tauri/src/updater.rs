@@ -8,15 +8,24 @@
 //! * **`"auto"` only checks**, at most once per 24 h ([`is_due`]). Downloading and installing
 //!   happen only inside `install_update`, which only a click calls.
 //! * **One source.** The two manifest URLs and the download prefix below are the only
-//!   addresses in the code, all under this repository's GitHub Releases.
+//!   addresses in the code, all under this repository's GitHub Releases. Every request is
+//!   HTTPS only, redirects included.
+//! * **The manifest is not trusted.** It is not signed, so everything in it is treated as
+//!   something an attacker may have written: it is read with a size limit
+//!   ([`MAX_MANIFEST_BYTES`]), its notes are shown as plain text, its URL must match the fixed
+//!   prefix, and its version counts only when the installer's signature says the same.
 //! * **Never a downgrade.** A version must be strictly greater by SemVer precedence
-//!   ([`is_newer`]), and the version is bound to the signed file through the signature's
-//!   trusted comment ([`check_signed_binding`]), because the manifest itself is not signed.
+//!   ([`is_newer`]), the stable channel never takes a preview version, and the version is
+//!   bound to the signed file through the signature's trusted comment
+//!   ([`check_signed_binding`]): a signature that does not name this file and this version is
+//!   refused.
 //! * **Nothing unverified runs, and nothing verified can be swapped.** Nexum runs elevated,
 //!   so the plugin's own `install` (which writes to `%TEMP%`) is never used. The download is
-//!   verified in memory, staged in `<Nexum folder>\updates` through [`PinnedDir`], reopened
-//!   so that nobody can write to, delete or replace it, read back through that handle and
-//!   compared byte for byte, and only then started.
+//!   verified in memory and staged in `<Nexum folder>\updates`, a folder made new for every
+//!   install with access for SYSTEM and Administrators only ([`PinnedDir::create_admin_only`]).
+//!   The file is created with the same access list, reopened so that nobody can write to,
+//!   delete or replace it, read back through that handle and compared byte for byte, and only
+//!   then started.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -59,6 +68,12 @@ const RECHECK_EVERY: Duration = Duration::from_secs(60 * 60);
 pub const MAX_AUTO_FAILURES: u32 = 3;
 /// Timeout of the manifest request.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
+/// A manifest that announces or sends more than this is refused before it is parsed (a real
+/// one is about 2 kB: the notes are at most 4000 characters).
+pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
+/// The client name sent with the manifest request. It says nothing about the version, the PC
+/// or the user.
+const USER_AGENT: &str = "nexum-updater";
 /// Timeout of the whole installer download (the plugin sets none by itself).
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// More than this announced or received aborts the download.
@@ -370,8 +385,15 @@ pub fn url_allowed(url: &str) -> bool {
         && !url.split('/').any(|segment| segment == ".." || segment == ".")
 }
 
-/// Validates what a manifest offers: the URL prefix, a readable version, and strictly newer.
-pub fn validate_offer(version: &str, url: &str, current: &Version) -> Result<Version, ErrorCode> {
+/// Validates what a manifest offers on `channel`: the URL prefix, a readable version, strictly
+/// newer, and no preview version on the stable channel (`stable.json` only ever describes a
+/// stable release, so a pre-release there is somebody else's edit).
+pub fn validate_offer(
+    version: &str,
+    url: &str,
+    current: &Version,
+    channel: Channel,
+) -> Result<Version, ErrorCode> {
     if !url_allowed(url) {
         return Err(ErrorCode::BadManifest);
     }
@@ -379,7 +401,38 @@ pub fn validate_offer(version: &str, url: &str, current: &Version) -> Result<Ver
     if !is_newer(&offered, current) {
         return Err(ErrorCode::NotNewer);
     }
+    if channel == Channel::Stable && !offered.pre.is_empty() {
+        return Err(ErrorCode::BadManifest);
+    }
     Ok(offered)
+}
+
+/// The error for an HTTP status of the manifest request, `None` for success (CONTRACT §2.15.4
+/// step 4): 404 is the normal state of a channel before its first release.
+pub fn manifest_status_error(status: u16) -> Option<ErrorCode> {
+    match status {
+        200..=299 => None,
+        404 => Some(ErrorCode::NotPublished),
+        _ => Some(ErrorCode::Offline),
+    }
+}
+
+/// True when a manifest is over [`MAX_MANIFEST_BYTES`], by what the server announced or by
+/// what has arrived so far.
+pub fn manifest_too_big(received: usize, announced: Option<u64>) -> bool {
+    received > MAX_MANIFEST_BYTES || announced.is_some_and(|n| n > MAX_MANIFEST_BYTES as u64)
+}
+
+/// The manifest as JSON. It must be an object; everything else about it is checked by the
+/// plugin's parser and by [`validate_offer`].
+pub fn parse_manifest(body: &[u8]) -> Result<serde_json::Value, ErrorCode> {
+    if manifest_too_big(body.len(), None) {
+        return Err(ErrorCode::BadManifest);
+    }
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(value) if value.is_object() => Ok(value),
+        _ => Err(ErrorCode::BadManifest),
+    }
 }
 
 /// Release notes as plain text: line breaks kept, every other control character and the
@@ -419,68 +472,81 @@ pub fn rfc3339_utc(unix_secs: i64) -> Option<String> {
 }
 
 /// The trusted comment of an updater signature. `signature` is the content of a `.sig` file:
-/// base64 of a minisign signature, whose third line is `trusted comment: …`. minisign's global
-/// signature covers that line, so it may be relied on **after** the signature was verified.
+/// base64 of a minisign signature, four lines of which the third is `trusted comment: …`.
+/// minisign's global signature covers that line, so it may be relied on **after** the
+/// signature was verified.
+///
+/// It is read exactly the way the verifier reads it (third line, exact prefix), never by
+/// searching: the first line is the *untrusted* comment, which no signature covers, so a
+/// search would let whoever wrote the manifest put a `trusted comment:` line of their own
+/// there.
 pub fn trusted_comment(signature: &str) -> Option<String> {
     let bytes = base64::engine::general_purpose::STANDARD
-        .decode(signature.trim())
+        .decode(signature)
         .ok()?;
     let text = String::from_utf8(bytes).ok()?;
     text.lines()
-        .find_map(|line| line.strip_prefix("trusted comment:"))
-        .map(|rest| rest.trim().to_string())
+        .nth(2)?
+        .strip_prefix("trusted comment: ")
+        .map(str::to_string)
 }
 
-/// The version inside an installer file name of the form `Nexum_<semver>_x64-setup….exe`
-/// (the name the release pipeline signs under; a suffix after `-setup` is tolerated).
+/// The version inside an installer file name. The name must be exactly
+/// `Nexum_<semver>_x64-setup.exe`, the name the release pipeline signs under.
 pub fn version_from_file_name(name: &str) -> Option<String> {
-    let name = name.rsplit(['/', '\\']).next()?;
-    let rest = name.strip_prefix("Nexum_")?;
-    let end = rest.find("_x64-setup")?;
-    let (version, tail) = rest.split_at(end);
-    if !tail.to_ascii_lowercase().ends_with(".exe") {
-        return None;
-    }
-    parse_version(version).map(|_| version.to_string())
+    let version = name.strip_prefix("Nexum_")?.strip_suffix("_x64-setup.exe")?;
+    parse_version(version)
+        .filter(|parsed| parsed.to_string() == version)
+        .map(|_| version.to_string())
 }
 
-/// The version a signature was made for, from its trusted comment (tab separated `key:value`
-/// pairs): the `version:` field the Tauri CLI records, else the version in the `file:` name.
-/// `None` when the comment carries neither.
-pub fn signed_version(trusted_comment: &str) -> Option<String> {
-    let mut from_file = None;
+/// The `version:` and `file:` fields of a trusted comment (tab separated `key:value` pairs,
+/// as the Tauri CLI writes them). The first occurrence of a key counts, as in the plugin.
+pub fn signed_fields(trusted_comment: &str) -> (Option<&str>, Option<&str>) {
+    let mut version = None;
+    let mut file = None;
     for field in trusted_comment.split('\t') {
-        let field = field.trim();
         if let Some(v) = field.strip_prefix("version:") {
-            return Some(v.trim().to_string());
-        }
-        if let Some(name) = field.strip_prefix("file:") {
-            from_file = version_from_file_name(name.trim());
+            if version.is_none() {
+                version = Some(v);
+            }
+        } else if let Some(name) = field.strip_prefix("file:") {
+            if file.is_none() {
+                file = Some(name);
+            }
         }
     }
-    from_file
+    (version, file)
 }
 
 /// Binds the version to the signed file (CONTRACT §2.15.5 step 2, anti-rollback). Call only
-/// after the bytes were verified against `signature`. `Ok(true)`: the signature names
-/// `announced` and that version is newer than `current`. `Ok(false)`: the signature names no
-/// version (accepted and logged by the caller). `Err(NotNewer)`: it names a different version,
-/// or one that is not newer — a manifest that pairs a new number with an old installer.
+/// after the bytes were verified against `signature`. `Ok(())` only when the signature names
+/// **both** the version and the installer file of that version, both equal the announced
+/// version, and that version is newer than `current`.
+///
+/// * `Err(BadSignature)`: the signature names no version or no Nexum installer. Every
+///   signature the release pipeline makes names both, so one that does not was not made for
+///   an update and is never accepted.
+/// * `Err(NotNewer)`: it names a different version, or one that is not newer — a manifest
+///   that pairs a new number with an old installer.
 pub fn check_signed_binding(
     signature: &str,
     announced: &str,
     current: &Version,
-) -> Result<bool, ErrorCode> {
+) -> Result<(), ErrorCode> {
     let comment = trusted_comment(signature).ok_or(ErrorCode::BadSignature)?;
-    let Some(signed) = signed_version(&comment) else {
-        return Ok(false);
-    };
-    let signed = parse_version(&signed).ok_or(ErrorCode::NotNewer)?;
+    let (version, file) = signed_fields(&comment);
+    let version = version.ok_or(ErrorCode::BadSignature)?;
+    let named = file
+        .and_then(version_from_file_name)
+        .ok_or(ErrorCode::BadSignature)?;
+    let signed = parse_version(version).ok_or(ErrorCode::NotNewer)?;
+    let named = parse_version(&named).ok_or(ErrorCode::NotNewer)?;
     let announced = parse_version(announced).ok_or(ErrorCode::BadManifest)?;
-    if signed != announced || !is_newer(&signed, current) {
+    if signed != announced || named != announced || !is_newer(&signed, current) {
         return Err(ErrorCode::NotNewer);
     }
-    Ok(true)
+    Ok(())
 }
 
 /// Download progress as an integer percentage, `None` while the size is unknown.
@@ -558,10 +624,9 @@ pub fn reader_matches(reader: &mut impl Read, expected: &[u8]) -> std::io::Resul
     }
 }
 
-/// The error code of a failed manifest request or download (CONTRACT §2.15.4 step 4). The
-/// plugin reports every non-success HTTP status of the manifest request as `ReleaseNotFound`;
-/// a manifest that does not exist yet (404) is the normal state of a channel before its first
-/// release, so that maps to `NotPublished`.
+/// The error code of a plugin error: a manifest the plugin's parser refuses, or a failed
+/// download (CONTRACT §2.15.4 step 4, §2.15.5 step 1). The manifest request itself is made by
+/// [`fetch_manifest`], which maps HTTP statuses with [`manifest_status_error`].
 pub fn map_plugin_error(error: &tauri_plugin_updater::Error) -> ErrorCode {
     use tauri_plugin_updater::Error as E;
     match error {
@@ -720,7 +785,63 @@ fn poke(app: &AppHandle) {
 // Checking (CONTRACT §2.15.4)
 // ---------------------------------------------------------------------------------------------
 
-/// One manifest request to the channel's fixed URL.
+/// TLS needs a crypto provider, and nothing installs one by default in this build. The plugin
+/// does the same before its own requests.
+fn ensure_tls_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Fails only when another thread installed one in the meantime, which is just as good.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
+/// The one request of a check: the channel's manifest from its fixed URL, HTTPS only
+/// (redirects included), with a timeout and never more than [`MAX_MANIFEST_BYTES`] of it.
+async fn fetch_manifest(channel: Channel) -> Result<serde_json::Value, ErrorCode> {
+    ensure_tls_provider();
+    let offline = |e: reqwest::Error| {
+        eprintln!("[nexum] update check failed: {e}");
+        ErrorCode::Offline
+    };
+    let client = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(CHECK_TIMEOUT)
+        .https_only(true)
+        .build()
+        .map_err(|e| {
+            eprintln!("[nexum] update check could not start: {e}");
+            ErrorCode::Unknown
+        })?;
+    let mut response = client
+        .get(channel.manifest_url())
+        .header("accept", "application/json")
+        .send()
+        .await
+        .map_err(offline)?;
+    let status = response.status().as_u16();
+    if let Some(code) = manifest_status_error(status) {
+        eprintln!("[nexum] update check failed: HTTP {status}");
+        return Err(code);
+    }
+    if manifest_too_big(0, response.content_length()) {
+        eprintln!("[nexum] update manifest refused: too big");
+        return Err(ErrorCode::BadManifest);
+    }
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(offline)? {
+        if manifest_too_big(body.len().saturating_add(chunk.len()), None) {
+            eprintln!("[nexum] update manifest refused: too big");
+            return Err(ErrorCode::BadManifest);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    parse_manifest(&body).map_err(|code| {
+        eprintln!("[nexum] update manifest refused: not a JSON object");
+        code
+    })
+}
+
+/// One check of `channel`: the manifest, then the plugin's own parser, target selection and
+/// version rule on it, then Nexum's rules.
 async fn fetch_offer(
     app: &AppHandle,
     channel: Channel,
@@ -734,28 +855,33 @@ async fn fetch_offer(
         eprintln!("[nexum] update check failed: {e}");
         map_plugin_error(&e)
     };
+    let manifest = fetch_manifest(channel).await?;
     let updater = app
         .updater_builder()
+        // Never the endpoint list of the configuration file.
         .endpoints(vec![url])
         .map_err(log)?
-        .timeout(CHECK_TIMEOUT)
         // Strictly greater. Stated explicitly although it is the plugin's default, so the
         // plugin's `allowDowngrades` switch can never apply.
         .version_comparator(|running, release| is_newer(&release.version, &running))
+        // The download: HTTPS only, redirects included.
+        .configure_client(|client| client.https_only(true))
         .build()
         .map_err(log)?;
-    match updater.check().await.map_err(log)? {
+    // `restore_update` makes no request. An update it returns always requires the signature
+    // to carry the announced version (the plugin's `requireSignedVersion`), whatever the
+    // configuration says.
+    match updater.restore_update(manifest).map_err(log)? {
         None => Ok(None),
         Some(mut update) => {
-            validate_offer(&update.version, update.download_url.as_str(), current).map_err(
-                |code| {
+            validate_offer(&update.version, update.download_url.as_str(), current, channel)
+                .map_err(|code| {
                     eprintln!(
                         "[nexum] update manifest refused ({code:?}): version {} at {}",
                         update.version, update.download_url
                     );
                     code
-                },
-            )?;
+                })?;
             update.timeout = Some(DOWNLOAD_TIMEOUT);
             Ok(Some(update))
         }
@@ -885,7 +1011,8 @@ fn fail_install(app: &AppHandle, code: ErrorCode) {
 }
 
 /// Step 1: download into memory. The plugin verifies the minisign signature of the bytes
-/// against the public key compiled into the app before it returns them.
+/// against the public key compiled into the app before it returns them, and checks that the
+/// signed trusted comment carries the announced version.
 async fn download_verified(app: &AppHandle, offer: &Update) -> Result<Vec<u8>, ErrorCode> {
     let too_big = Arc::new(AtomicBool::new(false));
     let flag = too_big.clone();
@@ -979,15 +1106,17 @@ fn stage(dir: &Path, version: &str, bytes: &[u8]) -> Result<Staged, ErrorCode> {
         eprintln!("[nexum] update staging failed ({what}): {e}");
         ErrorCode::Write
     };
-    // Every folder from the program folder down is opened without following links, must not
-    // be a link, and stays pinned.
-    let pinned = PinnedDir::open(dir, &dir.join(STAGING_DIR), true)
+    // A folder made new for this install, for SYSTEM and Administrators only: whatever had
+    // that name before (leftovers of an earlier attempt, or something planted) is removed and
+    // never reused, the access list is set in the call that creates the folder, and it is
+    // pinned and checked. Wherever Nexum was installed, nothing without administrator rights
+    // can reach into it.
+    let pinned = PinnedDir::create_admin_only(dir, STAGING_DIR)
         .map_err(|e| write_error("folder", e))?;
-    // Leftovers of an earlier attempt. The new file is created with CREATE_NEW under a free
-    // name, so a leftover that cannot be removed is never reused.
-    let _ = pinned.remove_entries();
+    // The file is created new with the same access list, so no other process can ever have
+    // held a handle to it or a writable mapping of it.
     let (mut file, path) = pinned
-        .create_unique(&staged_stem(version), "exe")
+        .create_new_file_admin_only(&format!("{}.exe", staged_stem(version)))
         .map_err(|e| write_error("create", e))?;
     let written = file.write_all(bytes).and_then(|_| file.sync_all());
     drop(file);
@@ -1029,10 +1158,13 @@ fn stage(dir: &Path, version: &str, bytes: &[u8]) -> Result<Staged, ErrorCode> {
 }
 
 /// Step 6: `CreateProcessW` on the absolute path, no shell, nothing inherited but null stdio.
+/// The installer starts in System32, not in whatever folder Nexum happened to be started
+/// from (which a non-elevated process may be able to write to).
 fn launch_installer(path: &Path) -> std::io::Result<()> {
     use std::process::{Command, Stdio};
     Command::new(path)
         .args(INSTALLER_ARGS)
+        .current_dir(crate::util::windows_dir().join("System32"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1090,15 +1222,9 @@ async fn run_install(app: AppHandle, offer: Update) {
 
     // 2. The manifest is not signed, only the installer is: bind the version to the file.
     let current = app.package_info().version.clone();
-    match check_signed_binding(&offer.signature, &offer.version, &current) {
-        Ok(true) => {}
-        Ok(false) => eprintln!(
-            "[nexum] the update signature names no version; accepted without the version binding"
-        ),
-        Err(code) => {
-            eprintln!("[nexum] the update signature is for a different version ({code:?})");
-            return fail_install(&app, code);
-        }
+    if let Err(code) = check_signed_binding(&offer.signature, &offer.version, &current) {
+        eprintln!("[nexum] the update signature is not for this version ({code:?})");
+        return fail_install(&app, code);
     }
 
     let worker = app.clone();
@@ -1289,11 +1415,22 @@ mod tests {
         parse_version(s).unwrap()
     }
 
+    fn b64(text: &str) -> String {
+        base64::engine::general_purpose::STANDARD.encode(text)
+    }
+
     /// A `.sig` file's content for a trusted comment (the two signature lines are dummies:
     /// these tests exercise the parser, the plugin verifies real signatures).
     fn sig(trusted: &str) -> String {
-        base64::engine::general_purpose::STANDARD.encode(format!(
+        b64(&format!(
             "untrusted comment: signature from tauri secret key\nRUTdummy\ntrusted comment: {trusted}\nGLOBALdummy\n"
+        ))
+    }
+
+    /// The trusted comment the release pipeline writes for the installer of `version`.
+    fn signed_for(version: &str) -> String {
+        sig(&format!(
+            "timestamp:1795800000\tfile:Nexum_{version}_x64-setup.exe\tversion:{version}"
         ))
     }
 
@@ -1342,30 +1479,102 @@ mod tests {
     fn manifest_offers_are_validated() {
         let cur = v("1.2.0");
         let url = "https://github.com/captainRapipo/nexum/releases/download/v1.3.0/Nexum_1.3.0_x64-setup.exe";
-        assert_eq!(validate_offer("1.3.0", url, &cur), Ok(v("1.3.0")));
-        assert_eq!(validate_offer("v1.3.0", url, &cur), Ok(v("1.3.0")));
-        // Not newer: a downgrade or the same version is never an offer.
-        assert_eq!(validate_offer("1.2.0", url, &cur), Err(ErrorCode::NotNewer));
-        assert_eq!(validate_offer("1.1.0", url, &cur), Err(ErrorCode::NotNewer));
-        // Unreadable version.
-        assert_eq!(validate_offer("newest", url, &cur), Err(ErrorCode::BadManifest));
-        // Any other host or repository.
-        for bad in [
-            "https://example.com/Nexum_1.3.0_x64-setup.exe",
-            "https://github.com/someone-else/nexum/releases/download/v1.3.0/Nexum_1.3.0_x64-setup.exe",
-            "https://github.com/captainRapipo/nexum-fork/releases/download/v1.3.0/x.exe",
-            "https://github.com.evil.example/captainRapipo/nexum/releases/download/v1.3.0/x.exe",
-            "https://github.com@evil.example/captainRapipo/nexum/releases/download/v1.3.0/x.exe",
-            "http://github.com/captainRapipo/nexum/releases/download/v1.3.0/x.exe",
-            "https://github.com/captainRapipo/nexum/releases/download/",
-            "https://github.com/captainRapipo/nexum/releases/download/../../../../evil/x.exe",
-            "https://github.com/captainRapipo/nexum/releases/download/v1.3.0/x.exe#@evil.example",
-            "https://objects.githubusercontent.com/x.exe",
-            "",
-        ] {
-            assert_eq!(validate_offer("1.3.0", bad, &cur), Err(ErrorCode::BadManifest), "{bad}");
+        for channel in [Channel::Stable, Channel::Preview] {
+            assert_eq!(validate_offer("1.3.0", url, &cur, channel), Ok(v("1.3.0")));
+            assert_eq!(validate_offer("v1.3.0", url, &cur, channel), Ok(v("1.3.0")));
+            // Not newer: a downgrade or the same version is never an offer.
+            assert_eq!(validate_offer("1.2.0", url, &cur, channel), Err(ErrorCode::NotNewer));
+            assert_eq!(validate_offer("1.1.0", url, &cur, channel), Err(ErrorCode::NotNewer));
+            // Unreadable version.
+            assert_eq!(validate_offer("newest", url, &cur, channel), Err(ErrorCode::BadManifest));
+            // Any other host or repository.
+            for bad in [
+                "https://example.com/Nexum_1.3.0_x64-setup.exe",
+                "https://github.com/someone-else/nexum/releases/download/v1.3.0/Nexum_1.3.0_x64-setup.exe",
+                "https://github.com/captainRapipo/nexum-fork/releases/download/v1.3.0/x.exe",
+                "https://github.com.evil.example/captainRapipo/nexum/releases/download/v1.3.0/x.exe",
+                "https://github.com@evil.example/captainRapipo/nexum/releases/download/v1.3.0/x.exe",
+                "http://github.com/captainRapipo/nexum/releases/download/v1.3.0/x.exe",
+                "https://github.com/captainRapipo/nexum/releases/download/",
+                "https://github.com/captainRapipo/nexum/releases/download/../../../../evil/x.exe",
+                "https://github.com/captainRapipo/nexum/releases/download/v1.3.0/x.exe#@evil.example",
+                "https://objects.githubusercontent.com/x.exe",
+                "",
+            ] {
+                assert_eq!(
+                    validate_offer("1.3.0", bad, &cur, channel),
+                    Err(ErrorCode::BadManifest),
+                    "{bad}"
+                );
+            }
         }
         assert!(url_allowed(url));
+    }
+
+    #[test]
+    fn the_stable_channel_never_takes_a_preview_version() {
+        let url = "https://github.com/captainRapipo/nexum/releases/download/v1.3.0-preview.1/Nexum_1.3.0-preview.1_x64-setup-UNSIGNED-PREVIEW.exe";
+        // A stable install, and a preview install whose user switched back to stable.
+        for cur in [v("1.2.0"), v("1.2.0-preview.4")] {
+            assert_eq!(
+                validate_offer("1.3.0-preview.1", url, &cur, Channel::Stable),
+                Err(ErrorCode::BadManifest)
+            );
+            assert_eq!(
+                validate_offer("1.3.0-preview.1", url, &cur, Channel::Preview),
+                Ok(v("1.3.0-preview.1"))
+            );
+            // The stable release that follows is taken on both.
+            assert_eq!(validate_offer("1.3.0", url, &cur, Channel::Stable), Ok(v("1.3.0")));
+            assert_eq!(validate_offer("1.3.0", url, &cur, Channel::Preview), Ok(v("1.3.0")));
+        }
+        // Build metadata is not a pre-release.
+        assert_eq!(
+            validate_offer("1.3.0+7", url, &v("1.2.0"), Channel::Stable),
+            Ok(v("1.3.0+7"))
+        );
+    }
+
+    #[test]
+    fn manifest_request_rules() {
+        // HTTP statuses (CONTRACT §2.15.4 step 4).
+        for ok in [200u16, 204, 206, 299] {
+            assert_eq!(manifest_status_error(ok), None);
+        }
+        assert_eq!(manifest_status_error(404), Some(ErrorCode::NotPublished));
+        for other in [100u16, 301, 302, 304, 400, 401, 403, 410, 429, 500, 502, 503] {
+            assert_eq!(manifest_status_error(other), Some(ErrorCode::Offline), "{other}");
+        }
+
+        // The size limit, announced or received.
+        assert_eq!(MAX_MANIFEST_BYTES, 256 * 1024);
+        assert!(!manifest_too_big(0, None));
+        assert!(!manifest_too_big(MAX_MANIFEST_BYTES, Some(MAX_MANIFEST_BYTES as u64)));
+        assert!(manifest_too_big(MAX_MANIFEST_BYTES + 1, None));
+        assert!(manifest_too_big(0, Some(MAX_MANIFEST_BYTES as u64 + 1)));
+        assert!(manifest_too_big(0, Some(u64::MAX)));
+        assert!(manifest_too_big(usize::MAX, None));
+
+        // A JSON object, nothing else.
+        let good = br#"{"version":"1.3.0","platforms":{}}"#;
+        assert_eq!(parse_manifest(good).unwrap()["version"], "1.3.0");
+        let not_manifests: [&[u8]; 7] = [
+            b"",
+            b"{",
+            b"[]",
+            b"\"1.3.0\"",
+            b"null",
+            b"<html>Not found</html>",
+            b"{\"version\":\"1.3.0\"} trailing",
+        ];
+        for bad in not_manifests {
+            assert_eq!(parse_manifest(bad), Err(ErrorCode::BadManifest));
+        }
+        // Too big is refused without being parsed, valid JSON or not.
+        let mut huge = b"{\"notes\":\"".to_vec();
+        huge.resize(MAX_MANIFEST_BYTES, b'x');
+        huge.extend_from_slice(b"\"}");
+        assert_eq!(parse_manifest(&huge), Err(ErrorCode::BadManifest));
     }
 
     #[test]
@@ -1545,101 +1754,168 @@ mod tests {
     }
 
     #[test]
-    fn trusted_comment_and_signed_version() {
-        // What `tauri signer sign` and the bundler write.
-        let plain = "timestamp:1795800000\tfile:Nexum_1.3.0_x64-setup.exe";
+    fn trusted_comment_is_read_the_way_the_verifier_reads_it() {
+        // What `tauri signer sign --app-version` and the bundler write.
+        let plain = "timestamp:1795800000\tfile:Nexum_1.3.0_x64-setup.exe\tversion:1.3.0";
         assert_eq!(trusted_comment(&sig(plain)).as_deref(), Some(plain));
-        assert_eq!(signed_version(plain).as_deref(), Some("1.3.0"));
-        // With the version field of newer CLI versions: it wins over the file name.
-        let versioned = "timestamp:1795800000\tfile:setup.exe\tversion:1.3.0-preview.2";
-        assert_eq!(signed_version(versioned).as_deref(), Some("1.3.0-preview.2"));
-        let both = "timestamp:1\tfile:Nexum_1.0.0_x64-setup.exe\tversion:1.3.0";
-        assert_eq!(signed_version(both).as_deref(), Some("1.3.0"));
-        // Nothing to bind to.
-        assert_eq!(signed_version("timestamp:1795800000\tfile:payload"), None);
-        assert_eq!(signed_version("timestamp:1795800000"), None);
-        assert_eq!(signed_version(""), None);
+        // CRLF line ends, and no line end after the last line.
+        let crlf = b64(&format!(
+            "untrusted comment: x\r\nRUTdummy\r\ntrusted comment: {plain}\r\nGLOBALdummy"
+        ));
+        assert_eq!(trusted_comment(&crlf).as_deref(), Some(plain));
 
-        assert_eq!(
-            version_from_file_name("Nexum_1.2.0-preview.1_x64-setup.exe").as_deref(),
-            Some("1.2.0-preview.1")
-        );
-        assert_eq!(
-            version_from_file_name("Nexum_1.2.0_x64-setup-UNSIGNED-PREVIEW.exe").as_deref(),
-            Some("1.2.0")
-        );
-        assert_eq!(
-            version_from_file_name(r"D:\a\out\Nexum_1.2.0_x64-setup.exe").as_deref(),
-            Some("1.2.0")
-        );
-        for other in [
-            "Nexum_x64-setup.exe",
-            "Nexum_latest_x64-setup.exe",
-            "Other_1.2.0_x64-setup.exe",
-            "Nexum_1.2.0_x64-setup.exe.zip",
-            "Nexum_1.2.0_arm64-setup.exe",
-            "setup.exe",
-            "",
-        ] {
-            assert_eq!(version_from_file_name(other), None, "{other}");
-        }
+        // The FIRST line is the untrusted comment: no signature covers it, so whoever writes
+        // the manifest can put anything there, including a line that looks like a trusted
+        // comment. Only the third line counts.
+        let forged_line = "trusted comment: timestamp:1\tfile:Nexum_9.9.9_x64-setup.exe\tversion:9.9.9";
+        let forged = b64(&format!(
+            "{forged_line}\nRUTdummy\ntrusted comment: {plain}\nGLOBALdummy\n"
+        ));
+        assert_eq!(trusted_comment(&forged).as_deref(), Some(plain));
+        // A forged line anywhere else does not count either.
+        let appended = b64(&format!(
+            "untrusted comment: x\nRUTdummy\ntrusted comment: {plain}\nGLOBALdummy\n{forged_line}\n"
+        ));
+        assert_eq!(trusted_comment(&appended).as_deref(), Some(plain));
+        // No trusted comment on the third line: nothing, however many there are elsewhere.
+        let shifted = b64(&format!(
+            "untrusted comment: x\n{forged_line}\nRUTdummy\ntrusted comment: {plain}\nGLOBALdummy\n"
+        ));
+        assert_eq!(trusted_comment(&shifted), None);
+        let wrong_prefix = b64("untrusted comment: x\nRUT\nTrusted comment: a\nG\n");
+        assert_eq!(trusted_comment(&wrong_prefix), None);
 
-        // Not base64, not text, or no trusted comment line.
+        // Not base64, not text, too few lines.
         assert_eq!(trusted_comment("not base64 !!"), None);
         assert_eq!(
             trusted_comment(&base64::engine::general_purpose::STANDARD.encode([0xFFu8, 0xFE, 0xFD])),
             None
         );
+        assert_eq!(trusted_comment(&b64("untrusted comment: x\nRUT\n")), None);
+        assert_eq!(trusted_comment(""), None);
+        // The plugin decodes the signature as it is; so does this (no trimming).
+        assert_eq!(trusted_comment(&format!(" {}", sig(plain))), None);
+    }
+
+    #[test]
+    fn signed_fields_and_installer_names() {
         assert_eq!(
-            trusted_comment(&base64::engine::general_purpose::STANDARD.encode("untrusted comment: x\nRUT\n")),
-            None
+            signed_fields("timestamp:1795800000\tfile:Nexum_1.3.0_x64-setup.exe\tversion:1.3.0"),
+            (Some("1.3.0"), Some("Nexum_1.3.0_x64-setup.exe"))
         );
+        // The first occurrence of a key counts.
+        assert_eq!(
+            signed_fields("version:1.3.0\tversion:9.9.9\tfile:a.exe\tfile:b.exe"),
+            (Some("1.3.0"), Some("a.exe"))
+        );
+        assert_eq!(signed_fields("timestamp:1795800000\tfile:payload"), (None, Some("payload")));
+        assert_eq!(signed_fields("timestamp:1795800000"), (None, None));
+        assert_eq!(signed_fields(""), (None, None));
+        // A key is a whole field, from its first character.
+        assert_eq!(signed_fields("xversion:1.3.0\t file:a.exe"), (None, None));
+
+        assert_eq!(
+            version_from_file_name("Nexum_1.2.0-preview.1_x64-setup.exe").as_deref(),
+            Some("1.2.0-preview.1")
+        );
+        assert_eq!(version_from_file_name("Nexum_1.2.0_x64-setup.exe").as_deref(), Some("1.2.0"));
+        for other in [
+            "Nexum_x64-setup.exe",
+            "Nexum_latest_x64-setup.exe",
+            "Nexum_v1.2.0_x64-setup.exe",
+            "Nexum_ 1.2.0_x64-setup.exe",
+            "Other_1.2.0_x64-setup.exe",
+            "Nexum_1.2.0_x64-setup.exe.zip",
+            "Nexum_1.2.0_x64-setup-UNSIGNED-PREVIEW.exe",
+            "Nexum_1.2.0_x64-setup.EXE",
+            "Nexum_1.2.0_arm64-setup.exe",
+            r"D:\a\out\Nexum_1.2.0_x64-setup.exe",
+            "out/Nexum_1.2.0_x64-setup.exe",
+            "setup.exe",
+            "",
+        ] {
+            assert_eq!(version_from_file_name(other), None, "{other}");
+        }
     }
 
     #[test]
     fn version_is_bound_to_the_signed_file() {
         let cur = v("1.2.0");
-        let s = |name: &str| sig(&format!("timestamp:1795800000\tfile:{name}"));
-        // The signature names the announced version, and it is newer: bound.
+        let s = |fields: &str| sig(&format!("timestamp:1795800000\t{fields}"));
+        // The signature names the announced version and its installer, and it is newer: bound.
+        assert_eq!(check_signed_binding(&signed_for("1.3.0"), "1.3.0", &cur), Ok(()));
+        assert_eq!(check_signed_binding(&signed_for("1.3.0"), "v1.3.0", &cur), Ok(()));
         assert_eq!(
-            check_signed_binding(&s("Nexum_1.3.0_x64-setup.exe"), "1.3.0", &cur),
-            Ok(true)
-        );
-        assert_eq!(
-            check_signed_binding(&sig("timestamp:1\tfile:x.exe\tversion:1.3.0"), "v1.3.0", &cur),
-            Ok(true)
+            check_signed_binding(&signed_for("1.3.0-preview.2"), "1.3.0-preview.2", &cur),
+            Ok(())
         );
         // Rollback: the manifest says 1.3.0 but serves the validly signed 1.1.0 installer.
         assert_eq!(
-            check_signed_binding(&s("Nexum_1.1.0_x64-setup.exe"), "1.3.0", &cur),
+            check_signed_binding(&signed_for("1.1.0"), "1.3.0", &cur),
             Err(ErrorCode::NotNewer)
         );
         // The same trick with the installer of the running version.
         assert_eq!(
-            check_signed_binding(&s("Nexum_1.2.0_x64-setup.exe"), "1.3.0", &cur),
+            check_signed_binding(&signed_for("1.2.0"), "1.3.0", &cur),
             Err(ErrorCode::NotNewer)
         );
         // A manifest that honestly names an old installer is refused as well.
         assert_eq!(
-            check_signed_binding(&s("Nexum_1.1.0_x64-setup.exe"), "1.1.0", &cur),
+            check_signed_binding(&signed_for("1.1.0"), "1.1.0", &cur),
             Err(ErrorCode::NotNewer)
         );
         // A newer file under a different announced number.
         assert_eq!(
-            check_signed_binding(&s("Nexum_1.4.0_x64-setup.exe"), "1.3.0", &cur),
+            check_signed_binding(&signed_for("1.4.0"), "1.3.0", &cur),
             Err(ErrorCode::NotNewer)
         );
-        // An unreadable version field never passes as "nothing to bind".
+        // The version field and the file name must agree with each other too.
         assert_eq!(
-            check_signed_binding(&sig("timestamp:1\tversion:newest"), "1.3.0", &cur),
+            check_signed_binding(&s("file:Nexum_1.1.0_x64-setup.exe\tversion:1.3.0"), "1.3.0", &cur),
             Err(ErrorCode::NotNewer)
         );
-        // No version anywhere in the trusted comment: accepted, the caller logs it.
-        assert_eq!(check_signed_binding(&s("payload"), "1.3.0", &cur), Ok(false));
+        assert_eq!(
+            check_signed_binding(&s("file:Nexum_1.3.0_x64-setup.exe\tversion:1.1.0"), "1.3.0", &cur),
+            Err(ErrorCode::NotNewer)
+        );
+        // An unreadable version field.
+        assert_eq!(
+            check_signed_binding(&s("file:Nexum_1.3.0_x64-setup.exe\tversion:newest"), "1.3.0", &cur),
+            Err(ErrorCode::NotNewer)
+        );
+        // A signature that names no version, or no Nexum installer, was not made for an
+        // update: never accepted (it used to be let through with a log line).
+        for unbound in [
+            "file:Nexum_1.3.0_x64-setup.exe",
+            "version:1.3.0",
+            "file:payload\tversion:1.3.0",
+            "file:Nexum_1.3.0_x64-portable.zip\tversion:1.3.0",
+            "file:Nexum_1.3.0_x64-setup-UNSIGNED-PREVIEW.exe\tversion:1.3.0",
+            "file:payload",
+            "",
+        ] {
+            assert_eq!(
+                check_signed_binding(&s(unbound), "1.3.0", &cur),
+                Err(ErrorCode::BadSignature),
+                "{unbound:?}"
+            );
+        }
         // A signature that cannot be read at all.
         assert_eq!(
             check_signed_binding("%%%", "1.3.0", &cur),
             Err(ErrorCode::BadSignature)
+        );
+
+        // The attack the strict reader exists for: a genuine signature of the OLD installer
+        // whose unsigned first line was rewritten to claim the new version. The signed line
+        // still says 1.1.0, and that is the one that counts.
+        let genuine_old = "timestamp:1795800000\tfile:Nexum_1.1.0_x64-setup.exe\tversion:1.1.0";
+        let forged = b64(&format!(
+            "trusted comment: timestamp:1\tfile:Nexum_1.3.0_x64-setup.exe\tversion:1.3.0\nRUTdummy\ntrusted comment: {genuine_old}\nGLOBALdummy\n"
+        ));
+        assert_eq!(
+            check_signed_binding(&forged, "1.3.0", &cur),
+            Err(ErrorCode::NotNewer)
         );
     }
 
@@ -1746,6 +2022,9 @@ mod tests {
         assert_eq!(launch_error_code(Some(740)), ErrorCode::Launch);
         assert_eq!(launch_error_code(None), ErrorCode::Launch);
         assert_eq!(INSTALLER_ARGS, ["/P", "/R", "/UPDATE"]);
+        // The installer is started in a folder only administrators can write to.
+        let start_dir = crate::util::windows_dir().join("System32");
+        assert!(start_dir.is_absolute() && start_dir.is_dir(), "{}", start_dir.display());
     }
 
     #[test]
@@ -1802,9 +2081,26 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let bytes: Vec<u8> = (0..70_000u32).map(|i| (i % 253) as u8).collect();
 
-        // A leftover from an earlier attempt is removed first.
+        // The staging folder is made for administrators only, which needs an elevated run
+        // (CI has one; the app always runs elevated). Without it there is nothing to test.
+        match PinnedDir::create_admin_only(&base, "probe") {
+            Ok(probe) => {
+                drop(probe);
+                std::fs::remove_dir(base.join("probe")).unwrap();
+            }
+            Err(e) if crate::safe_fs::tests::skip_without_elevation(&e) => {
+                let _ = std::fs::remove_dir_all(&base);
+                return;
+            }
+            Err(e) => panic!("could not make an admin-only folder: {e}"),
+        }
+
+        // What an earlier attempt left behind, or what somebody planted: an ordinary folder
+        // with an ordinary access list. It is never reused.
         std::fs::create_dir_all(base.join(STAGING_DIR)).unwrap();
         std::fs::write(base.join(STAGING_DIR).join("old-leftover.bin"), b"old").unwrap();
+        let before = crate::safe_fs::security_sddl(&base.join(STAGING_DIR)).unwrap();
+        assert!(!crate::safe_fs::sddl_admin_only(&before), "{before}");
 
         let staged = match stage(&base, "1.3.0", &bytes) {
             Ok(s) => s,
@@ -1813,6 +2109,12 @@ mod tests {
         assert_eq!(staged.path, base.join(STAGING_DIR).join("Nexum-update-1.3.0.exe"));
         assert!(!base.join(STAGING_DIR).join("old-leftover.bin").exists());
         assert_eq!(std::fs::read(&staged.path).unwrap(), bytes);
+        // Folder and file: owner Administrators, SYSTEM and Administrators only, nothing
+        // inherited from the folder Nexum is installed in.
+        for path in [base.join(STAGING_DIR), staged.path.clone()] {
+            let sddl = crate::safe_fs::security_sddl(&path).unwrap();
+            assert!(crate::safe_fs::sddl_admin_only(&sddl), "{}: {sddl}", path.display());
+        }
         // While it is held nobody can change, delete or replace it, or move its folder.
         assert!(std::fs::write(&staged.path, b"swapped").is_err());
         assert!(std::fs::remove_file(&staged.path).is_err());
@@ -1827,6 +2129,12 @@ mod tests {
         assert_eq!(pinned.remove_entries().unwrap(), 0);
         drop(pinned);
         std::fs::remove_dir(base.join(STAGING_DIR)).unwrap();
+
+        // A staging folder that cannot be emptied is refused: nothing is written into it.
+        std::fs::create_dir_all(base.join(STAGING_DIR).join("sub")).unwrap();
+        std::fs::write(base.join(STAGING_DIR).join("sub").join("x"), b"x").unwrap();
+        assert!(matches!(stage(&base, "1.3.0", &bytes), Err(ErrorCode::Write)));
+        assert!(!base.join(STAGING_DIR).join("Nexum-update-1.3.0.exe").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 

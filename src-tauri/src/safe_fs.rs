@@ -12,19 +12,37 @@
 //! * new files are created with `CREATE_NEW` (never through an existing name or link) and their
 //!   final path is verified the same way; a file that landed anywhere else is deleted again
 //!   through its own handle.
+//!
+//! The update installer is the one file the elevated app writes and then *runs*, so its
+//! folder gets more than that (CONTRACT §2.15.5 step 3): [`PinnedDir::create_admin_only`]
+//! makes a new folder whose security descriptor is set in the call that creates it (owner
+//! Administrators; SYSTEM and Administrators only; nothing inherited from the parent), and
+//! [`PinnedDir::create_new_file_admin_only`] does the same for the file. Nothing that runs
+//! without administrator rights can open, replace, map or rename either of them, wherever
+//! Nexum was installed.
 
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Component, Path, PathBuf};
 
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOLEAN, HANDLE};
+use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::Foundation::{LocalFree, BOOLEAN, HANDLE, HLOCAL};
+use windows::Win32::Security::Authorization::{
+    ConvertSecurityDescriptorToStringSecurityDescriptorW,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
+    SDDL_REVISION_1, SE_FILE_OBJECT,
+};
+use windows::Win32::Security::{
+    DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    SECURITY_ATTRIBUTES,
+};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FileDispositionInfo, GetFileInformationByHandle, SetFileInformationByHandle,
-    BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    CreateDirectoryW, CreateFileW, FileDispositionInfo, GetFileInformationByHandle,
+    SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_APPEND_DATA, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
     FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, SYNCHRONIZE,
@@ -75,6 +93,151 @@ fn check_plain_dir(h: &OwnedHandle) -> io::Result<()> {
     }
     if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
         return Err(refused("the path is not a folder"));
+    }
+    Ok(())
+}
+
+/// Security descriptor of the update staging folder (SDDL): owner Administrators; a protected
+/// DACL (nothing inherited from the parent) with full access for SYSTEM and Administrators,
+/// passed on to what is created inside. Nobody else gets any access.
+pub const ADMIN_ONLY_DIR_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+/// The same for a single file.
+pub const ADMIN_ONLY_FILE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+
+/// True when a security descriptor in SDDL form (owner and DACL, as [`security_sddl`] returns
+/// it) keeps everybody but SYSTEM and the Administrators group out: the owner is one of the
+/// two (an owner can always rewrite the access list), the DACL is protected (it inherits
+/// nothing), it has at least one entry, and every entry is an allow entry for one of the two.
+pub fn sddl_admin_only(sddl: &str) -> bool {
+    let Some(rest) = sddl.trim().strip_prefix("O:") else {
+        return false;
+    };
+    let Some((owner, dacl)) = rest.split_once("D:") else {
+        return false;
+    };
+    if !matches!(owner, "BA" | "SY") {
+        return false;
+    }
+    let Some(first) = dacl.find('(') else {
+        return false;
+    };
+    let (flags, aces) = dacl.split_at(first);
+    // The DACL flags are P (protected), AR and AI: only "P" contains that letter.
+    if !flags.contains('P') {
+        return false;
+    }
+    let mut entries = 0usize;
+    for ace in aces.split(')') {
+        if ace.is_empty() {
+            continue;
+        }
+        let Some(ace) = ace.strip_prefix('(') else {
+            return false;
+        };
+        let fields: Vec<&str> = ace.split(';').collect();
+        if fields.len() != 6 || fields[0] != "A" || !matches!(fields[5], "SY" | "BA") {
+            return false;
+        }
+        entries += 1;
+    }
+    entries > 0
+}
+
+/// A security descriptor the system allocated (`LocalAlloc`), released on drop.
+struct LocalSd(PSECURITY_DESCRIPTOR);
+
+impl Drop for LocalSd {
+    fn drop(&mut self) {
+        if !self.0 .0.is_null() {
+            // SAFETY: the pointer came from a system call that allocates with LocalAlloc, and
+            // it is released exactly once.
+            unsafe {
+                let _ = LocalFree(HLOCAL(self.0 .0));
+            }
+        }
+    }
+}
+
+fn sd_from_sddl(sddl: &str) -> io::Result<LocalSd> {
+    let wide = to_wide(sddl);
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `wide` is NUL-terminated and outlives the call; `sd` is a valid out pointer and
+    // the result is owned (and released) by `LocalSd`.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(wide.as_ptr()),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
+    }
+    .map_err(win_io)?;
+    Ok(LocalSd(sd))
+}
+
+fn security_attributes(sd: &LocalSd) -> SECURITY_ATTRIBUTES {
+    SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0 .0,
+        bInheritHandle: false.into(),
+    }
+}
+
+/// Owner and DACL of a file or folder in SDDL form (for [`sddl_admin_only`]). The caller must
+/// hold the object pinned, so that the path cannot name anything else while this runs.
+pub fn security_sddl(path: &Path) -> io::Result<String> {
+    let wide = to_wide(path);
+    let info = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let mut raw = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `wide` is NUL-terminated and outlives the call; `raw` is a valid out pointer and
+    // the descriptor is owned (and released) by `LocalSd`.
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            info,
+            None,
+            None,
+            None,
+            None,
+            &mut raw,
+        )
+    };
+    let sd = LocalSd(raw);
+    if rc.0 != 0 {
+        return Err(io::Error::from_raw_os_error(rc.0 as i32));
+    }
+    let mut text = PWSTR::null();
+    // SAFETY: `sd` holds a valid descriptor and `text` is a valid out pointer.
+    unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            sd.0,
+            SDDL_REVISION_1,
+            info,
+            &mut text,
+            None,
+        )
+    }
+    .map_err(win_io)?;
+    // SAFETY: on success `text` is a NUL-terminated wide string the system allocated with
+    // LocalAlloc; it is copied once and then released exactly once.
+    let sddl = unsafe {
+        let copy = text.to_string();
+        let _ = LocalFree(HLOCAL(text.0.cast()));
+        copy
+    };
+    sddl.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "unreadable security descriptor"))
+}
+
+/// A plain entry name: no separators, no stream or drive syntax, no control characters.
+fn check_plain_name(name: &str) -> io::Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['\\', '/', ':'])
+        || name.chars().any(char::is_control)
+    {
+        return Err(refused("invalid file name"));
     }
     Ok(())
 }
@@ -153,6 +316,60 @@ impl PinnedDir {
         })
     }
 
+    /// Creates the folder `<base>\<name>` for administrators only and pins it (CONTRACT
+    /// §2.15.5 step 3). `base` is the trusted folder it lives in (see [`Self::open`]).
+    ///
+    /// * Whatever already has that name is never reused: a folder is emptied and removed, a
+    ///   link or a file is removed as the entry itself. If that fails, so does this call.
+    /// * The new folder gets [`ADMIN_ONLY_DIR_SDDL`] **in the call that creates it**, so there
+    ///   is no moment at which it has the access list of its parent.
+    /// * It is then pinned and its security descriptor is read back: a folder that somebody
+    ///   else managed to put there in between has another owner or another access list, and
+    ///   is refused.
+    ///
+    /// Needs an elevated process (the Administrators group must be a valid owner); without
+    /// one it fails with `ERROR_INVALID_OWNER` (1307).
+    pub fn create_admin_only(base: &Path, name: &str) -> io::Result<PinnedDir> {
+        check_plain_name(name)?;
+        let dir = base.join(name);
+        match std::fs::symlink_metadata(&dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+            Ok(_) => {
+                // A real folder is emptied first. `open` refuses a link, which is then
+                // removed below as the link itself (neither call follows it).
+                if let Ok(old) = PinnedDir::open(base, &dir, false) {
+                    let left = old.remove_entries()?;
+                    drop(old);
+                    if left > 0 {
+                        return Err(refused("the folder holds entries that cannot be removed"));
+                    }
+                }
+                if std::fs::remove_dir(&dir).is_err() {
+                    std::fs::remove_file(&dir)?;
+                }
+            }
+        }
+        let sd = sd_from_sddl(ADMIN_ONLY_DIR_SDDL)?;
+        let sa = security_attributes(&sd);
+        let wide = to_wide(&dir);
+        // SAFETY: `wide` is NUL-terminated; `sa` and the descriptor it points to (`sd`) live
+        // until the call returns. Fails with ERROR_ALREADY_EXISTS if the name is taken again.
+        unsafe {
+            CreateDirectoryW(
+                PCWSTR(wide.as_ptr()),
+                Some(&sa as *const SECURITY_ATTRIBUTES),
+            )
+        }
+        .map_err(win_io)?;
+        let pinned = PinnedDir::open(base, &dir, false)?;
+        // Pinned: the path names this very folder for as long as `pinned` lives.
+        if !sddl_admin_only(&security_sddl(&dir)?) {
+            return Err(refused("the new folder is not limited to administrators"));
+        }
+        Ok(pinned)
+    }
+
     /// Lexical path of the pinned folder.
     pub fn path(&self) -> &Path {
         &self.path
@@ -162,14 +379,7 @@ impl PinnedDir {
     /// taken by anything, including a link) for writing, shared for reading only. Its final
     /// path is verified; a file that resolved elsewhere is deleted again and refused.
     pub fn create_new_file(&self, name: &str) -> io::Result<(File, PathBuf)> {
-        if name.is_empty()
-            || name == "."
-            || name == ".."
-            || name.contains(['\\', '/', ':'])
-            || name.chars().any(char::is_control)
-        {
-            return Err(refused("invalid file name"));
-        }
+        check_plain_name(name)?;
         let path = self.path.join(name);
         let file = std::fs::OpenOptions::new()
             .write(true)
@@ -178,6 +388,47 @@ impl PinnedDir {
             .share_mode(FILE_SHARE_READ.0)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
             .open(&path)?;
+        self.verify_created(file, name, path)
+    }
+
+    /// [`Self::create_new_file`] with [`ADMIN_ONLY_FILE_SDDL`] set **in the call that creates
+    /// the file** (CONTRACT §2.15.5 step 3): from its first moment only SYSTEM and the
+    /// Administrators group can open it, so nothing without administrator rights can ever
+    /// hold a handle to it or a writable mapping of it. Needs an elevated process.
+    pub fn create_new_file_admin_only(&self, name: &str) -> io::Result<(File, PathBuf)> {
+        check_plain_name(name)?;
+        let path = self.path.join(name);
+        let sd = sd_from_sddl(ADMIN_ONLY_FILE_SDDL)?;
+        let sa = security_attributes(&sd);
+        let wide = to_wide(&path);
+        // SAFETY: `wide` is NUL-terminated; `sa` and the descriptor it points to (`sd`) live
+        // until the call returns. Same access, sharing and flags as `create_new_file`.
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(wide.as_ptr()),
+                FILE_GENERIC_WRITE.0 | DELETE.0,
+                FILE_SHARE_READ,
+                Some(&sa as *const SECURITY_ATTRIBUTES),
+                CREATE_NEW,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL,
+                HANDLE::default(),
+            )
+        }
+        .map_err(win_io)?;
+        // SAFETY: a valid handle from a successful CreateFileW that nothing else owns; the
+        // `File` closes it.
+        let file = unsafe { File::from_raw_handle(handle.0 as _) };
+        self.verify_created(file, name, path)
+    }
+
+    /// The final path of a file just created as `name` must be inside this folder; a file
+    /// that landed anywhere else is deleted again through its own handle and refused.
+    fn verify_created(
+        &self,
+        file: File,
+        name: &str,
+        path: PathBuf,
+    ) -> io::Result<(File, PathBuf)> {
         let handle = HANDLE(file.as_raw_handle());
         let expected = norm_path(&Path::new(&self.final_norm).join(name));
         if final_path(handle).as_deref() != Some(expected.as_str()) {
@@ -225,14 +476,7 @@ impl PinnedDir {
     /// the same checks as [`Self::create_new_file`]: not a reparse point, a single hard link
     /// (a second name could point at a file elsewhere), final path inside this folder.
     fn open_existing(&self, name: &str, access: u32, share: u32) -> io::Result<File> {
-        if name.is_empty()
-            || name == "."
-            || name == ".."
-            || name.contains(['\\', '/', ':'])
-            || name.chars().any(char::is_control)
-        {
-            return Err(refused("invalid file name"));
-        }
+        check_plain_name(name)?;
         let path = self.path.join(name);
         let file = std::fs::OpenOptions::new()
             .access_mode(access)
@@ -369,7 +613,7 @@ pub fn open_local_appdata(sub: &[&str]) -> io::Result<PinnedDir> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Write;
 
@@ -508,6 +752,149 @@ mod tests {
         assert!(!path.exists());
         drop(pinned);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn admin_only_rule_reads_security_descriptors() {
+        assert!(sddl_admin_only(ADMIN_ONLY_DIR_SDDL));
+        assert!(sddl_admin_only(ADMIN_ONLY_FILE_SDDL));
+        // The same descriptors as Windows may print them back.
+        assert!(sddl_admin_only("O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"));
+        assert!(sddl_admin_only("O:SYD:P(A;;FA;;;BA)"));
+        for open in [
+            "",
+            "D:P(A;;FA;;;BA)",
+            "O:BA",
+            "O:BAD:P",
+            // Not protected: it takes entries from its parent.
+            "O:BAD:(A;;FA;;;SY)(A;;FA;;;BA)",
+            "O:BAD:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)",
+            // Anybody else in the list, whatever the right.
+            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)",
+            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;AU)",
+            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;WD)",
+            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;S-1-5-21-1-2-3-1001)",
+            // Owned by somebody else: an owner can rewrite the list.
+            "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)",
+            "O:S-1-5-21-1-2-3-1001D:P(A;;FA;;;SY)(A;;FA;;;BA)",
+            // Anything that is not a plain allow entry, and anything after the list.
+            "O:BAD:P(D;;FA;;;WD)(A;;FA;;;BA)",
+            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)S:(ML;;NW;;;ME)",
+            "O:BAD:P(A;;FA;;;SY)x",
+        ] {
+            assert!(!sddl_admin_only(open), "{open:?}");
+        }
+    }
+
+    /// True when a failed admin-only creation only means that this test run is not elevated
+    /// (the Administrators group cannot be made an owner then: error 1307), so the test has
+    /// nothing to test. Never in CI: its runner is elevated, and the tests must run there.
+    pub(crate) fn skip_without_elevation(e: &io::Error) -> bool {
+        if e.raw_os_error() != Some(1307) {
+            return false;
+        }
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "the CI runner must be elevated for the admin-only folder tests: {e}"
+        );
+        eprintln!("skipped: this test needs an elevated run");
+        true
+    }
+
+    fn admin_only_or_skip(base: &Path, name: &str) -> Option<PinnedDir> {
+        match PinnedDir::create_admin_only(base, name) {
+            Ok(pinned) => Some(pinned),
+            Err(e) if skip_without_elevation(&e) => None,
+            Err(e) => panic!("create_admin_only failed: {e}"),
+        }
+    }
+
+    #[test]
+    fn admin_only_folder_and_file_keep_everybody_else_out() {
+        let base = scratch("adminonly");
+        let Some(pinned) = admin_only_or_skip(&base, "updates") else {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        };
+        let dir = base.join("updates");
+        assert_eq!(pinned.path(), dir.as_path());
+        let sddl = security_sddl(&dir).unwrap();
+        assert!(sddl_admin_only(&sddl), "{sddl}");
+        // The folder it was made in is an ordinary one: the rule does tell them apart.
+        let parent = security_sddl(&base).unwrap();
+        assert!(!sddl_admin_only(&parent), "{parent}");
+        // It is pinned like every other folder.
+        assert!(std::fs::rename(&dir, base.join("moved")).is_err());
+
+        let (mut f, path) = pinned.create_new_file_admin_only("setup.exe").unwrap();
+        f.write_all(b"verified bytes").unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        assert_eq!(path, dir.join("setup.exe"));
+        let sddl = security_sddl(&path).unwrap();
+        assert!(sddl_admin_only(&sddl), "{sddl}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"verified bytes");
+        // CREATE_NEW and plain names only, as for every other file.
+        let err = pinned.create_new_file_admin_only("setup.exe").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(pinned.create_new_file_admin_only(r"..\setup.exe").is_err());
+        assert!(pinned.create_new_file_admin_only("a:b").is_err());
+        // It can be pinned for reading exactly like a file made the ordinary way.
+        let held = pinned.open_read_exclusive("setup.exe").unwrap();
+        assert!(std::fs::write(&path, b"swapped").is_err());
+        drop(held);
+
+        assert_eq!(pinned.remove_entries().unwrap(), 0);
+        drop(pinned);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn admin_only_folder_never_reuses_what_was_there() {
+        let base = scratch("adminonly-old");
+        let outside = scratch("adminonly-target");
+        let dir = base.join("updates");
+        // An ordinary folder with a leftover: emptied, removed, made again.
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("old.exe"), b"old").unwrap();
+        let Some(pinned) = admin_only_or_skip(&base, "updates") else {
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&outside);
+            return;
+        };
+        assert!(!dir.join("old.exe").exists());
+        assert!(sddl_admin_only(&security_sddl(&dir).unwrap()));
+        drop(pinned);
+
+        // A junction under that name: the link goes, its target is not touched.
+        std::fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(junction(&dir, &outside), "could not create junction");
+        let pinned = PinnedDir::create_admin_only(&base, "updates").unwrap();
+        assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(), b"keep");
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+        assert!(sddl_admin_only(&security_sddl(&dir).unwrap()));
+        drop(pinned);
+
+        // A file under that name.
+        std::fs::remove_dir(&dir).unwrap();
+        std::fs::write(&dir, b"not a folder").unwrap();
+        let pinned = PinnedDir::create_admin_only(&base, "updates").unwrap();
+        assert!(dir.is_dir());
+        drop(pinned);
+
+        // A folder that cannot be emptied (a sub-folder with content) is refused, not reused.
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub").join("x"), b"x").unwrap();
+        assert!(PinnedDir::create_admin_only(&base, "updates").is_err());
+        assert!(dir.join("sub").join("x").exists());
+        // Plain names only.
+        assert!(PinnedDir::create_admin_only(&base, r"..\updates").is_err());
+        assert!(PinnedDir::create_admin_only(&base, r"a\b").is_err());
+        assert!(PinnedDir::create_admin_only(&base, "").is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

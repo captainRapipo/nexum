@@ -35,15 +35,23 @@ tauri-plugin-notification = "2"
 # capability, so the WebView cannot reach the plugin. Its `zip` feature (Tauri v1 archives)
 # is left out because Nexum never calls the plugin's own installer.
 tauri-plugin-updater = { version = "2.14.1", default-features = false, features = ["rustls-tls", "system-proxy"] }
-# Named directly because src/updater.rs uses their API; both are already in the tree.
+# Named directly because src/updater.rs uses their API; all of them are already in the tree
+# through the updater plugin, with exactly these features, so nothing new is compiled.
+# reqwest: the manifest request is made by updater.rs itself, so that it can stop reading at
+# a size limit (the plugin reads a response of any size into memory). rustls: the TLS crypto
+# provider has to be installed before the first request. CI allows network crates in
+# src/updater.rs only (.github/scripts/check-network.mjs).
 semver = "1"
 base64 = "0.23"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "system-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [dependencies.windows]
 version = "0.58"
 features = [
   "Win32_Foundation",
   "Win32_Security",
+  "Win32_Security_Authorization",
   "Win32_UI_Shell",
   "Win32_System_Com",
   "Win32_System_Registry",
