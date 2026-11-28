@@ -1,14 +1,20 @@
-// Authoritative frontend mirror of CONTRACT.md — contract version 1.1.0.
+// Authoritative frontend mirror of CONTRACT.md — contract version 1.2.0.
 // Field names, unions and defaults here are binding for all three layers (C# sidecar,
 // Rust core, React frontend). Do not rename fields. Change this file only together with
-// CONTRACT.md. Owner: implementer C (frontend core).
+// CONTRACT.md. Owner: the contract owner (foundation); implementers do not edit it.
 //
-// Legend used in comments:  [NEW 1.1] added in 1.1.0 · [BREAKING 1.1] removed/renamed/re-typed
-// in 1.1.0 · [CHANGED 1.1] same type, new semantics in 1.1.0. Unsuffixed [NEW] / [BREAKING] /
-// [CHANGED] markers are historical (1.0.0-gate).
+// Legend used in comments:  [NEW 1.2] added in 1.2.0 · [BREAKING 1.2] removed/renamed/re-typed
+// in 1.2.0 · [CHANGED 1.2] same type, new semantics in 1.2.0. The 1.1 markers ([NEW 1.1] …) and
+// the unsuffixed [NEW] / [BREAKING] / [CHANGED] markers are historical (1.1.0, 1.0.0-gate).
+//
+// Wording rule (CONTRACT §4.8): the word "agent" never appears in text people can see. Identifiers
+// in this file keep it (AgentStatus, agent-status, agentOffline, agentLost): they are internal.
 
-export const CONTRACT_VERSION = "1.1.0";
-/** [BREAKING 1.1] Value of `hello.protocol` sent by a sidecar that implements this contract (was 2). */
+export const CONTRACT_VERSION = "1.2.0";
+/**
+ * [BREAKING 1.1] Value of `hello.protocol` sent by a sidecar that implements this contract (was 2).
+ * Unchanged in 1.2: the sidecar is not touched this round and still reports version "1.1.0".
+ */
 export const AGENT_PROTOCOL = 3;
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -49,6 +55,61 @@ export const VIEW_LABELS: Record<ViewId, string> = {
   cleaner: "Cleaner",
 };
 
+/**
+ * [NEW 1.2] Sidebar row label and page title per view (CONTRACT §4.6). Differs from VIEW_LABELS
+ * only for the cleaner ("Clean caches"). VIEW_LABELS stays for the tray menu and existing callers.
+ */
+export const VIEW_TITLES: Record<ViewId, string> = {
+  dashboard: "Dashboard",
+  sensors: "Sensors",
+  system: "System",
+  storage: "Storage",
+  cooling: "Cooling",
+  drivers: "Drivers",
+  gaming: "Gaming",
+  cleaner: "Clean caches",
+};
+
+/** [NEW 1.2] Sidebar groups, top to bottom. Flattened, the order equals VIEW_ORDER (F1–F9 stay monotonic). */
+export type NavGroupId = "monitor" | "hardware" | "tools";
+export interface NavGroup {
+  id: NavGroupId;
+  /** Group label, exactly as shown. */
+  label: string;
+  views: readonly ViewId[];
+}
+export const NAV_GROUPS: readonly NavGroup[] = [
+  { id: "monitor", label: "Monitor", views: ["dashboard", "sensors", "system"] },
+  { id: "hardware", label: "Hardware", views: ["storage", "cooling", "drivers"] },
+  { id: "tools", label: "Tools", views: ["gaming", "cleaner"] },
+] as const;
+
+/**
+ * [NEW 1.2] Page kind (CONTRACT §4.6). "list" pages (Sensors, Drivers) are full-bleed white, never
+ * show a large title and always show their title in the toolbar. "grouped" pages sit on the canvas,
+ * show a large title in regular mode and move it into the toolbar in tight mode.
+ */
+export type PageKind = "grouped" | "list";
+export const PAGE_KIND: Record<ViewId, PageKind> = {
+  dashboard: "grouped",
+  sensors: "list",
+  system: "grouped",
+  storage: "grouped",
+  cooling: "grouped",
+  drivers: "list",
+  gaming: "grouped",
+  cleaner: "grouped",
+};
+
+/**
+ * [NEW 1.2] Tight mode = viewport at most 1399 px wide OR at most 899 px tall. The same rule as the
+ * `tight:` Tailwind variant in styles/nexum.css; hooks/useTightMode.ts feeds this to matchMedia.
+ */
+export const TIGHT_MEDIA_QUERY = "(max-width: 1399px), (max-height: 899px)";
+
+/** [NEW 1.2] Shortcut that focuses the toolbar filter field when the page has one (Ctrl+K). */
+export const SEARCH_HOTKEY_LABEL = "Ctrl K";
+
 export type KeyAction =
   | { type: "view"; view: ViewId }
   | { type: "rescan" }
@@ -84,6 +145,8 @@ export const EVENTS = {
   sensorLog: "sensor-log",
   healthAlerts: "health-alerts",
   tuningState: "tuning-state",
+  /** [NEW 1.2] UpdateState on every change (CONTRACT §2.15). */
+  updateState: "update-state",
 } as const;
 export type EventName = (typeof EVENTS)[keyof typeof EVENTS];
 
@@ -298,8 +361,49 @@ export interface SensorDriverStatus {
 
 export type LimitedReason = "notElevated" | "pawnIoMissing" | "pawnIoOutdated";
 
-/** Reasons accepted by the <Unavailable> primitive. */
+/**
+ * Reasons accepted by the <Unavailable> primitive. [CHANGED 1.2] The id "agentOffline" stays, but its
+ * text is now NOT_AVAILABLE_TEXT ("Not available right now"); no visible text says "agent".
+ */
 export type UnavailableReason = LimitedReason | "unsupported" | "agentOffline";
+
+/** [NEW 1.2] Tooltip / cause text of a value that cannot be read at the moment (CONTRACT §4.8). */
+export const NOT_AVAILABLE_TEXT = "Not available right now";
+
+/**
+ * [NEW 1.2] Life cycle of the background sensor service as Rust reports it (CONTRACT §2.3).
+ * starting   → spawned, no hello yet (also right after "Try again")
+ * running    → hello received
+ * restarting → it stopped or stopped answering; Rust is restarting it (SENSOR_RESTART_* policy)
+ * failed     → Rust gave up; the UI shows the one banner (SENSORS_DOWN_TITLE) with "Try again"
+ * stopped    → Nexum itself stopped it (app exit, installing an update)
+ * The UI shows nothing for starting / running / restarting / stopped.
+ */
+export type SensorServicePhase = "starting" | "running" | "restarting" | "failed" | "stopped";
+
+/** [NEW 1.2] Why the sensor service is in phase "failed" (CONTRACT §2.3). */
+export type SensorFailReason = "blocked" | "missing" | "crashed" | "notResponding" | "startFailed";
+
+/** [NEW 1.2] Automatic restart policy (CONTRACT §2.3). Rust implements it; mirrored for the mock. */
+export const SENSOR_RESTART_MAX = 5;
+/** Delay before automatic restart 1..5. */
+export const SENSOR_RESTART_DELAYS_MS: readonly number[] = [1000, 2000, 4000, 8000, 15000] as const;
+/** The restart counter returns to 0 after the service has run this long without stopping. */
+export const SENSOR_HEALTHY_RUN_MS = 60_000;
+
+/** [NEW 1.2] The one banner shown when the sensor service is in phase "failed" (CONTRACT §4.8.1). Exact texts. */
+export const SENSORS_DOWN_TITLE = "Nexum can't read sensors right now.";
+export const SENSORS_RETRY_LABEL = "Try again";
+/** Short plain reason under the title; no line when failReason is null. */
+export const SENSORS_DOWN_REASON: Record<SensorFailReason, string> = {
+  blocked: "Windows security blocked part of Nexum.",
+  missing: "Part of Nexum is missing. Installing Nexum again fixes this.",
+  crashed: "Sensor reading stopped and could not be restarted.",
+  notResponding: "Sensor reading stopped responding.",
+  startFailed: "Sensor reading could not be started.",
+};
+/** Pill fragment for the same condition ("Attention · Sensors unavailable") and the tray tooltip head. */
+export const SENSORS_DOWN_SHORT = "Sensors unavailable";
 
 /** What a value needs in order to be readable (CONTRACT §4.5 resolveUnavailable). */
 export type FeatureNeed = "admin" | "pawnio" | "none";
@@ -324,8 +428,13 @@ export interface AgentHello {
 export interface AgentStatus {
   running: boolean;
   isAdmin: boolean;
+  /** [CHANGED 1.2] Diagnostic text for logs only. Never rendered in the UI (it may name internals). */
   message: string;
   lastPacketTs: number | null;
+  /** [NEW 1.2] Life cycle of the sensor service. The UI shows the "can't read sensors" banner only for "failed". */
+  phase: SensorServicePhase;
+  /** [NEW 1.2] Set only while phase === "failed", else null. */
+  failReason: SensorFailReason | null;
   /** [NEW] Copied from the last hello; null until a hello arrives or while the agent is down. */
   sensorDriver: SensorDriverStatus | null;
   /** [NEW] Empty while the agent is down (offline is not "limited"). Order: notElevated, pawnIoMissing|pawnIoOutdated. */
@@ -1333,7 +1442,7 @@ export interface FanFailsafeState {
   /** True → show the banner. */
   active: boolean;
   kind: FanFailsafeKind | null;
-  /** "crit" (rose) for interrupted/agentLost, "warn" (amber) for previousBoot, null when inactive. */
+  /** "crit" (vermilion, octagon) for interrupted/agentLost, "warn" (amber) for previousBoot, null when inactive. */
   severity: "crit" | "warn" | null;
   /** True when a running agent confirms every controllable header is held at 100%. */
   fansAt100: boolean;
@@ -1350,7 +1459,7 @@ export interface SelfUsage {
   cpuPct: number;
   /** Sum of working sets, MB (integer). */
   workingSetMb: number;
-  /** Nexum.exe + nexum-agent + WebView2 descendants. */
+  /** Nexum.exe + its sensor service process + WebView2 descendants. */
   processCount: number;
 }
 
@@ -1366,6 +1475,20 @@ export interface SensorLabelMeta {
 }
 
 export type SensorDriverChoice = "undecided" | "pawnio" | "none";
+
+/**
+ * [NEW 1.2] Update-check consent (CONTRACT §2.15.3).
+ * "ask"    → not answered yet: the first-run question is shown once; NO network request is made.
+ * "auto"   → Nexum checks at most once every 24 h and shows a quiet toolbar indicator. It never downloads
+ *            or installs on its own.
+ * "manual" → Nexum checks only when the user presses "Check now".
+ */
+export type UpdateCheckMode = "ask" | "auto" | "manual";
+
+/** [NEW 1.2] Release channel (CONTRACT §2.15.2). */
+export type UpdateChannel = "stable" | "preview";
+/** [NEW 1.2] "default" = the channel this build was made for (UpdateState.buildChannel). */
+export type UpdateChannelSetting = "default" | UpdateChannel;
 
 export interface Settings {
   launchOnStartup: boolean;
@@ -1402,6 +1525,15 @@ export interface Settings {
   alerts: AlertSettings;
   /** [NEW 1.1] Recycle Bin age filter: one of RECYCLE_AGE_OPTIONS (null = every item). */
   recycleMinAgeDays: number | null;
+  /** [NEW 1.2] Update-check consent. Default "ask". Unknown value → "ask". */
+  updateCheck: UpdateCheckMode;
+  /**
+   * [NEW 1.2] Unix ms of the last update check that got an answer from GitHub (update or no update);
+   * null = never. Written by Rust only: save_settings keeps the stored value and ignores this member.
+   */
+  lastUpdateCheckTs: number | null;
+  /** [NEW 1.2] Channel choice. Default "default". Unknown value → "default". */
+  updateChannel: UpdateChannelSetting;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -1425,12 +1557,167 @@ export const DEFAULT_SETTINGS: Settings = {
   sensorLogIntervalMs: 1000,
   alerts: DEFAULT_ALERT_SETTINGS,
   recycleMinAgeDays: 30,
+  updateCheck: "ask",
+  lastUpdateCheckTs: null,
+  updateChannel: "default",
 };
+
+// ───────────────────────────────────────────────────────────────────────────────
+// In-app updates [NEW 1.2] (CONTRACT §2.15). The frontend never talks to the network: Rust owns the
+// check, the download, the signature check and the install. These shapes mirror the Rust structs.
+// ───────────────────────────────────────────────────────────────────────────────
+
+/**
+ * idle        → nothing to do: never checked, or the last check found no newer version
+ * checking    → asking GitHub
+ * available   → a newer version exists (latestVersion, notes, publishedAt are set); nothing downloaded
+ * downloading → the user clicked Install; `progress` is set when the size is known
+ * ready       → downloaded and the signature is verified; the installer is about to start
+ * installing  → the installer was started; Nexum exits within a few seconds
+ * error       → `error` and `errorCode` are set; latestVersion stays set if an update had been found
+ * disabled    → this build does not update from inside the app (no channel compiled in: forks, dev builds)
+ */
+export type UpdateStatus = "idle" | "checking" | "available" | "downloading" | "ready" | "installing" | "error" | "disabled";
+
+/** Stable error ids; the display text is UpdateState.error (= UPDATE_ERROR_TEXT[errorCode]). */
+export type UpdateErrorCode =
+  | "offline"
+  | "notPublished"
+  | "badManifest"
+  | "notNewer"
+  | "badSignature"
+  | "blocked"
+  | "write"
+  | "launch"
+  | "busy"
+  | "unknown";
+
+export interface UpdateState {
+  state: UpdateStatus;
+  /** Version of the running app, SemVer without a leading "v" (e.g. "1.2.0", "1.2.0-preview.2"). */
+  currentVersion: string;
+  /** Version on offer; null unless a newer version was found. Always strictly greater than currentVersion. */
+  latestVersion: string | null;
+  /** Release notes as plain text (max 4000 chars, shown as text, never as HTML); null if none. */
+  notes: string | null;
+  /** ISO 8601 UTC publication time of the version on offer; null if unknown. */
+  publishedAt: string | null;
+  /** Download progress 0..100 (integer) while downloading and the size is known; else null. */
+  progress: number | null;
+  /** Bytes received so far while downloading; else null. */
+  downloadedBytes: number | null;
+  /** Download size if GitHub reported it; else null. */
+  totalBytes: number | null;
+  /** Plain-language error (one of UPDATE_ERROR_TEXT), set only in state "error". */
+  error: string | null;
+  errorCode: UpdateErrorCode | null;
+  /** Channel in effect (the setting, or the build channel for "default"); null when disabled. */
+  channel: UpdateChannel | null;
+  /** Channel compiled into this build; null = this build never updates from inside the app. */
+  buildChannel: UpdateChannel | null;
+  /** = Settings.lastUpdateCheckTs. */
+  lastCheckTs: number | null;
+}
+
+/** State before Rust answers get_update_state (also the mock's default). */
+export const INITIAL_UPDATE_STATE: UpdateState = {
+  state: "idle",
+  currentVersion: "",
+  latestVersion: null,
+  notes: null,
+  publishedAt: null,
+  progress: null,
+  downloadedBytes: null,
+  totalBytes: null,
+  error: null,
+  errorCode: null,
+  channel: null,
+  buildChannel: null,
+  lastCheckTs: null,
+};
+
+/** The only hosts and paths the updater may contact (CONTRACT §2.15.2). Documentation + mock; Rust owns the real constants. */
+export const UPDATE_REPO_URL = "https://github.com/captainRapipo/nexum";
+/** Opened in the browser by "Open the releases page" (api.openExternal): not a request made by Nexum. */
+export const UPDATE_RELEASES_URL = "https://github.com/captainRapipo/nexum/releases";
+/** Fixed-URL manifests: assets of the permanent release tagged "updates". */
+export const UPDATE_MANIFEST_URLS: Record<UpdateChannel, string> = {
+  stable: "https://github.com/captainRapipo/nexum/releases/download/updates/stable.json",
+  preview: "https://github.com/captainRapipo/nexum/releases/download/updates/preview.json",
+};
+/** Every download URL in a manifest must start with this. */
+export const UPDATE_DOWNLOAD_PREFIX = "https://github.com/captainRapipo/nexum/releases/download/";
+/** "auto" checks at most once per this period, counted from Settings.lastUpdateCheckTs. */
+export const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+/** First automatic check this long after start; then the due rule is re-evaluated every hour. */
+export const UPDATE_FIRST_CHECK_DELAY_MS = 30_000;
+/** Release notes are cut to this many characters (then "…"). */
+export const UPDATE_NOTES_MAX_CHARS = 4000;
+
+/** Exact error texts (CONTRACT §2.15.6). Rust sends the same strings in UpdateState.error. */
+export const UPDATE_ERROR_TEXT: Record<UpdateErrorCode, string> = {
+  offline: "Could not reach GitHub. Check your internet connection and try again.",
+  notPublished: "No update information has been published for this version line yet.",
+  badManifest: "The update information from GitHub could not be read.",
+  notNewer: "The version on offer is not newer than this one, so nothing was installed.",
+  badSignature: "The download did not pass Nexum's signature check, so it was not installed.",
+  blocked: "Windows security blocked the installer. Nothing was changed.",
+  write: "The update could not be saved in Nexum's folder. Nothing was changed.",
+  launch: "The installer could not be started. Nothing was changed.",
+  busy: "An update is already in progress.",
+  unknown: "The update could not be completed. Nothing was changed.",
+};
+
+/** Exact UI texts of the update flow (CONTRACT §2.15.7). `{v}` = latestVersion, `{c}` = currentVersion. */
+export const UPDATE_TEXT = {
+  /** First-run question (shown once while Settings.updateCheck === "ask"). */
+  askTitle: "Check for updates automatically?",
+  askBody:
+    "Nexum can ask GitHub once a day whether a newer version exists. That check, and the download when you choose to install, are the only times Nexum goes online. It sends no information about you or this PC, and nothing is installed until you click Install.",
+  askNote: "You can change this any time in Settings, under Updates.",
+  askYes: "Check automatically",
+  askNo: "Not now",
+  /** Toolbar indicator (state available / downloading / ready / installing). */
+  indicator: "Update available",
+  indicatorTitle: "Nexum {v} is available",
+  /** Update dialog. */
+  dialogTitle: "Nexum {v} is available",
+  dialogCurrent: "You have Nexum {c}.",
+  dialogClose: "Nexum closes while the update installs. If it does not open again by itself, start it from the Start menu.",
+  dialogPreview: "This is a preview version. It is not code-signed yet, so Windows may warn about it or block it.",
+  dialogVerified: "Nexum checks the download against its signing key before anything runs.",
+  install: "Install update",
+  later: "Later",
+  downloading: "Downloading…",
+  ready: "Download verified. Starting the installer…",
+  installing: "Installing. Nexum will close now.",
+  retry: "Try again",
+  close: "Close",
+  openReleases: "Open the releases page",
+  /** Settings section "Updates". */
+  sectionTitle: "Updates",
+  modeLabel: "Check for updates",
+  modeAuto: "Automatically, once a day",
+  modeManual: "Only when I ask",
+  previewToggle: "Get preview versions",
+  previewToggleNote: "Preview versions arrive earlier and are not code-signed yet. Windows may warn about them or block them.",
+  checkNow: "Check now",
+  viewUpdate: "View update",
+  statusNever: "Not checked yet.",
+  statusChecking: "Checking…",
+  statusUpToDate: "Nexum is up to date.",
+  statusAvailable: "Nexum {v} is available.",
+  lastChecked: "Last checked {when}.",
+  sourceNote: "Updates come from Nexum's GitHub releases page and are verified with Nexum's signing key before they run.",
+  disabled: "This build does not update from inside the app. New versions are on the releases page.",
+} as const;
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Health derivation (MF-6, CONTRACT §5). [CHANGED 1.1] Conditions drive:*, cpu-temp, gpu-temp:*,
 // gpu-mem-temp:*, drive-temp:*, space:* come from Rust (HealthAlert → alertToCondition, §5.0);
 // fan-failsafe, agent-offline, fan-override, limited-mode, drive-unknown:* stay frontend-derived.
+// [CHANGED 1.2] "agent-offline" (id kept, internal) exists only while AgentStatus.phase === "failed";
+// its texts are SENSORS_DOWN_*; while the service is starting or restarting the level is "checking".
 // ───────────────────────────────────────────────────────────────────────────────
 
 export type HealthSeverity = "crit" | "warn" | "info";
@@ -1439,7 +1726,8 @@ export type HealthSource = "drive" | "cpu" | "gpu" | "agent" | "space" | "fan";
 /** A condition's button: either in-app navigation or one of the fixed commands. */
 export type HealthAction =
   | { label: string; nav: NavRequest }
-  | { label: string; command: "restartAsAdmin" | "getPawnIo" };
+  /** [CHANGED 1.2] "retrySensors" added: api.restartAgent() (label SENSORS_RETRY_LABEL). */
+  | { label: string; command: "restartAsAdmin" | "getPawnIo" | "retrySensors" };
 
 export interface HealthCondition {
   /** Stable id, e.g. "drive:/nvme/0", "cpu-temp", "gpu-temp:0", "space:C:", "fan-failsafe". */
@@ -1459,7 +1747,10 @@ export interface HealthCondition {
   action: HealthAction | null;
 }
 
-/** [BREAKING 1.1] "checking" added: agent online, Rust alerts not ready yet, no other condition (pill tone unknown). */
+/**
+ * [BREAKING 1.1] "checking" added. [CHANGED 1.2] It now also covers the sensor service starting or
+ * restarting (no data yet, not failed). Pill tone "checking" (StatusPillTone): neutral, dashed ring.
+ */
 export type SystemHealthLevel = "optimal" | "attention" | "critical" | "partial" | "checking";
 
 export interface SystemHealth {
@@ -1494,6 +1785,6 @@ export const HEALTH_THRESHOLDS = {
   /** Sustained window: a temperature condition is active when the MIN of samples in the window ≥ threshold. */
   sustainWindowMs: 10_000,
   sustainMinSamples: 3,
-  /** Agent is considered offline when no packet for max(staleMinMs, 3 × pollIntervalMs). */
+  /** Sensor data counts as stale when no packet arrived for max(staleMinMs, 3 × pollIntervalMs). */
   staleMinMs: 5_000,
 } as const;
