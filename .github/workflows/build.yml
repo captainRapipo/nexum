@@ -80,6 +80,11 @@ jobs:
       - name: No injection or hooks (CONTRACT §0)
         run: node .github/scripts/check-no-injection.mjs
 
+      # CONTRACT §7 item 14 (h): third-party actions are pinned to a commit, because the
+      # build job holds the update signing key and the release jobs can write releases.
+      - name: Third-party actions pinned to a commit
+        run: node .github/scripts/check-actions-pinned.mjs
+
   build:
     name: Build & test (Windows x64)
     runs-on: windows-latest

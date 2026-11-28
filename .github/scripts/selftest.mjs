@@ -381,6 +381,28 @@ for (const [name, patch, re] of netCases) {
   });
 }
 
+const wf = (uses) => ({ ".github/workflows/build.yml": `jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v5\n${uses}` });
+test("check-actions-pinned: commits, GitHub's own actions and local workflows pass", () => {
+  const dir = fixture(wf('      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3\n      - name: Sign\n        uses: "signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627"\n  manifest:\n    uses: ./.github/workflows/update-manifest.yml\n'));
+  const r = run("check-actions-pinned.mjs", dir);
+  rmSync(dir, { recursive: true, force: true });
+  ok(r.code === 0 && /2 third-party reference\(s\)/.test(r.out), r.out);
+});
+for (const [name, line] of [
+  ["a tag", "      - uses: Swatinem/rust-cache@v2\n"],
+  ["a branch", "      - uses: dtolnay/rust-toolchain@stable\n"],
+  ["a short commit", "      - uses: softprops/action-gh-release@8a0cd65\n"],
+  ["a container image", "      - uses: docker://alpine:3\n"],
+  ["a tag inside a named step", "      - name: Release\n        uses: softprops/action-gh-release@v3\n"],
+]) {
+  test(`check-actions-pinned: fails on ${name}`, () => {
+    const dir = fixture(wf(line));
+    const r = run("check-actions-pinned.mjs", dir);
+    rmSync(dir, { recursive: true, force: true });
+    ok(r.code === 1 && /not pinned to a commit/.test(r.out), `exit ${r.code}: ${r.out}`);
+  });
+}
+
 const copyTree = (extra = {}) => ({
   "src-frontend/a.tsx": 'export const A = () => <p title="Not available right now">Sensors</p>;\nexport const id = "agent-status";\nif (x === "agent offline") {}\n',
   "src-frontend/lib/t.ts": 'export const EVENT = "agentOffline";\nexport type T = "agent offline";\nexport const ok = "Try again";\n',
