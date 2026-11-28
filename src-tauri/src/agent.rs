@@ -1,9 +1,11 @@
 //! `nexum-agent` sidecar lifecycle: spawn, NDJSON stdout parsing, stdin commands,
-//! auto-restart with backoff, hang detection, the fan fail-safe watchdog (CONTRACT §2.4),
-//! degraded-mode status (§2.3), the sensor-tree bridge (§1.3) and graceful shutdown.
+//! bounded automatic restart (CONTRACT §2.3.1), hang detection, the fan fail-safe watchdog
+//! (§2.4), degraded-mode status (§2.3), the sensor-tree bridge (§1.3) and graceful shutdown.
+//!
+//! In anything a user can read this process is "sensor reading"; in logs and in the diagnostic
+//! `AgentStatus.message` it is the "sensor service" (CONTRACT §4.8.1).
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,8 +22,14 @@ use crate::state::AppState;
 use crate::util::{lock, now_ms};
 
 const SIDECAR_NAME: &str = "nexum-agent";
-const MAX_RESTARTS: usize = 5;
-const RESTART_WINDOW: Duration = Duration::from_secs(60);
+/// Automatic restart policy (CONTRACT §2.3.1; mirrored in `types.ts`): at most this many
+/// automatic restarts since the last healthy run, …
+pub const SENSOR_RESTART_MAX: usize = 5;
+/// … with this delay before restart 1..5, …
+pub const SENSOR_RESTART_DELAYS_MS: [u64; SENSOR_RESTART_MAX] =
+    [1_000, 2_000, 4_000, 8_000, 15_000];
+/// … and the count returns to 0 once a process has stayed up this long after its `hello`.
+pub const SENSOR_HEALTHY_RUN_MS: u64 = 60_000;
 // The sidecar restores BIOS fan control before closing hardware, but may first have to
 // wait (up to 2 s, `ShutdownLockWaitMs` in Program.cs) for an in-flight sensor tick to release
 // its lock, then up to 1.5 s per restore for the shared ISA-bus mutex. A hard kill before the
@@ -30,9 +38,14 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(6000);
 const MAX_LINE_BUFFER: usize = 8 * 1024 * 1024;
 /// `hello.protocol` of an agent that implements CONTRACT 1.1.0 (was 2 in 1.0.0-gate).
 pub const AGENT_PROTOCOL: u64 = 3;
-/// Error texts of request/reply commands (CONTRACT §2.13, §2.14).
-pub const ERR_NOT_RUNNING: &str = "Hardware agent is not running";
-pub const ERR_NO_ANSWER: &str = "Hardware agent did not answer";
+/// Error texts of request/reply commands (CONTRACT §2.13, §2.14; wording §4.8.1). They reach
+/// the UI, so they say what the user can do and never name the process.
+pub const ERR_NOT_RUNNING: &str = "Not available right now. Try again in a moment.";
+pub const ERR_NO_ANSWER: &str = "That took too long. Try again.";
+/// A command was refused without a reason of its own.
+const ERR_COMMAND_FAILED: &str = "Nexum could not do that. Try again.";
+/// `reset_sensor_stats` was refused without a reason of its own.
+const ERR_RESET_FAILED: &str = "The sensor statistics could not be reset. Try again.";
 /// Hang detection (CONTRACT §2.4 item 2): no stdout line for max(15 s, 3 × interval).
 const HANG_MIN_MS: u64 = 15_000;
 /// Before the first line, LHM `Open()` (driver load, storage enumeration) may take a while.
@@ -74,17 +87,109 @@ pub struct SensorDriverStatus {
     pub reason: Option<String>,
 }
 
+/// `AgentStatus.phase` (CONTRACT §2.3.1). The UI shows something only for `Failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Phase {
+    /// Spawned by app start or by `restart_agent`; no `hello` yet.
+    #[default]
+    Starting,
+    /// `hello` received.
+    Running,
+    /// It stopped or stopped answering; an automatic restart is pending or under way.
+    Restarting,
+    /// The restart policy gave up, or the start error cannot be fixed by retrying.
+    Failed,
+    /// Nexum stopped it on purpose (app exit, installing an update).
+    Stopped,
+}
+
+/// `AgentStatus.failReason`: why the phase is `failed` (CONTRACT §2.3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FailReason {
+    /// Windows security (an Application Control policy, antivirus) refused to start it.
+    Blocked,
+    /// The program file is not there.
+    Missing,
+    /// It kept exiting.
+    Crashed,
+    /// It kept hanging.
+    NotResponding,
+    /// It could not be started (any other start error).
+    StartFailed,
+}
+
+/// What made the sensor service need a restart (CONTRACT §2.3.1 rule 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// An abnormal exit.
+    Exit,
+    /// The hang watchdog killed it.
+    Hang,
+    /// The process could not be spawned.
+    SpawnError,
+}
+
+/// What the restart policy does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Restart { delay_ms: u64 },
+    Fail { reason: FailReason },
+}
+
+/// The restart policy (CONTRACT §2.3.1 rules 3 and 4). `n` = automatic restarts since the last
+/// healthy run. Restart `n + 1` waits `SENSOR_RESTART_DELAYS_MS[n]`; after
+/// `SENSOR_RESTART_MAX` of them the policy gives up with a reason that names the last trigger.
+pub fn next_step(n: usize, trigger: Trigger) -> Step {
+    match SENSOR_RESTART_DELAYS_MS.get(n) {
+        Some(&delay_ms) => Step::Restart { delay_ms },
+        None => Step::Fail {
+            reason: match trigger {
+                Trigger::Hang => FailReason::NotResponding,
+                Trigger::SpawnError => FailReason::StartFailed,
+                Trigger::Exit => FailReason::Crashed,
+            },
+        },
+    }
+}
+
+/// Start errors that retrying cannot fix (CONTRACT §2.3.1 rule 5), by Win32 error code:
+/// file or path not found → `Missing`; blocked by Windows security → `Blocked`. `None` for
+/// everything else (and for an error without an OS code): those are retried.
+pub fn classify_start_error(os_code: Option<i32>) -> Option<FailReason> {
+    match os_code? {
+        2 | 3 => Some(FailReason::Missing),
+        code if crate::util::blocked_by_windows_security(code) => Some(FailReason::Blocked),
+        _ => None,
+    }
+}
+
+/// The restart counter once a process has ended: back to 0 when that process had stayed up
+/// for `SENSOR_HEALTHY_RUN_MS` after its `hello` (`healthy_ms` = time since that `hello`,
+/// `None` when it never sent one), unchanged otherwise (CONTRACT §2.3.1 rule 2).
+pub fn counter_after_run(n: usize, healthy_ms: Option<u64>) -> usize {
+    match healthy_ms {
+        Some(ms) if ms >= SENSOR_HEALTHY_RUN_MS => 0,
+        _ => n,
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentStatus {
     pub running: bool,
     pub is_admin: bool,
+    /// Diagnostic text for logs only: no layer renders it (CONTRACT §2.3).
     pub message: String,
     pub last_packet_ts: Option<u64>,
     pub sensor_driver: Option<SensorDriverStatus>,
     pub limited_reasons: Vec<String>,
     pub missing_features: Vec<String>,
     pub protocol: Option<u64>,
+    pub phase: Phase,
+    /// Set only while `phase` is `Failed`.
+    pub fail_reason: Option<FailReason>,
 }
 
 impl AgentStatus {
@@ -156,6 +261,8 @@ pub fn parse_hello(v: &Value) -> Hello {
 /// Applies a hello to the status (CONTRACT §2.3).
 pub fn apply_hello(s: &mut AgentStatus, h: &Hello) {
     s.running = true;
+    s.phase = Phase::Running;
+    s.fail_reason = None;
     s.is_admin = h.is_admin;
     let (reasons, features) = limited_mode(
         h.is_admin,
@@ -167,15 +274,15 @@ pub fn apply_hello(s: &mut AgentStatus, h: &Hello) {
     s.protocol = h.protocol;
     s.message = if h.protocol != Some(AGENT_PROTOCOL) {
         format!(
-            "Hardware agent version mismatch (protocol {})",
+            "Sensor service version mismatch (protocol {})",
             h.protocol
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         )
     } else {
         match h.pid {
-            Some(pid) => format!("Hardware agent v{} online (pid {pid})", h.version),
-            None => format!("Hardware agent v{} online", h.version),
+            Some(pid) => format!("Sensor service v{} running (pid {pid})", h.version),
+            None => format!("Sensor service v{} running", h.version),
         }
     };
 }
@@ -214,7 +321,17 @@ pub struct AgentManager {
     expected_exit: AtomicBool,
     /// Set when the app is exiting: no more restarts.
     shutting_down: AtomicBool,
-    restart_times: Mutex<VecDeque<Instant>>,
+    /// One spawn / stop at a time (app start, `restart_agent`, automatic restarts, the updater).
+    start_lock: Mutex<()>,
+    /// Automatic restarts since the last healthy run (CONTRACT §2.3.1, counter `n`).
+    restart_count: AtomicUsize,
+    /// `clock`-relative time of the current process's `hello` (0 = none yet).
+    hello_ms: AtomicU64,
+    /// Generation of the process the hang watchdog killed (0 = none): its exit is a
+    /// "stopped answering" trigger, not a crash.
+    hang_killed_gen: AtomicU64,
+    /// `start` is replacing a running process: that expected exit is not the `stopped` phase.
+    replacing: AtomicBool,
     waiters: Mutex<Vec<AckWaiter>>,
     reply_waiters: Mutex<Vec<ReplyWaiter>>,
     next_waiter_id: AtomicU64,
@@ -248,14 +365,18 @@ impl Default for AgentManager {
             status: Mutex::new(AgentStatus {
                 running: false,
                 is_admin: false,
-                message: "Hardware agent not started".to_string(),
+                message: "Sensor service not started".to_string(),
                 ..Default::default()
             }),
             generation: AtomicU64::new(0),
             exited: AtomicBool::new(true),
             expected_exit: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
-            restart_times: Mutex::new(VecDeque::new()),
+            start_lock: Mutex::new(()),
+            restart_count: AtomicUsize::new(0),
+            hello_ms: AtomicU64::new(0),
+            hang_killed_gen: AtomicU64::new(0),
+            replacing: AtomicBool::new(false),
             waiters: Mutex::new(Vec::new()),
             reply_waiters: Mutex::new(Vec::new()),
             next_waiter_id: AtomicU64::new(1),
@@ -317,15 +438,21 @@ impl AgentManager {
         line.push(b'\n');
         let mut guard = lock(&self.child);
         match guard.as_mut() {
-            Some(child) if !self.exited.load(Ordering::SeqCst) => child
-                .write(&line)
-                .map_err(|e| format!("Could not talk to the hardware agent: {e}")),
-            _ => Err("Hardware agent is not running".to_string()),
+            Some(child) if !self.exited.load(Ordering::SeqCst) => {
+                child.write(&line).map_err(|e| {
+                    // The detail is for the log; the UI gets the plain text.
+                    eprintln!("[nexum] could not write to the sensor service: {e}");
+                    ERR_NOT_RUNNING.to_string()
+                })
+            }
+            _ => Err(ERR_NOT_RUNNING.to_string()),
         }
     }
 
-    /// Sends a command and blocks (up to `timeout`) for the matching `ack`.
-    /// Must be called from a blocking context (never on the async runtime / main thread).
+    /// Sends a command and blocks (up to `timeout`) for the matching `ack`. An `Err` is always
+    /// [`ERR_NOT_RUNNING`] (not running, or it stopped before answering) or [`ERR_NO_ANSWER`]
+    /// (timeout). Must be called from a blocking context (never on the async runtime / main
+    /// thread).
     pub fn request_ack(
         &self,
         value: &Value,
@@ -348,19 +475,17 @@ impl AgentManager {
         match result {
             Ok(ack) => Ok(ack),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                Err(format!("Timed out waiting for the hardware agent ({cmd})"))
+                eprintln!("[nexum] no answer from the sensor service ({cmd})");
+                Err(ERR_NO_ANSWER.to_string())
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err("Hardware agent exited before answering".to_string())
-            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ERR_NOT_RUNNING.to_string()),
         }
     }
 
     /// Sends `{cmd:"spec"}` and waits (up to `timeout`) for the `spec` line. Callers hold
     /// `spec_lock`, so only one request is in flight.
     pub fn request_spec(&self, timeout: Duration) -> Result<Value, String> {
-        const NOT_RUNNING: &str = "Hardware agent is not running";
-        const NO_ANSWER: &str = "Hardware agent did not answer";
+        use crate::spec::{ERR_SPEC_TIMEOUT as NO_ANSWER, ERR_SPEC_UNAVAILABLE as NOT_RUNNING};
         if !self.is_running() {
             return Err(NOT_RUNNING.to_string());
         }
@@ -376,8 +501,8 @@ impl AgentManager {
     }
 
     /// Sends a command and waits (up to `timeout`) for its ack with the contract's error texts:
-    /// agent down → `Hardware agent is not running`, timeout → `Hardware agent did not answer`,
-    /// `ok:false` → the agent's message (or `fallback` when it is empty).
+    /// not running → [`ERR_NOT_RUNNING`], timeout → [`ERR_NO_ANSWER`], `ok:false` → the
+    /// sidecar's message (or `fallback` when it is empty).
     pub fn request_ack_checked(
         &self,
         value: &Value,
@@ -392,8 +517,8 @@ impl AgentManager {
             Ok(ack) if ack.ok => Ok(ack),
             Ok(ack) if ack.message.is_empty() => Err(fallback.to_string()),
             Ok(ack) => Err(ack.message),
-            Err(e) if e.starts_with("Timed out") => Err(ERR_NO_ANSWER.to_string()),
-            Err(_) => Err(ERR_NOT_RUNNING.to_string()),
+            // Already one of the two contract texts.
+            Err(e) => Err(e),
         }
     }
 
@@ -457,7 +582,7 @@ impl AgentManager {
             lock(&self.reply_waiters).retain(|w| {
                 if w.ack_cmd.eq_ignore_ascii_case(&ack.cmd) {
                     let message = if ack.message.is_empty() {
-                        "The hardware agent could not run this command".to_string()
+                        ERR_COMMAND_FAILED.to_string()
                     } else {
                         ack.message.clone()
                     };
@@ -488,15 +613,32 @@ impl AgentManager {
     }
 }
 
-/// Mutates the status and emits `agent-status`.
+/// Mutates the status and emits `agent-status`, so every phase change is emitted
+/// (CONTRACT §2.3.1 rule 7). A phase change also refreshes the tray tooltip (§2.10.5).
 fn update_status(app: &AppHandle, f: impl FnOnce(&mut AgentStatus)) {
     let state = app.state::<AppState>();
-    let snapshot = {
+    let (snapshot, phase_changed) = {
         let mut st = lock(&state.agent.status);
+        let before = st.phase;
         f(&mut st);
-        st.clone()
+        // `failReason` exists only in the failed phase.
+        if st.phase != Phase::Failed {
+            st.fail_reason = None;
+        }
+        (st.clone(), st.phase != before)
     };
     let _ = app.emit("agent-status", snapshot);
+    if phase_changed {
+        crate::alerts::request_tooltip(app);
+    }
+}
+
+/// The status fields of a process that is not running (CONTRACT §2.3: down is not "limited").
+fn mark_down(s: &mut AgentStatus, phase: Phase, message: String) {
+    s.running = false;
+    s.clear_agent_fields();
+    s.phase = phase;
+    s.message = message;
 }
 
 /// Sends the effective poll interval (throttled while in the tray) to the sidecar.
@@ -505,7 +647,7 @@ pub fn apply_interval(app: &AppHandle) {
     let state = app.state::<AppState>();
     if state.agent.is_running() {
         if let Err(e) = state.agent.send(&json!({ "cmd": "interval", "ms": ms })) {
-            eprintln!("[nexum] could not set agent interval: {e}");
+            eprintln!("[nexum] could not set the poll interval: {e}");
         }
     }
 }
@@ -549,21 +691,39 @@ pub fn sync_sensor_stream(app: &AppHandle, force: bool) {
     }
 }
 
-/// Spawns (or respawns) the sidecar. Never panics: failures are reported via `agent-status`.
+/// Starts (or replaces) the sidecar on behalf of the app or the user: app start, `restart_agent`,
+/// the update flow giving the sensors back. Phase `starting`. Never panics: failures are
+/// reported via `agent-status`.
 pub fn start(app: &AppHandle) {
+    spawn_process(app, None);
+}
+
+/// Spawns the sidecar. `automatic` = `Some(gen)` for a restart the policy scheduled after the
+/// process generation `gen` ended: it is dropped when anything else started or stopped the
+/// sidecar in the meantime, and the phase stays `restarting` until the new `hello`.
+fn spawn_process(app: &AppHandle, automatic: Option<u64>) {
     let state = app.state::<AppState>();
     let mgr = &state.agent;
+    let _one_at_a_time = lock(&mgr.start_lock);
     if mgr.shutting_down.load(Ordering::SeqCst) {
         return;
+    }
+    if let Some(expected) = automatic {
+        if mgr.generation.load(Ordering::SeqCst) != expected || lock(&mgr.child).is_some() {
+            return;
+        }
     }
 
     // Stop a previous instance (if any) before spawning the new one.
     if lock(&mgr.child).is_some() {
+        mgr.replacing.store(true, Ordering::SeqCst);
         stop_current(app, SHUTDOWN_GRACE);
+        mgr.replacing.store(false, Ordering::SeqCst);
     }
 
     let gen = mgr.generation.fetch_add(1, Ordering::SeqCst) + 1;
     mgr.expected_exit.store(false, Ordering::SeqCst);
+    mgr.hello_ms.store(0, Ordering::SeqCst);
     // A new process: forget everything cached from the previous one.
     *lock(&mgr.sensor_tree) = None;
     *lock(&mgr.spec_cache) = None;
@@ -578,11 +738,18 @@ pub fn start(app: &AppHandle) {
             None => c,
         },
         Err(e) => {
-            update_status(app, |s| {
-                s.running = false;
-                s.clear_agent_fields();
-                s.message = format!("Hardware agent unavailable: {e}");
-            });
+            // The sidecar path cannot be resolved at all: retrying cannot fix that.
+            eprintln!("[nexum] the sensor service cannot be located: {e}");
+            mgr.exited.store(true, Ordering::SeqCst);
+            mgr.child_pid.store(0, Ordering::SeqCst);
+            apply_step(
+                app,
+                gen,
+                Step::Fail {
+                    reason: FailReason::Missing,
+                },
+                "it cannot be located",
+            );
             return;
         }
     };
@@ -594,23 +761,108 @@ pub fn start(app: &AppHandle) {
             mgr.touch();
             mgr.exited.store(false, Ordering::SeqCst);
             *lock(&mgr.child) = Some(child);
+            let phase = if automatic.is_some() {
+                Phase::Restarting
+            } else {
+                Phase::Starting
+            };
             update_status(app, |s| {
                 s.running = true;
                 s.clear_agent_fields();
-                s.message = "Hardware agent starting…".to_string();
+                s.phase = phase;
+                s.message = "Sensor service starting".to_string();
             });
             spawn_reader(app.clone(), rx, gen);
         }
         Err(e) => {
             mgr.exited.store(true, Ordering::SeqCst);
             mgr.child_pid.store(0, Ordering::SeqCst);
-            update_status(app, |s| {
-                s.running = false;
-                s.clear_agent_fields();
-                s.message = format!("Could not start hardware agent: {e}");
-            });
+            let os_code = match &e {
+                tauri_plugin_shell::Error::Io(io) => io.raw_os_error(),
+                _ => None,
+            };
+            eprintln!("[nexum] could not start the sensor service: {e}");
+            // CONTRACT §2.3.1 rule 5: "missing" and "blocked" go straight to failed and leave
+            // the counter alone; any other start error is retried like a crash.
+            let step = match classify_start_error(os_code) {
+                Some(reason) => Step::Fail { reason },
+                None => next_step(
+                    mgr.restart_count.load(Ordering::SeqCst),
+                    Trigger::SpawnError,
+                ),
+            };
+            apply_step(app, gen, step, "it could not be started");
         }
     }
+}
+
+/// Carries out a policy step for the process generation `gen` that just ended or failed to
+/// start: schedule the next automatic restart (counting it), or give up.
+fn apply_step(app: &AppHandle, gen: u64, step: Step, detail: &str) {
+    match step {
+        Step::Fail { reason } => {
+            update_status(app, |s| {
+                mark_down(
+                    s,
+                    Phase::Failed,
+                    format!("Sensor service gave up: {detail}"),
+                );
+                s.fail_reason = Some(reason);
+            });
+        }
+        Step::Restart { delay_ms } => {
+            app.state::<AppState>()
+                .agent
+                .restart_count
+                .fetch_add(1, Ordering::SeqCst);
+            update_status(app, |s| {
+                mark_down(
+                    s,
+                    Phase::Restarting,
+                    format!("Sensor service stopped ({detail}); restarting in {delay_ms} ms"),
+                );
+            });
+            schedule_restart(app, gen, Duration::from_millis(delay_ms));
+        }
+    }
+}
+
+/// Starts the sidecar again after `delay`, unless something else started or stopped it first
+/// (`gen` is the generation that ended).
+fn schedule_restart(app: &AppHandle, gen: u64, delay: Duration) {
+    let worker = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("nexum-sensor-restart".into())
+        .spawn(move || {
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+            spawn_process(&worker, Some(gen));
+        });
+    if let Err(e) = spawned {
+        eprintln!("[nexum] could not schedule the sensor service restart: {e}");
+        update_status(app, |s| {
+            mark_down(
+                s,
+                Phase::Failed,
+                "Sensor service restart could not be scheduled".to_string(),
+            );
+            s.fail_reason = Some(FailReason::StartFailed);
+        });
+    }
+}
+
+/// What every end of a sidecar process clears, whether it exited by itself or was stopped.
+fn cleanup_after_exit(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let mgr = &state.agent;
+    mgr.fail_all_waiters(ERR_NOT_RUNNING);
+    *lock(&mgr.sensor_tree) = None;
+    *lock(&mgr.stream_sent) = None;
+    *lock(&state.latest_values) = None;
+    crate::frames::clear(app);
+    crate::tuning::clear(app);
+    crate::alerts::on_agent_down(app);
 }
 
 fn spawn_reader(app: AppHandle, mut rx: tauri::async_runtime::Receiver<CommandEvent>, gen: u64) {
@@ -638,7 +890,7 @@ fn spawn_reader(app: AppHandle, mut rx: tauri::async_runtime::Receiver<CommandEv
                     }
                 }
                 CommandEvent::Error(err) => {
-                    eprintln!("[nexum] agent pipe error: {err}");
+                    eprintln!("[nexum] sensor service pipe error: {err}");
                 }
                 CommandEvent::Terminated(payload) => {
                     if is_current {
@@ -678,7 +930,7 @@ fn drain_lines(app: &AppHandle, buffer: &mut Vec<u8>) {
             let line = std::mem::take(buffer);
             handle_line(app, &line);
         } else if buffer.len() > MAX_LINE_BUFFER {
-            eprintln!("[nexum] discarding oversized agent output fragment");
+            eprintln!("[nexum] discarding an oversized sensor service output fragment");
             buffer.clear();
         }
     }
@@ -714,7 +966,7 @@ fn handle_line(app: &AppHandle, raw: &[u8]) {
         Ok(v) => v,
         Err(e) => {
             eprintln!(
-                "[nexum] unparseable agent line ({e}): {}",
+                "[nexum] unparseable sensor service line ({e}): {}",
                 String::from_utf8_lossy(&line[..line.len().min(200)])
             );
             return;
@@ -731,8 +983,8 @@ fn handle_line(app: &AppHandle, raw: &[u8]) {
                 st.last_packet_ts = Some(ts);
                 let became = if !st.running {
                     st.running = true;
-                    if st.message.is_empty() || st.message.starts_with("Hardware agent starting") {
-                        st.message = "Hardware agent online".to_string();
+                    if st.message.is_empty() || st.message.starts_with("Sensor service starting") {
+                        st.message = "Sensor service running".to_string();
                     }
                     true
                 } else {
@@ -782,10 +1034,15 @@ fn handle_line(app: &AppHandle, raw: &[u8]) {
             let hello = parse_hello(&value);
             if hello.protocol != Some(AGENT_PROTOCOL) {
                 eprintln!(
-                    "[nexum] warning: hardware agent speaks protocol {:?}, expected {AGENT_PROTOCOL}",
+                    "[nexum] warning: the sensor service speaks protocol {:?}, expected {AGENT_PROTOCOL}",
                     hello.protocol
                 );
             }
+            // The healthy-run clock of CONTRACT §2.3.1 rule 2 starts at the `hello`.
+            state
+                .agent
+                .hello_ms
+                .store(state.agent.elapsed_ms().max(1), Ordering::SeqCst);
             update_status(app, |s| apply_hello(s, &hello));
             failsafe::update(app, |t, now| {
                 t.on_hello(hello.fan_flag.as_deref(), hello.is_admin, now)
@@ -820,15 +1077,15 @@ fn handle_line(app: &AppHandle, raw: &[u8]) {
             let message = value
                 .get("message")
                 .and_then(Value::as_str)
-                .unwrap_or("Unknown agent error")
+                .unwrap_or("Unknown error")
                 .to_string();
             eprintln!("[nexum-agent] error: {message}");
             update_status(app, |s| {
-                s.message = format!("Agent: {message}");
+                s.message = format!("Sensor service reported: {message}");
             });
         }
         other => {
-            eprintln!("[nexum] ignoring agent message type '{other}'");
+            eprintln!("[nexum] ignoring sensor service message type '{other}'");
         }
     }
 }
@@ -836,98 +1093,67 @@ fn handle_line(app: &AppHandle, raw: &[u8]) {
 fn handle_exit(app: &AppHandle, gen: u64, code: Option<i32>) {
     let state = app.state::<AppState>();
     let mgr = &state.agent;
-    mgr.exited.store(true, Ordering::SeqCst);
+    // The pid first: `stop` reads it after it has seen `exited`.
     mgr.child_pid.store(0, Ordering::SeqCst);
+    mgr.exited.store(true, Ordering::SeqCst);
     // The process is gone; drop the handle (kill_on_drop on a dead process is harmless).
     let dead = lock(&mgr.child).take();
     drop(dead);
-    mgr.fail_all_waiters("Hardware agent exited");
-    *lock(&mgr.sensor_tree) = None;
-    *lock(&mgr.stream_sent) = None;
-    *lock(&state.latest_values) = None;
-    crate::frames::clear(app);
-    crate::tuning::clear(app);
-    crate::alerts::on_agent_down(app);
+    // How long this process had been healthy (time since its `hello`), if it ever said hello.
+    let healthy_ms = match mgr.hello_ms.swap(0, Ordering::SeqCst) {
+        0 => None,
+        at => Some(mgr.elapsed_ms().saturating_sub(at)),
+    };
+    cleanup_after_exit(app);
 
     let code_text = code
         .map(|c| c.to_string())
         .unwrap_or_else(|| "?".to_string());
 
     if mgr.shutting_down.load(Ordering::SeqCst) || mgr.expected_exit.load(Ordering::SeqCst) {
+        // Stopped on purpose. While `start` is replacing the process the phase is left alone
+        // (it is `starting`, and the UI's "Try again" waits for it to change).
+        let replacing = mgr.replacing.load(Ordering::SeqCst);
         update_status(app, |s| {
-            s.running = false;
-            s.clear_agent_fields();
-            s.message = "Hardware agent stopped".to_string();
+            let phase = if replacing { s.phase } else { Phase::Stopped };
+            mark_down(s, phase, "Sensor service stopped".to_string());
         });
         return;
     }
 
     // Abnormal exit (crash, kill, hang). With the fan write-ahead flag present, fans may be
-    // stuck at a manual duty: warn, and restart at once so the new agent latches them at 100%.
+    // stuck at a manual duty: warn, and restart at once so the new process latches them at 100%.
     let flag = failsafe::flag_exists();
     failsafe::update(app, |t, now| t.on_abnormal_exit(flag, now));
     let immediate = flag && !mgr.immediate_restart_used.swap(true, Ordering::SeqCst);
 
-    let attempt = {
-        let mut times = lock(&mgr.restart_times);
-        let now = Instant::now();
-        while times
-            .front()
-            .is_some_and(|t| now.duration_since(*t) > RESTART_WINDOW)
-        {
-            times.pop_front();
-        }
-        if times.len() >= MAX_RESTARTS && !immediate {
-            None
-        } else {
-            let n = times.len();
-            times.push_back(now);
-            Some(n)
-        }
+    let trigger = if mgr.hang_killed_gen.load(Ordering::SeqCst) == gen {
+        Trigger::Hang
+    } else {
+        Trigger::Exit
     };
+    // CONTRACT §2.3.1 rule 2: a process that stayed up long enough starts a fresh count.
+    let n = counter_after_run(mgr.restart_count.load(Ordering::SeqCst), healthy_ms);
+    mgr.restart_count.store(n, Ordering::SeqCst);
 
-    match attempt {
-        None => update_status(app, |s| {
-            s.running = false;
-            s.clear_agent_fields();
-            s.message = format!(
-                "Hardware agent crashed repeatedly (exit code {code_text}). Use Restart Agent to try again."
+    if immediate {
+        // MF-13 (CONTRACT §2.4 item 1): one restart without delay, not counted (§2.3.1 rule 6).
+        update_status(app, |s| {
+            mark_down(
+                s,
+                Phase::Restarting,
+                format!("Sensor service stopped (exit code {code_text}); restarting now"),
             );
-        }),
-        Some(n) => {
-            let delay = if immediate {
-                Duration::ZERO
-            } else {
-                Duration::from_millis((1000u64 << n.min(4)).min(15_000))
-            };
-            update_status(app, |s| {
-                s.running = false;
-                s.clear_agent_fields();
-                s.message = if immediate {
-                    format!("Hardware agent exited (code {code_text}); restarting now")
-                } else {
-                    format!(
-                        "Hardware agent exited (code {code_text}); restarting in {}s",
-                        delay.as_secs().max(1)
-                    )
-                };
-            });
-            let app = app.clone();
-            std::thread::spawn(move || {
-                if !delay.is_zero() {
-                    std::thread::sleep(delay);
-                }
-                let state = app.state::<AppState>();
-                let mgr = &state.agent;
-                if mgr.generation.load(Ordering::SeqCst) == gen
-                    && !mgr.shutting_down.load(Ordering::SeqCst)
-                    && lock(&mgr.child).is_none()
-                {
-                    start(&app);
-                }
-            });
-        }
+        });
+        schedule_restart(app, gen, Duration::ZERO);
+        return;
     }
+
+    let detail = match trigger {
+        Trigger::Hang => "it stopped answering".to_string(),
+        _ => format!("exit code {code_text}"),
+    };
+    apply_step(app, gen, next_step(n, trigger), &detail);
 }
 
 /// Hang threshold in ms: max(15 s, 3 × effective interval) once the agent has spoken,
@@ -940,8 +1166,9 @@ pub fn hang_limit_ms(got_line: bool, interval_ms: u64) -> u64 {
     }
 }
 
-/// Starts the hang watchdog (CONTRACT §2.4 item 2): an agent that stops writing lines is
-/// killed, which the reader then handles as an abnormal exit (restart + fail-safe check).
+/// Starts the hang watchdog (CONTRACT §2.4 item 2): a sidecar that stops writing lines is
+/// killed, which the reader then handles as an abnormal exit (restart policy + fail-safe
+/// check). The same tick resets the restart counter after a healthy run (§2.3.1 rule 2).
 pub fn start_watchdog(app: &AppHandle) {
     let app = app.clone();
     let spawned = std::thread::Builder::new()
@@ -956,7 +1183,7 @@ pub fn start_watchdog(app: &AppHandle) {
                     break;
                 }
                 // A tick that took far longer than it should means the whole system was
-                // suspended (sleep/hibernate): the agent was frozen too, not hung. Start over.
+                // suspended (sleep/hibernate): the sidecar was frozen too, not hung. Start over.
                 let gap = last_tick.elapsed();
                 last_tick = Instant::now();
                 if gap > WATCHDOG_TICK * 5 {
@@ -965,6 +1192,14 @@ pub fn start_watchdog(app: &AppHandle) {
                 }
                 if !mgr.is_running() || mgr.expected_exit.load(Ordering::SeqCst) {
                     continue;
+                }
+                // Up for long enough after its `hello`: the next failure starts a fresh count.
+                let hello_at = mgr.hello_ms.load(Ordering::SeqCst);
+                if hello_at != 0
+                    && mgr.elapsed_ms().saturating_sub(hello_at) >= SENSOR_HEALTHY_RUN_MS
+                    && mgr.restart_count.load(Ordering::SeqCst) != 0
+                {
+                    mgr.restart_count.store(0, Ordering::SeqCst);
                 }
                 let idle = mgr
                     .elapsed_ms()
@@ -976,20 +1211,23 @@ pub fn start_watchdog(app: &AppHandle) {
                 if idle <= limit {
                     continue;
                 }
-                eprintln!("[nexum] hardware agent sent nothing for {idle} ms; restarting it");
+                eprintln!("[nexum] the sensor service sent nothing for {idle} ms; restarting it");
+                // The exit that follows is a "stopped answering" trigger (§2.3.1 rule 4).
+                mgr.hang_killed_gen
+                    .store(mgr.generation.load(Ordering::SeqCst), Ordering::SeqCst);
                 // Taking the child stops further writes; the reader sees `Terminated` and runs
                 // the abnormal-exit path (expected_exit stays false).
                 let child = lock(&mgr.child).take();
                 if let Some(child) = child {
                     if let Err(e) = child.kill() {
-                        eprintln!("[nexum] could not kill the hung agent: {e}");
+                        eprintln!("[nexum] could not kill the hung sensor service: {e}");
                     }
                 }
                 mgr.touch();
             }
         });
     if let Err(e) = spawned {
-        eprintln!("[nexum] agent watchdog unavailable: {e}");
+        eprintln!("[nexum] sensor service watchdog unavailable: {e}");
     }
 }
 
@@ -1016,7 +1254,7 @@ fn stop_current(app: &AppHandle, grace: Duration) {
     if let Some(child) = child {
         if !mgr.exited.load(Ordering::SeqCst) {
             if let Err(e) = child.kill() {
-                eprintln!("[nexum] could not kill agent: {e}");
+                eprintln!("[nexum] could not kill the sensor service: {e}");
             }
         }
     }
@@ -1034,6 +1272,30 @@ pub fn shutdown(app: &AppHandle) {
     state.agent.generation.fetch_add(1, Ordering::SeqCst);
 }
 
+/// Stops the sidecar on purpose while Nexum keeps running (CONTRACT §2.15.5 step 5: before
+/// the update installer starts). Same graceful `shutdown` as on Quit (fans go back to BIOS
+/// control, frame capture stops), phase `stopped`, and any pending automatic restart is
+/// cancelled. [`start`] brings it back. Blocking (up to the shutdown grace).
+pub fn stop(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let mgr = &state.agent;
+    let _one_at_a_time = lock(&mgr.start_lock);
+    if mgr.shutting_down.load(Ordering::SeqCst) {
+        return;
+    }
+    stop_current(app, SHUTDOWN_GRACE);
+    // Late events of this process and a scheduled automatic restart are for an old generation.
+    mgr.generation.fetch_add(1, Ordering::SeqCst);
+    mgr.hello_ms.store(0, Ordering::SeqCst);
+    if mgr.child_pid.swap(0, Ordering::SeqCst) != 0 {
+        // It had to be killed, so the reader's exit path will be ignored: clean up here.
+        cleanup_after_exit(app);
+    }
+    update_status(app, |s| {
+        mark_down(s, Phase::Stopped, "Sensor service stopped".to_string());
+    });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------------------------
@@ -1043,16 +1305,28 @@ pub fn get_agent_status(app: AppHandle) -> Result<AgentStatus, String> {
     Ok(app.state::<AppState>().agent.status())
 }
 
+/// `restart_agent` (the banner's "Try again" and Settings › Sensors): the restart counter goes
+/// back to 0 and the phase to `starting` (CONTRACT §2.3.1 rule 8), then a normal start.
 #[tauri::command]
 pub async fn restart_agent(app: AppHandle) -> Result<(), String> {
     let worker = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = worker.state::<AppState>();
-        lock(&state.agent.restart_times).clear();
+        if state.agent.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        state.agent.restart_count.store(0, Ordering::SeqCst);
+        update_status(&worker, |s| {
+            s.phase = Phase::Starting;
+            s.message = "Sensor service restart requested".to_string();
+        });
         start(&worker);
     })
     .await
-    .map_err(|e| format!("Restart failed: {e}"))
+    .map_err(|e| {
+        eprintln!("[nexum] restart worker failed: {e}");
+        ERR_NOT_RUNNING.to_string()
+    })
 }
 
 #[tauri::command]
@@ -1182,7 +1456,7 @@ pub async fn reset_sensor_stats(app: AppHandle, ids: Option<Vec<String>>) -> Res
     if ack.ok {
         Ok(())
     } else if ack.message.is_empty() {
-        Err("The hardware agent could not reset the sensors".to_string())
+        Err(ERR_RESET_FAILED.to_string())
     } else {
         Err(ack.message)
     }
@@ -1251,8 +1525,12 @@ mod tests {
         assert!(s.running && s.is_admin);
         assert_eq!(s.limited_reasons, vec!["pawnIoMissing"]);
         assert_eq!(s.protocol, Some(3));
-        assert_eq!(s.message, "Hardware agent v1.1.0 online (pid 42)");
+        assert_eq!(s.message, "Sensor service v1.1.0 running (pid 42)");
+        assert_eq!(s.phase, Phase::Running);
+        assert_eq!(s.fail_reason, None);
         let j = serde_json::to_value(&s).unwrap();
+        assert_eq!(j["phase"], "running");
+        assert!(j["failReason"].is_null());
         assert_eq!(j["sensorDriver"]["minVersion"], "2.1.0");
         assert_eq!(j["limitedReasons"][0], "pawnIoMissing");
         assert_eq!(j["missingFeatures"].as_array().unwrap().len(), 4);
@@ -1264,10 +1542,10 @@ mod tests {
         assert_eq!(s.protocol, None);
         assert_eq!(s.sensor_driver, None);
         assert_eq!(s.limited_reasons, vec!["notElevated"]);
-        assert_eq!(s.message, "Hardware agent version mismatch (protocol unknown)");
+        assert_eq!(s.message, "Sensor service version mismatch (protocol unknown)");
         let h = parse_hello(&json!({ "type": "hello", "version": "1.0.0", "protocol": 2, "isAdmin": true, "sensorDriver": driver(None) }));
         apply_hello(&mut s, &h);
-        assert_eq!(s.message, "Hardware agent version mismatch (protocol 2)");
+        assert_eq!(s.message, "Sensor service version mismatch (protocol 2)");
         assert!(s.limited_reasons.is_empty());
 
         s.clear_agent_fields();
@@ -1276,6 +1554,182 @@ mod tests {
         assert_eq!(j["limitedReasons"], json!([]));
         assert_eq!(j["missingFeatures"], json!([]));
         assert!(j["protocol"].is_null());
+    }
+
+    #[test]
+    fn restart_backoff_schedule() {
+        // CONTRACT §2.3.1 rule 3: restarts 1..5 wait 1, 2, 4, 8 and 15 s, whatever the trigger.
+        assert_eq!(SENSOR_RESTART_DELAYS_MS, [1_000, 2_000, 4_000, 8_000, 15_000]);
+        assert_eq!(SENSOR_RESTART_DELAYS_MS.len(), SENSOR_RESTART_MAX);
+        for trigger in [Trigger::Exit, Trigger::Hang, Trigger::SpawnError] {
+            for (n, delay_ms) in SENSOR_RESTART_DELAYS_MS.iter().copied().enumerate() {
+                assert_eq!(next_step(n, trigger), Step::Restart { delay_ms });
+            }
+        }
+        // 30 s of delays in total before the policy gives up.
+        assert_eq!(SENSOR_RESTART_DELAYS_MS.iter().sum::<u64>(), 30_000);
+
+        // Rule 4: the sixth trigger gives up, and the reason names that trigger.
+        let fail = |t| match next_step(SENSOR_RESTART_MAX, t) {
+            Step::Fail { reason } => reason,
+            other => panic!("expected the policy to give up, got {other:?}"),
+        };
+        assert_eq!(fail(Trigger::Exit), FailReason::Crashed);
+        assert_eq!(fail(Trigger::Hang), FailReason::NotResponding);
+        assert_eq!(fail(Trigger::SpawnError), FailReason::StartFailed);
+        // A counter beyond the maximum never restarts either (the policy is bounded).
+        assert!(matches!(
+            next_step(SENSOR_RESTART_MAX + 7, Trigger::Exit),
+            Step::Fail { .. }
+        ));
+        assert!(matches!(next_step(usize::MAX, Trigger::Hang), Step::Fail { .. }));
+    }
+
+    #[test]
+    fn a_process_that_dies_at_once_ends_in_failed_after_five_restarts() {
+        // Simulates the loop the 1.1 rolling window could not end: every start crashes.
+        let mut n = 0usize;
+        let mut restarts = 0;
+        let reason = loop {
+            match next_step(n, Trigger::Exit) {
+                Step::Restart { .. } => {
+                    restarts += 1;
+                    n += 1;
+                    // The new process dies before a healthy run: the count is kept.
+                    n = counter_after_run(n, Some(9_000));
+                }
+                Step::Fail { reason } => break reason,
+            }
+            assert!(restarts <= SENSOR_RESTART_MAX, "the policy must be bounded");
+        };
+        assert_eq!(restarts, SENSOR_RESTART_MAX);
+        assert_eq!(reason, FailReason::Crashed);
+    }
+
+    #[test]
+    fn healthy_run_resets_the_restart_counter() {
+        assert_eq!(counter_after_run(4, None), 4, "it never said hello");
+        assert_eq!(counter_after_run(4, Some(0)), 4);
+        assert_eq!(counter_after_run(4, Some(SENSOR_HEALTHY_RUN_MS - 1)), 4);
+        assert_eq!(counter_after_run(4, Some(SENSOR_HEALTHY_RUN_MS)), 0);
+        assert_eq!(counter_after_run(5, Some(3_600_000)), 0);
+        assert_eq!(counter_after_run(0, Some(1)), 0);
+        // After the reset the schedule starts again at 1 s.
+        assert_eq!(
+            next_step(counter_after_run(5, Some(SENSOR_HEALTHY_RUN_MS)), Trigger::Exit),
+            Step::Restart { delay_ms: 1_000 }
+        );
+    }
+
+    #[test]
+    fn start_errors_that_retrying_cannot_fix() {
+        // File or path not found.
+        assert_eq!(classify_start_error(Some(2)), Some(FailReason::Missing));
+        assert_eq!(classify_start_error(Some(3)), Some(FailReason::Missing));
+        // Blocked by an Application Control policy (Smart App Control), by policy, by antivirus.
+        for code in [4551, 1260, 225, 226] {
+            assert_eq!(classify_start_error(Some(code)), Some(FailReason::Blocked));
+        }
+        // Everything else is retried like any other trigger.
+        assert_eq!(classify_start_error(Some(5)), None, "access denied");
+        assert_eq!(classify_start_error(Some(8)), None, "out of memory");
+        assert_eq!(classify_start_error(Some(740)), None, "elevation required");
+        assert_eq!(classify_start_error(Some(0)), None);
+        assert_eq!(classify_start_error(None), None, "no OS code");
+    }
+
+    #[test]
+    fn phase_and_fail_reason_wire_names() {
+        let phases = [
+            (Phase::Starting, "starting"),
+            (Phase::Running, "running"),
+            (Phase::Restarting, "restarting"),
+            (Phase::Failed, "failed"),
+            (Phase::Stopped, "stopped"),
+        ];
+        for (p, name) in phases {
+            assert_eq!(serde_json::to_value(p).unwrap(), json!(name));
+        }
+        let reasons = [
+            (FailReason::Blocked, "blocked"),
+            (FailReason::Missing, "missing"),
+            (FailReason::Crashed, "crashed"),
+            (FailReason::NotResponding, "notResponding"),
+            (FailReason::StartFailed, "startFailed"),
+        ];
+        for (r, name) in reasons {
+            assert_eq!(serde_json::to_value(r).unwrap(), json!(name));
+        }
+        // Before anything started: `starting`, not running, no reason.
+        let j = serde_json::to_value(AgentManager::default().status()).unwrap();
+        assert_eq!(j["phase"], "starting");
+        assert_eq!(j["running"], false);
+        assert!(j["failReason"].is_null());
+
+        let mut s = AgentStatus::default();
+        mark_down(&mut s, Phase::Failed, "x".into());
+        s.fail_reason = Some(FailReason::Blocked);
+        let j = serde_json::to_value(&s).unwrap();
+        assert_eq!(j["phase"], "failed");
+        assert_eq!(j["failReason"], "blocked");
+        assert_eq!(j["running"], false);
+        assert_eq!(j["limitedReasons"], json!([]));
+    }
+
+    #[test]
+    fn user_visible_texts_never_name_the_process() {
+        // CONTRACT §4.8.1: these reach toasts and inline errors.
+        let texts = [
+            ERR_NOT_RUNNING,
+            ERR_NO_ANSWER,
+            ERR_COMMAND_FAILED,
+            ERR_RESET_FAILED,
+            crate::spec::ERR_SPEC_UNAVAILABLE,
+            crate::spec::ERR_SPEC_TIMEOUT,
+            failsafe::MSG_AGENT_LOST,
+        ];
+        for t in texts {
+            let lower = t.to_lowercase();
+            assert!(
+                !lower.split(|c: char| !c.is_alphanumeric()).any(|w| w == "agent" || w == "agents"),
+                "{t}"
+            );
+        }
+        assert_eq!(ERR_NOT_RUNNING, "Not available right now. Try again in a moment.");
+        assert_eq!(ERR_NO_ANSWER, "That took too long. Try again.");
+        assert_eq!(ERR_COMMAND_FAILED, "Nexum could not do that. Try again.");
+        assert_eq!(
+            ERR_RESET_FAILED,
+            "The sensor statistics could not be reset. Try again."
+        );
+        // A caller that was waiting when the process ended gets the same plain text.
+        let mgr = AgentManager::default();
+        let (tx, rx) = mpsc::channel();
+        lock(&mgr.waiters).push(AckWaiter {
+            id: 1,
+            cmd: "fanPreset".into(),
+            tx,
+        });
+        mgr.fail_all_waiters(ERR_NOT_RUNNING);
+        let ack = rx.try_recv().unwrap();
+        assert!(!ack.ok);
+        assert_eq!(ack.message, ERR_NOT_RUNNING);
+        // Nothing is running in a fresh manager: every request path says so in plain words.
+        assert_eq!(mgr.send(&json!({ "cmd": "interval", "ms": 1000 })), Err(ERR_NOT_RUNNING.to_string()));
+        assert_eq!(
+            mgr.request_ack_checked(&json!({}), "x", Duration::from_millis(1), "fallback")
+                .unwrap_err(),
+            ERR_NOT_RUNNING
+        );
+        assert_eq!(
+            mgr.request_reply(&json!({}), "tuningState", "tuningGet", Duration::from_millis(1))
+                .unwrap_err(),
+            ERR_NOT_RUNNING
+        );
+        assert_eq!(
+            mgr.request_spec(Duration::from_millis(1)).unwrap_err(),
+            crate::spec::ERR_SPEC_UNAVAILABLE
+        );
     }
 
     #[test]

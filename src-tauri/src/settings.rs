@@ -73,6 +73,54 @@ pub struct Settings {
     /// `null` = every Recycle Bin item; else one of 1, 14, 30, 60 (CONTRACT §3.2).
     #[serde(deserialize_with = "de_recycle_age")]
     pub recycle_min_age_days: Option<u32>,
+    /// Update-check consent (CONTRACT §2.15.3): `"ask"` (not answered: no network request at
+    /// all), `"auto"` or `"manual"`.
+    #[serde(deserialize_with = "de_update_check")]
+    pub update_check: String,
+    /// Unix ms of the last answered update check. Written by Rust only (`updater.rs`);
+    /// `save_settings` keeps the stored value (CONTRACT §2.2).
+    #[serde(deserialize_with = "de_opt_ts")]
+    pub last_update_check_ts: Option<u64>,
+    /// `"default"` (the channel this build was made for), `"stable"` or `"preview"`.
+    #[serde(deserialize_with = "de_update_channel")]
+    pub update_channel: String,
+}
+
+pub const UPDATE_CHECK_ASK: &str = "ask";
+pub const UPDATE_CHECK_AUTO: &str = "auto";
+pub const UPDATE_CHECK_MANUAL: &str = "manual";
+pub const UPDATE_CHANNEL_DEFAULT: &str = "default";
+pub const UPDATE_CHANNEL_STABLE: &str = "stable";
+pub const UPDATE_CHANNEL_PREVIEW: &str = "preview";
+
+/// `updateCheck`: one of `ask`, `auto`, `manual`; anything else → `ask` (so an unreadable
+/// value can never switch the network on).
+pub fn sanitize_update_check(v: &str) -> &'static str {
+    match v {
+        UPDATE_CHECK_AUTO => UPDATE_CHECK_AUTO,
+        UPDATE_CHECK_MANUAL => UPDATE_CHECK_MANUAL,
+        _ => UPDATE_CHECK_ASK,
+    }
+}
+
+/// `updateChannel`: one of `default`, `stable`, `preview`; anything else → `default`.
+pub fn sanitize_update_channel(v: &str) -> &'static str {
+    match v {
+        UPDATE_CHANNEL_STABLE => UPDATE_CHANNEL_STABLE,
+        UPDATE_CHANNEL_PREVIEW => UPDATE_CHANNEL_PREVIEW,
+        _ => UPDATE_CHANNEL_DEFAULT,
+    }
+}
+
+/// What `save_settings` stores for the update members (CONTRACT §2.2, §2.15.4): the incoming
+/// `lastUpdateCheckTs` is ignored and the stored one kept, except that a change of the
+/// effective channel (`channel_changed`) clears it so the next check asks the new channel.
+pub fn keep_stored_update_check_ts(stored: Option<u64>, channel_changed: bool) -> Option<u64> {
+    if channel_changed {
+        None
+    } else {
+        stored
+    }
 }
 
 /// `Settings.alerts` (CONTRACT §2.2, §2.10). Each member is sanitized on its own.
@@ -217,6 +265,9 @@ impl Default for Settings {
             sensor_log_interval_ms: 1000,
             alerts: AlertSettings::default(),
             recycle_min_age_days: Some(RECYCLE_AGE_DEFAULT),
+            update_check: UPDATE_CHECK_ASK.to_string(),
+            last_update_check_ts: None,
+            update_channel: UPDATE_CHANNEL_DEFAULT.to_string(),
         }
     }
 }
@@ -284,6 +335,8 @@ impl Settings {
         self.sensor_log_interval_ms = sanitize_log_interval(self.sensor_log_interval_ms);
         self.alerts = self.alerts.clone().sanitized();
         self.recycle_min_age_days = sanitize_recycle_age(self.recycle_min_age_days);
+        self.update_check = sanitize_update_check(&self.update_check).to_string();
+        self.update_channel = sanitize_update_channel(&self.update_channel).to_string();
         self
     }
 }
@@ -449,6 +502,40 @@ fn de_alerts<'de, D: Deserializer<'de>>(d: D) -> Result<AlertSettings, D::Error>
 /// `recycleMinAgeDays`: `null` stays `null` (every item); malformed → 30.
 fn de_recycle_age<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
     Ok(recycle_age_from_value(&serde_json::Value::deserialize(d)?))
+}
+
+/// `updateCheck`; anything that is not a string becomes `"ask"` (checked in `sanitized`).
+fn de_update_check<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => s,
+        _ => UPDATE_CHECK_ASK.to_string(),
+    })
+}
+
+/// `updateChannel`; anything that is not a string becomes `"default"` (checked in `sanitized`).
+fn de_update_channel<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => s,
+        _ => UPDATE_CHANNEL_DEFAULT.to_string(),
+    })
+}
+
+/// A unix-ms timestamp from a JSON value: a finite, non-negative number → rounded; anything
+/// else (null, strings, NaN, negatives) → `None`.
+pub fn opt_ts_from_value(v: &serde_json::Value) -> Option<u64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_u64().or_else(|| {
+            n.as_f64()
+                .filter(|f| f.is_finite() && *f >= 0.0 && *f <= u64::MAX as f64)
+                .map(|f| f.round() as u64)
+        }),
+        _ => None,
+    }
+}
+
+/// `lastUpdateCheckTs`; not a finite number → `null`.
+fn de_opt_ts<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    Ok(opt_ts_from_value(&serde_json::Value::deserialize(d)?))
 }
 
 /// True when `p` exists and is a reparse point (junction, symbolic link, mount point).
@@ -815,7 +902,8 @@ fn is_under_dir(path: &str, dir: &str) -> bool {
         && !path.split('\\').any(|c| c == "..")
 }
 
-fn strip_verbatim(p: PathBuf) -> PathBuf {
+/// A verbatim path (the `\\?\` form that `canonicalize` returns) in its plain form.
+pub(crate) fn strip_verbatim(p: PathBuf) -> PathBuf {
     let s = p.to_string_lossy();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         PathBuf::from(format!(r"\\{rest}"))
@@ -855,8 +943,14 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> Result<Setting
         let app = worker;
         let state = app.state::<AppState>();
         let _writer = lock(&state.settings_write);
-        let new = settings.sanitized();
+        let mut new = settings.sanitized();
         let old = lock(&state.settings).clone();
+        // CONTRACT §2.2: `lastUpdateCheckTs` is written by Rust only. The UI's copy may be
+        // stale, so the stored value is kept (cleared when the update channel changes).
+        new.last_update_check_ts = keep_stored_update_check_ts(
+            old.last_update_check_ts,
+            crate::updater::channel_changed(&old, &new),
+        );
 
         if new.launch_on_startup != old.launch_on_startup {
             apply_autostart(new.launch_on_startup)?;
@@ -891,6 +985,8 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> Result<Setting
     if old.sensor_labels != saved.sensor_labels {
         crate::alerts::request_tooltip(&app);
     }
+    // CONTRACT §2.15.4: a new consent answer or channel re-arms the update schedule.
+    crate::updater::on_settings_changed(&app, &old, &saved);
     Ok(saved)
 }
 
@@ -1027,6 +1123,81 @@ mod tests {
         let s = s.sanitized();
         assert_eq!(s.recycle_min_age_days, Some(30));
         assert_eq!(s.alerts, AlertSettings::default());
+    }
+
+    #[test]
+    fn v12_update_members_default_and_sanitize() {
+        // CONTRACT §2.2 / §2.15.3: the default is "not answered", which keeps the network off.
+        let v = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(v["updateCheck"], "ask");
+        assert!(v["lastUpdateCheckTs"].is_null());
+        assert_eq!(v["updateChannel"], "default");
+
+        // A 1.1 file has none of the three members.
+        let s: Settings = serde_json::from_str(r#"{"pollIntervalMs":1000}"#).unwrap();
+        let s = s.sanitized();
+        assert_eq!(s.update_check, "ask");
+        assert_eq!(s.last_update_check_ts, None);
+        assert_eq!(s.update_channel, "default");
+
+        // Valid values survive a round trip.
+        let s: Settings = serde_json::from_value(serde_json::json!({
+            "updateCheck": "auto", "lastUpdateCheckTs": 1_800_000_000_000u64, "updateChannel": "preview"
+        }))
+        .unwrap();
+        let s = s.sanitized();
+        assert_eq!(s.update_check, "auto");
+        assert_eq!(s.last_update_check_ts, Some(1_800_000_000_000));
+        assert_eq!(s.update_channel, "preview");
+        let back: Settings =
+            serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(back.sanitized(), s);
+
+        // Unknown or wrongly typed values fall back to the safe side: never to "auto".
+        for bad in [
+            serde_json::json!("AUTO"),
+            serde_json::json!("always"),
+            serde_json::json!(""),
+            serde_json::json!(true),
+            serde_json::json!(1),
+            serde_json::Value::Null,
+        ] {
+            let s: Settings =
+                serde_json::from_value(serde_json::json!({ "updateCheck": bad })).unwrap();
+            assert_eq!(s.sanitized().update_check, "ask");
+        }
+        for bad in [
+            serde_json::json!("beta"),
+            serde_json::json!("Preview"),
+            serde_json::json!(7),
+            serde_json::Value::Null,
+        ] {
+            let s: Settings =
+                serde_json::from_value(serde_json::json!({ "updateChannel": bad })).unwrap();
+            assert_eq!(s.sanitized().update_channel, "default");
+        }
+        assert_eq!(sanitize_update_check("manual"), "manual");
+        assert_eq!(sanitize_update_channel("stable"), "stable");
+
+        // lastUpdateCheckTs: not a finite, non-negative number → null.
+        assert_eq!(opt_ts_from_value(&serde_json::json!(12.6)), Some(13));
+        assert_eq!(opt_ts_from_value(&serde_json::json!(0)), Some(0));
+        assert_eq!(opt_ts_from_value(&serde_json::json!(-5)), None);
+        assert_eq!(opt_ts_from_value(&serde_json::json!("1700000000000")), None);
+        assert_eq!(opt_ts_from_value(&serde_json::Value::Null), None);
+        assert_eq!(opt_ts_from_value(&serde_json::json!([1])), None);
+        let s: Settings =
+            serde_json::from_value(serde_json::json!({ "lastUpdateCheckTs": "soon" })).unwrap();
+        assert_eq!(s.last_update_check_ts, None);
+    }
+
+    #[test]
+    fn save_settings_keeps_the_stored_update_check_time() {
+        // The UI's copy of the timestamp never wins; a channel change clears it.
+        assert_eq!(keep_stored_update_check_ts(Some(5), false), Some(5));
+        assert_eq!(keep_stored_update_check_ts(None, false), None);
+        assert_eq!(keep_stored_update_check_ts(Some(5), true), None);
+        assert_eq!(keep_stored_update_check_ts(None, true), None);
     }
 
     #[test]

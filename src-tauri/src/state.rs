@@ -16,6 +16,7 @@ use crate::frames::FrameBridge;
 use crate::sensor_log::SensorLogger;
 use crate::settings::Settings;
 use crate::tuning::TuningBridge;
+use crate::updater::UpdaterManager;
 
 pub struct AppState {
     /// Current (sanitized) settings.
@@ -53,6 +54,8 @@ pub struct AppState {
     pub tray_sensors: Mutex<Vec<String>>,
     /// Latest `sensorValues` line and when it arrived (tray tooltip).
     pub latest_values: Mutex<Option<(Instant, Value)>>,
+    /// In-app updates: state, the pending offer and the scheduler's wake-up (CONTRACT §2.15).
+    pub updater: UpdaterManager,
 }
 
 impl Default for AppState {
@@ -75,6 +78,7 @@ impl Default for AppState {
             tuning: TuningBridge::default(),
             tray_sensors: Mutex::new(Vec::new()),
             latest_values: Mutex::new(None),
+            updater: UpdaterManager::default(),
         }
     }
 }

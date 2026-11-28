@@ -277,6 +277,32 @@ impl PinnedDir {
             FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0,
         )
     }
+
+    /// Opens an existing file for reading and pins its content (CONTRACT §2.15.5 step 4), with
+    /// the checks of [`Self::open_existing`]. The share mode is `FILE_SHARE_READ` only, so:
+    /// * the open fails (sharing violation) while any other handle has write or delete access;
+    /// * for as long as the returned handle lives, nobody can open the file for writing, delete
+    ///   it, rename it or replace it. Reading and executing it stay possible.
+    ///
+    /// What is read back through this handle is therefore exactly what will run.
+    pub fn open_read_exclusive(&self, name: &str) -> io::Result<File> {
+        self.open_existing(name, FILE_GENERIC_READ.0, FILE_SHARE_READ.0)
+    }
+
+    /// Removes every entry directly inside this folder without following links: a file or a
+    /// file link is removed by name, a sub-folder only when it is empty, a junction as the link
+    /// itself (never its target's content). Returns how many entries could not be removed.
+    pub fn remove_entries(&self) -> io::Result<usize> {
+        let mut left = 0usize;
+        for entry in std::fs::read_dir(&self.path)? {
+            let path = entry?.path();
+            // Neither call follows a reparse point, and `remove_dir` never recurses.
+            if std::fs::remove_file(&path).is_err() && std::fs::remove_dir(&path).is_err() {
+                left += 1;
+            }
+        }
+        Ok(left)
+    }
 }
 
 /// The user's profile folder (from the token; not redirectable through `User Shell Folders`).
@@ -435,6 +461,80 @@ mod tests {
         assert!(pinned.open_append("alias.txt").is_err());
         drop(pinned);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn exclusive_read_pins_the_file_until_the_handle_closes() {
+        use std::io::Read;
+        let base = scratch("pin");
+        let dir = base.join("Nexum").join("updates");
+        let pinned = PinnedDir::open(&base, &dir, true).unwrap();
+        let (mut f, path) = pinned.create_new_file("pinned.bin").unwrap();
+        f.write_all(b"verified bytes").unwrap();
+        f.sync_all().unwrap();
+
+        // While the writer is still open the exclusive open is refused: someone could write.
+        assert!(pinned.open_read_exclusive("pinned.bin").is_err());
+        drop(f);
+
+        let mut held = pinned.open_read_exclusive("pinned.bin").unwrap();
+        let mut back = Vec::new();
+        held.read_to_end(&mut back).unwrap();
+        assert_eq!(back, b"verified bytes");
+
+        // Nobody can write to, truncate, delete, rename or replace it while it is held …
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+        assert!(std::fs::OpenOptions::new().append(true).open(&path).is_err());
+        assert!(std::fs::write(&path, b"swapped").is_err());
+        assert!(std::fs::remove_file(&path).is_err());
+        assert!(std::fs::rename(&path, dir.join("moved.bin")).is_err());
+        std::fs::write(dir.join("other.bin"), b"other").unwrap();
+        assert!(std::fs::rename(dir.join("other.bin"), &path).is_err());
+        assert!(pinned.open_append("pinned.bin").is_err());
+        // … but it can still be read (and so executed) by others.
+        assert_eq!(std::fs::read(&path).unwrap(), b"verified bytes");
+        assert!(pinned.open_read_exclusive("pinned.bin").is_ok(), "read-only sharing");
+        // `remove_entries` cannot take the pinned file either; it removes the rest.
+        assert_eq!(pinned.remove_entries().unwrap(), 1);
+        assert!(path.exists());
+        assert!(!dir.join("other.bin").exists());
+
+        // The same link rules as every other open.
+        assert!(pinned.open_read_exclusive("missing.bin").is_err());
+        assert!(pinned.open_read_exclusive(r"..\setup.exe").is_err());
+
+        drop(held);
+        assert_eq!(pinned.remove_entries().unwrap(), 0);
+        assert!(!path.exists());
+        drop(pinned);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn remove_entries_never_follows_a_junction_or_recurses() {
+        let base = scratch("clear");
+        let outside = scratch("clear-target");
+        std::fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        let dir = base.join("Nexum").join("updates");
+        let pinned = PinnedDir::open(&base, &dir, true).unwrap();
+        std::fs::write(dir.join("a.bin"), b"a").unwrap();
+        std::fs::create_dir(dir.join("empty")).unwrap();
+        std::fs::create_dir(dir.join("full")).unwrap();
+        std::fs::write(dir.join("full").join("x"), b"x").unwrap();
+        assert!(junction(&dir.join("link"), &outside), "could not create junction");
+
+        // The non-empty sub-folder stays (no recursion); everything else goes.
+        assert_eq!(pinned.remove_entries().unwrap(), 1);
+        assert!(!dir.join("a.bin").exists());
+        assert!(!dir.join("empty").exists());
+        assert!(!dir.join("link").exists(), "the junction itself is removed");
+        assert!(dir.join("full").join("x").exists());
+        // The junction's target was not touched.
+        assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(), b"keep");
+
+        drop(pinned);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

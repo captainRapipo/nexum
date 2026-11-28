@@ -13,7 +13,7 @@ use crate::state::AppState;
 use crate::util::{lock, now_ms, program_data_dir};
 
 pub const MSG_INTERRUPTED: &str = "Fan control was interrupted. Fans are at 100% for safety. Restart the PC to return them to BIOS control.";
-pub const MSG_AGENT_LOST: &str = "Fan control was interrupted and the hardware agent is not running. Fans may be stuck at their last manual speed. Restart the PC to return them to BIOS control.";
+pub const MSG_AGENT_LOST: &str = "Fan control was interrupted and Nexum is no longer controlling the fans. Fans may be stuck at their last manual speed. Restart the PC to return them to BIOS control.";
 pub const MSG_PREVIOUS_BOOT: &str = "Nexum's fan control was interrupted before the last restart. If the fans behave unusually, shut down fully and power the PC on again.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

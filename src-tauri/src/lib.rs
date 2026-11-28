@@ -20,6 +20,7 @@ mod spec;
 mod state;
 mod system_info;
 mod tuning;
+mod updater;
 mod util;
 
 use std::sync::atomic::Ordering;
@@ -126,7 +127,8 @@ pub(crate) fn navigate(app: &AppHandle, target: &str) {
     let _ = app.emit("navigate", target.to_string());
 }
 
-fn quit(app: &AppHandle) {
+/// Quits Nexum (tray "Quit", and the updater once the installer runs).
+pub(crate) fn quit(app: &AppHandle) {
     let state = app.state::<AppState>();
     state.quitting.store(true, Ordering::SeqCst);
     // The sidecar is shut down gracefully in RunEvent::Exit.
@@ -228,6 +230,10 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         // Rust-side only (CONTRACT §0): no capability grants the WebView notification access.
         .plugin(tauri_plugin_notification::init())
+        // In-app updates (CONTRACT §2.15). Used only from `updater.rs`; no capability grants
+        // the WebView the plugin's own commands, and this is the only line outside that file
+        // that names the plugin.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             system_info::get_system_info,
@@ -271,6 +277,9 @@ pub fn run() {
             report::save_report,
             tuning::get_tuning_state,
             tuning::run_tuning_probe,
+            updater::get_update_state,
+            updater::check_for_update,
+            updater::install_update,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -302,6 +311,8 @@ pub fn run() {
             alerts::start(&handle);
             self_usage::start(&handle);
             settings::refresh_autostart_in_background(&handle);
+            // Makes no request unless the user chose automatic checks (CONTRACT §2.15.3).
+            updater::start(&handle);
             Ok(())
         })
         .on_window_event(|window, event| {

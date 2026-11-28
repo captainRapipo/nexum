@@ -14,6 +14,12 @@ use crate::util::{lock, now_ms};
 /// How long to wait for the agent's `spec` line.
 const SPEC_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// `SystemSpec.errors` entries for a missing sidecar answer (CONTRACT §2.6; wording §4.8.1).
+/// The System view shows them, so they never name the process.
+pub const ERR_SPEC_UNAVAILABLE: &str = "Hardware details are not available right now.";
+pub const ERR_SPEC_TIMEOUT: &str =
+    "Hardware details took too long to read. Press F5 to try again.";
+
 /// `SystemSpec`. The agent sections are passed through as JSON (their shape is owned by the
 /// sidecar and mirrored in `types.ts`); only their top-level kind is validated.
 #[derive(Debug, Clone, Serialize)]
@@ -186,7 +192,7 @@ mod tests {
     #[test]
     fn agent_down_or_silent() {
         let s = merge(
-            Err("Hardware agent is not running".into()),
+            Err(ERR_SPEC_UNAVAILABLE.into()),
             os(),
             security(),
             vec![],
@@ -196,14 +202,14 @@ mod tests {
         assert!(s.cpu.is_null() && s.board.is_null() && s.memory.is_null());
         assert_eq!(s.gpus, json!([]));
         assert_eq!(serde_json::to_value(&s).unwrap()["diskLinks"], json!([]));
-        assert_eq!(s.errors, vec!["Hardware agent is not running".to_string()]);
-        let s = merge(
-            Err("Hardware agent did not answer".into()),
-            os(),
-            security(),
-            vec![],
-            1,
+        assert_eq!(
+            s.errors,
+            vec!["Hardware details are not available right now.".to_string()]
         );
-        assert_eq!(s.errors, vec!["Hardware agent did not answer".to_string()]);
+        let s = merge(Err(ERR_SPEC_TIMEOUT.into()), os(), security(), vec![], 1);
+        assert_eq!(
+            s.errors,
+            vec!["Hardware details took too long to read. Press F5 to try again.".to_string()]
+        );
     }
 }

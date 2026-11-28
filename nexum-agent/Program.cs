@@ -742,7 +742,7 @@ internal static class Program
 
         lock (svc.SyncRoot)
         {
-            if (Volatile.Read(ref _shutdownStarted) == 1) return (false, "Agent is shutting down");
+            if (Volatile.Read(ref _shutdownStarted) == 1) return (false, "Nexum is shutting down");
             safety.Fans.Refresh(svc.AllHardware());
             return action(safety);
         }

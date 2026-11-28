@@ -1337,13 +1337,38 @@ pub fn fit_tooltip(lines: &[String], max_units: usize) -> String {
     out
 }
 
-/// `Nexum · No alerts` / `Nexum · 1 alert` / `Nexum · N alerts` / `Nexum · Agent offline`.
-pub fn tooltip_head(agent_up: bool, alerts: usize) -> String {
-    match (agent_up, alerts) {
-        (false, _) => "Nexum · Agent offline".into(),
-        (true, 0) => "Nexum · No alerts".into(),
-        (true, 1) => "Nexum · 1 alert".into(),
-        (true, n) => format!("Nexum · {n} alerts"),
+/// What the tray tooltip's first line says about sensor reading (CONTRACT §2.10.5, §4.8.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraySensors {
+    /// Telemetry is arriving: the line is the alert count.
+    Working,
+    /// Starting, restarting or stopped on purpose: nothing to say yet.
+    Pending,
+    /// The restart policy gave up (`AgentStatus.phase == "failed"`).
+    Unavailable,
+}
+
+/// [`TraySensors`] from the sensor service phase and whether telemetry has arrived since it
+/// last went down.
+pub fn tray_sensor_state(phase: crate::agent::Phase, telemetry_up: bool) -> TraySensors {
+    if phase == crate::agent::Phase::Failed {
+        TraySensors::Unavailable
+    } else if telemetry_up {
+        TraySensors::Working
+    } else {
+        TraySensors::Pending
+    }
+}
+
+/// `Nexum · No alerts` / `Nexum · 1 alert` / `Nexum · N alerts`; `Nexum · Sensors unavailable`
+/// when sensor reading failed for good, and plain `Nexum` while it is starting or restarting.
+pub fn tooltip_head(sensors: TraySensors, alerts: usize) -> String {
+    match (sensors, alerts) {
+        (TraySensors::Unavailable, _) => "Nexum · Sensors unavailable".into(),
+        (TraySensors::Pending, _) => "Nexum".into(),
+        (TraySensors::Working, 0) => "Nexum · No alerts".into(),
+        (TraySensors::Working, 1) => "Nexum · 1 alert".into(),
+        (TraySensors::Working, n) => format!("Nexum · {n} alerts"),
     }
 }
 
@@ -1443,7 +1468,8 @@ fn build_tooltip(app: &AppHandle) -> String {
             e.last_packet.clone(),
         )
     };
-    let mut lines = vec![tooltip_head(agent_up, count)];
+    let phase = state.agent.status().phase;
+    let mut lines = vec![tooltip_head(tray_sensor_state(phase, agent_up), count)];
     let (labels, unit) = {
         let s = lock(&state.settings);
         (s.sensor_labels.clone(), s.temp_unit.clone())
@@ -2119,10 +2145,27 @@ mod tests {
 
     #[test]
     fn tooltip_fits_at_line_boundaries() {
-        assert_eq!(tooltip_head(false, 3), "Nexum · Agent offline");
-        assert_eq!(tooltip_head(true, 0), "Nexum · No alerts");
-        assert_eq!(tooltip_head(true, 1), "Nexum · 1 alert");
-        assert_eq!(tooltip_head(true, 2), "Nexum · 2 alerts");
+        use crate::agent::Phase;
+        // CONTRACT §2.10.5: failed for good → one plain line; starting / restarting → just the
+        // name; no tray string says "agent".
+        assert_eq!(
+            tooltip_head(TraySensors::Unavailable, 3),
+            "Nexum · Sensors unavailable"
+        );
+        assert_eq!(tooltip_head(TraySensors::Pending, 3), "Nexum");
+        assert_eq!(tooltip_head(TraySensors::Working, 0), "Nexum · No alerts");
+        assert_eq!(tooltip_head(TraySensors::Working, 1), "Nexum · 1 alert");
+        assert_eq!(tooltip_head(TraySensors::Working, 2), "Nexum · 2 alerts");
+        assert_eq!(tray_sensor_state(Phase::Failed, false), TraySensors::Unavailable);
+        assert_eq!(tray_sensor_state(Phase::Failed, true), TraySensors::Unavailable);
+        assert_eq!(tray_sensor_state(Phase::Starting, false), TraySensors::Pending);
+        assert_eq!(tray_sensor_state(Phase::Restarting, false), TraySensors::Pending);
+        assert_eq!(tray_sensor_state(Phase::Stopped, false), TraySensors::Pending);
+        assert_eq!(tray_sensor_state(Phase::Running, false), TraySensors::Pending);
+        assert_eq!(tray_sensor_state(Phase::Running, true), TraySensors::Working);
+        for s in [TraySensors::Unavailable, TraySensors::Pending, TraySensors::Working] {
+            assert!(!tooltip_head(s, 2).to_lowercase().contains("agent"));
+        }
         let lines: Vec<String> = vec![
             "Nexum · No alerts".into(),
             "a".repeat(50),

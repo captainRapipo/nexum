@@ -1,6 +1,6 @@
 [package]
 name = "nexum"
-version = "1.1.0"
+version = "1.2.0"
 description = "Nexum - PC telemetry, driver inventory and safe cleanup for Windows 10/11"
 authors = ["Nexum"]
 edition = "2021"
@@ -31,6 +31,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 wmi = "0.14"
 dirs = "5"
 tauri-plugin-notification = "2"
+# In-app updates (CONTRACT 2.15). Used from Rust only (src/updater.rs): no JS package and no
+# capability, so the WebView cannot reach the plugin. Its `zip` feature (Tauri v1 archives)
+# is left out because Nexum never calls the plugin's own installer.
+tauri-plugin-updater = { version = "2.14.1", default-features = false, features = ["rustls-tls", "system-proxy"] }
+# Named directly because src/updater.rs uses their API; both are already in the tree.
+semver = "1"
+base64 = "0.23"
 
 [dependencies.windows]
 version = "0.58"

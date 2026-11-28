@@ -230,6 +230,15 @@ pub fn win32_code(hresult: i32) -> Option<u32> {
     }
 }
 
+/// True for the Win32 errors `CreateProcess` returns when Windows security refuses to run a
+/// file (CONTRACT §2.3.1 rule 5, §2.15.5 step 6): 4551 `ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION`
+/// (an Application Control policy, which is what Smart App Control uses), 1260
+/// `ERROR_ACCESS_DISABLED_BY_POLICY`, 225 `ERROR_VIRUS_INFECTED` and 226 `ERROR_VIRUS_DELETED`
+/// (antivirus). Retrying cannot fix any of them.
+pub fn blocked_by_windows_security(os_code: i32) -> bool {
+    matches!(os_code, 4551 | 1260 | 225 | 226)
+}
+
 /// Closes a kernel handle on drop.
 pub struct OwnedHandle(pub windows::Win32::Foundation::HANDLE);
 
