@@ -2,8 +2,9 @@ import { Button, Card, ScrollFade, StatusIcon } from "../ui";
 import { useHealth } from "../../hooks/useHealth";
 import { useHealthAlerts } from "../../hooks/useHealthAlerts";
 import { useSettings } from "../../hooks/useSettings";
-import { alertState, limitedBannerShown } from "../../lib/status";
+import { alertState, healthRows, limitedBannerShown, type HealthRow } from "../../lib/status";
 import { useTelemetry } from "../../hooks/useTelemetryStream";
+import { useTightMode } from "../../hooks/useTightMode";
 import type { CpuLimitInfo, HealthCondition } from "../../types";
 import { runHealthAction } from "./healthActions";
 import { tempText } from "./sensorHelpers";
@@ -57,12 +58,14 @@ export default function HealthAlertsCard() {
   const { agent } = useTelemetry();
   const limitedBar = limitedBannerShown(agent, settings?.sensorDriverChoice);
 
+  // Drives whose health is unknown for one shared reason are one row (see healthRows).
+  const rows = healthRows(conditions);
   const needAttention = conditions.filter((c) => c.severity === "warn" || c.severity === "crit").length;
   const meta =
     needAttention > 0
       ? `${needAttention} ${needAttention === 1 ? "item needs" : "items need"} attention`
-      : conditions.length > 0
-        ? `${conditions.length} ${conditions.length === 1 ? "item" : "items"}`
+      : rows.length > 0
+        ? `${rows.length} ${rows.length === 1 ? "item" : "items"}`
         : undefined;
 
   return (
@@ -100,8 +103,12 @@ export default function HealthAlertsCard() {
         <ScrollFade className="min-h-0 flex-1 pr-1">
           {/* pb: the last row's button draws its outline as a shadow, which the scroll box would clip. */}
           <ul className="flex flex-col pb-0.5">
-            {conditions.map((c) => (
-              <AlertRow key={c.id} condition={c} compact={hasBanner(c, dismissed) || (limitedBar && c.id === "limited-mode")} />
+            {rows.map((r) => (
+              <AlertRow
+                key={r.key}
+                row={r}
+                compact={r.members.length === 1 && (hasBanner(r.members[0], dismissed) || (limitedBar && r.key === "limited-mode"))}
+              />
             ))}
           </ul>
         </ScrollFade>
@@ -110,22 +117,44 @@ export default function HealthAlertsCard() {
   );
 }
 
-function AlertRow({ condition: c, compact }: { condition: HealthCondition; compact: boolean }) {
-  const tone = alertState(c.severity);
+/**
+ * A title on one line that never loses its last part. Drive titles read `<name> — <state>`; when the
+ * line is too short the name gives way (`C: (addlink M.2 PCIE… — Worn`), so the state word, which is
+ * the point of the row, stays readable. Titles without a dash truncate at the end as usual.
+ */
+function OneLineTitle({ text }: { text: string }) {
+  const i = text.indexOf(" — ");
+  // A short name before a long state ("3 drives — Health unknown — run as administrator") reads best cut at the end.
+  if (i < 0 || text.length - i > i) return <h4 className="truncate text-headline text-ink">{text}</h4>;
+  return (
+    <h4 className="flex min-w-0 whitespace-nowrap text-headline text-ink">
+      {/* The name gives way first (shrink 1000 : 1); the state part is cut only when it alone is too long. */}
+      <span className="min-w-[3ch] shrink-[1000] truncate">{text.slice(0, i)}</span>
+      <span className="min-w-0 shrink truncate">{text.slice(i).replace(/^ /, "\u00a0")}</span>
+    </h4>
+  );
+}
+
+function AlertRow({ row: r, compact: compactProp }: { row: HealthRow; compact: boolean }) {
+  const tone = alertState(r.severity);
+  const tight = useTightMode();
+  // Tight mode: a note with nothing to click (drive health unknown) is one line, so two notes fit the card.
+  const compact = compactProp || (tight && r.severity === "info" && !r.action);
+  const hover = r.members.length > 1 ? [...r.members.map((m) => m.title), r.detail, `Rule: ${r.rule}`] : [r.title, r.detail, `Rule: ${r.rule}`];
   return (
     <li
       className="grid grid-cols-[20px_minmax(0,1fr)] gap-x-2.5 border-t border-divider py-2.5 first:border-t-0 first:pt-0 last:pb-0"
-      title={[c.title, c.detail, `Rule: ${c.rule}`].filter(Boolean).join("\n")}
+      title={hover.filter(Boolean).join("\n")}
     >
       <StatusIcon tone={tone} size={18} className="mt-px" />
       <div className="min-w-0">
         {/* Tight mode keeps a row to three lines (title, detail, button); the hover text has all of it. */}
-        <h4 className={compact ? "truncate text-headline text-ink" : "text-headline text-ink tight:truncate"}>{c.title}</h4>
-        {!compact && c.detail && <p className="mt-0.5 line-clamp-3 text-callout text-ink-2 tight:line-clamp-1">{c.detail}</p>}
-        {!compact && c.action && (
+        {compact || tight ? <OneLineTitle text={r.title} /> : <h4 className="text-headline text-ink">{r.title}</h4>}
+        {!compact && r.detail && <p className="mt-0.5 line-clamp-3 text-callout text-ink-2 tight:line-clamp-1">{r.detail}</p>}
+        {!compact && r.action && (
           <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
-            <Button size="sm" variant="secondary" onClick={() => runHealthAction(c.action!)}>
-              {c.action.label}
+            <Button size="sm" variant="secondary" onClick={() => runHealthAction(r.action!)}>
+              {r.action.label}
             </Button>
           </div>
         )}

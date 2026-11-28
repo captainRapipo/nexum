@@ -239,7 +239,7 @@
   .kbd-sm { height: 16px; padding: 0 4px; font-size: 10px; }
 
   .scroll-fade { overflow-y: auto; scrollbar-width: thin; scrollbar-color: rgba(0, 0, 0, 0.25) transparent; }
-  .scroll-fade[data-fade="true"] { -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 24px), transparent); mask-image: linear-gradient(to bottom, #000 calc(100% - 24px), transparent); }
+  .scroll-fade[data-fade="true"] { -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), transparent); mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), transparent); }
 
   /* Shared pieces of the new system (docs/design/SPEC.md) */
   .zebra > :nth-child(even) { background: var(--color-row-alt); }

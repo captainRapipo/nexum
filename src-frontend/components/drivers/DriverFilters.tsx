@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { ChevronDown, Download, HardDriveDownload } from "lucide-react";
 import { Button, Segmented, Toggle, type SegmentedOption } from "../ui";
 import { cn } from "../../lib/format";
@@ -60,57 +60,157 @@ export default function DriverFilters({
     return out;
   }, [counts, scope]);
 
-  // Many categories do not fit a narrow window: the control then scrolls sideways (the arrow keys
-  // reach every segment) and its cut edge fades, so it never looks like the list simply ends.
-  const scroller = useRef<HTMLDivElement>(null);
-  const [fade, setFade] = useState<{ left: boolean; right: boolean }>({ left: false, right: false });
+  // Many categories do not fit a narrow window (or the bar next to the open detail panel). The
+  // segments that fit stay in the control; the rest move into a "More" menu, so every category is one
+  // click away and nothing is cut mid-word. The chosen scope always stays in the control.
+  const lead = useRef<HTMLDivElement>(null);
+  const ruler = useRef<HTMLDivElement>(null);
+  const toggleRef = useRef<HTMLSpanElement>(null);
+  const [fit, setFit] = useState<number>(options.length);
+  const selectedIndex = options.findIndex((o) => o.value === scope);
+
   useLayoutEffect(() => {
-    const el = scroller.current;
-    if (!el) return;
+    const box = lead.current;
+    const rule = ruler.current;
+    if (!box || !rule) return;
     const measure = () => {
-      const left = el.scrollLeft > 1;
-      const right = el.scrollWidth - el.clientWidth - el.scrollLeft > 1;
-      setFade((prev) => (prev.left === left && prev.right === right ? prev : { left, right }));
+      const widths = Array.from(rule.querySelectorAll<HTMLElement>('[role="radio"]'), (b) => b.offsetWidth);
+      const n = widths.length;
+      const avail = box.clientWidth - (toggleRef.current?.offsetWidth ?? 0) - BAR_GAP;
+      // Track padding 2 + 2, segments 2 px apart.
+      const need = (idx: number[]) => 4 + idx.reduce((sum, i) => sum + widths[i], 0) + 2 * Math.max(0, idx.length - 1);
+      const all = widths.map((_, i) => i);
+      let next = n;
+      if (need(all) > avail) {
+        next = 1;
+        for (let k = n - 1; k >= 1; k--) {
+          if (need(visibleIndexes(n, k, selectedIndex)) + MORE_GAP + MORE_WIDTH <= avail) {
+            next = k;
+            break;
+          }
+        }
+      }
+      setFit((prev) => (prev === next ? prev : next));
     };
     measure();
     const ro = new ResizeObserver(measure);
-    ro.observe(el);
-    if (el.firstElementChild) ro.observe(el.firstElementChild);
-    el.addEventListener("scroll", measure, { passive: true });
-    return () => {
-      ro.disconnect();
-      el.removeEventListener("scroll", measure);
-    };
-  }, [options.length]);
+    ro.observe(box);
+    ro.observe(rule);
+    return () => ro.disconnect();
+  }, [options, selectedIndex]);
 
-  // Keep the chosen segment in view (keyboard navigation, or a category picked while scrolled).
-  useEffect(() => {
-    scroller.current?.querySelector('[aria-checked="true"]')?.scrollIntoView({ block: "nearest", inline: "nearest" });
-  }, [scope]);
+  const shown = visibleIndexes(options.length, Math.min(fit, options.length), selectedIndex);
+  const visible = shown.map((i) => options[i]);
+  const overflow = options.filter((_, i) => !shown.includes(i));
 
   return (
     <div className="flex h-11 shrink-0 items-center gap-3.5 whitespace-nowrap border-b border-hairline bg-content px-(--page-pad-x)">
-      <div
-        ref={scroller}
-        className={cn(
-          "-my-1 min-w-0 shrink overflow-x-auto py-1 [scrollbar-width:none]",
-          fade.right && !fade.left && "[mask-image:linear-gradient(to_right,black_calc(100%-28px),transparent)]",
-          fade.left && !fade.right && "[mask-image:linear-gradient(to_left,black_calc(100%-28px),transparent)]",
-          fade.left && fade.right && "[mask-image:linear-gradient(to_right,transparent,black_28px,black_calc(100%-28px),transparent)]",
-        )}
-      >
-        <Segmented value={scope} options={options} onChange={onScope} size="sm" ariaLabel="Drivers shown" />
+      <div ref={lead} className="relative flex min-w-0 flex-1 items-center gap-3.5">
+        {/* Invisible copy with every segment: the ruler the fit is measured against. */}
+        <div ref={ruler} aria-hidden="true" className="pointer-events-none invisible absolute left-0 top-0 h-0 overflow-hidden">
+          <Segmented value={scope} options={options} onChange={noop} size="sm" />
+        </div>
+        <span className="flex shrink-0 items-center gap-1.5">
+          <Segmented value={scope} options={visible} onChange={onScope} size="sm" ariaLabel="Drivers shown" />
+          {overflow.length > 0 && <MoreMenu options={overflow} onPick={onScope} />}
+        </span>
+        <span ref={toggleRef} className="shrink-0" title="Hides drivers that ship with Windows.">
+          <Toggle checked={thirdPartyOnly} onChange={onThirdPartyOnly} label="Third-party only" />
+        </span>
       </div>
-      <span className="shrink-0" title="Hides drivers that ship with Windows.">
-        <Toggle checked={thirdPartyOnly} onChange={onThirdPartyOnly} label="Third-party only" />
-      </span>
-
-      <span className="min-w-0 flex-1" />
 
       <ExportMenu exporting={exporting} onExport={onExport} disabled={!canExport} />
       <Button size="sm" icon={HardDriveDownload} onClick={onBackup} loading={backingUp} title={backupTitle}>
         {backingUp ? "Backing up…" : "Back up drivers"}
       </Button>
+    </div>
+  );
+}
+
+const noop = () => undefined;
+/** Gap between the control and the switch (gap-3.5), between the control and "More", and the width kept for "More". */
+const BAR_GAP = 14;
+const MORE_GAP = 6;
+const MORE_WIDTH = 68;
+
+/** The first `count` segments, with the last slot given to the chosen one when it would otherwise be hidden. */
+function visibleIndexes(total: number, count: number, selected: number): number[] {
+  const n = Math.max(1, Math.min(count, total));
+  const idx = Array.from({ length: n }, (_, i) => i);
+  if (selected >= n && n >= 1) idx[n - 1] = selected;
+  return idx;
+}
+
+const MENU_ITEM =
+  "focus-inset flex h-7 w-full items-center rounded-sm px-2.5 text-left text-body text-ink hover:bg-hover active:bg-pressed";
+
+/** Closes a menu on an outside press or on Esc. */
+function useMenuDismiss(open: boolean, wrap: RefObject<HTMLElement | null>, close: () => void) {
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (wrap.current && !wrap.current.contains(e.target as Node)) close();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        close();
+      }
+    };
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey, true);
+    };
+  }, [open, wrap, close]);
+}
+
+/** "More": the categories that do not fit the bar, each with its count. */
+function MoreMenu({ options, onPick }: { options: SegmentedOption<DriverScope>[]; onPick: (s: DriverScope) => void }) {
+  const [open, setOpen] = useState(false);
+  const wrap = useRef<HTMLDivElement>(null);
+  const first = useRef<HTMLButtonElement>(null);
+  const close = useCallback(() => setOpen(false), []);
+  useMenuDismiss(open, wrap, close);
+  useEffect(() => {
+    if (open) first.current?.focus();
+  }, [open]);
+
+  return (
+    <div ref={wrap} className="relative shrink-0">
+      <Button
+        size="sm"
+        variant="plain"
+        iconRight={ChevronDown}
+        onClick={() => setOpen((v) => !v)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title={`${options.length} more ${options.length === 1 ? "category" : "categories"}`}
+      >
+        More
+      </Button>
+      {open && (
+        <div role="menu" aria-label="More categories" className="absolute left-0 top-full z-30 mt-1.5 min-w-44 animate-fade-in rounded-lg bg-card p-1 shadow-popover">
+          {options.map((o, i) => (
+            <button
+              key={String(o.value)}
+              ref={i === 0 ? first : undefined}
+              type="button"
+              role="menuitem"
+              title={o.title}
+              className={cn(MENU_ITEM, "tnum justify-between gap-6")}
+              onClick={() => {
+                setOpen(false);
+                onPick(o.value);
+              }}
+            >
+              <span>{o.label}</span>
+              {o.count != null && <span className="text-ink-3">{o.count}</span>}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -129,33 +229,16 @@ function ExportMenu({
   const wrap = useRef<HTMLDivElement>(null);
   const first = useRef<HTMLButtonElement>(null);
 
+  const close = useCallback(() => setOpen(false), []);
+  useMenuDismiss(open, wrap, close);
   useEffect(() => {
-    if (!open) return;
-    first.current?.focus();
-    const onDown = (e: MouseEvent) => {
-      if (wrap.current && !wrap.current.contains(e.target as Node)) setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        setOpen(false);
-      }
-    };
-    window.addEventListener("mousedown", onDown);
-    window.addEventListener("keydown", onKey, true);
-    return () => {
-      window.removeEventListener("mousedown", onDown);
-      window.removeEventListener("keydown", onKey, true);
-    };
+    if (open) first.current?.focus();
   }, [open]);
 
   const pick = (format: "json" | "csv") => {
     setOpen(false);
     onExport(format);
   };
-  const item =
-    "focus-inset flex h-7 w-full items-center rounded-sm px-2.5 text-left text-body text-ink hover:bg-hover active:bg-pressed";
-
   return (
     <div ref={wrap} className="relative shrink-0">
       <Button
@@ -173,10 +256,10 @@ function ExportMenu({
       </Button>
       {open && (
         <div role="menu" aria-label="Export list" className="absolute right-0 top-full z-30 mt-1.5 w-44 animate-fade-in rounded-lg bg-card p-1 shadow-popover">
-          <button ref={first} type="button" role="menuitem" className={item} onClick={() => pick("csv")}>
+          <button ref={first} type="button" role="menuitem" className={MENU_ITEM} onClick={() => pick("csv")}>
             Spreadsheet (.csv)
           </button>
-          <button type="button" role="menuitem" className={item} onClick={() => pick("json")}>
+          <button type="button" role="menuitem" className={MENU_ITEM} onClick={() => pick("json")}>
             JSON (.json)
           </button>
         </div>

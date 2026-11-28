@@ -141,7 +141,7 @@ export default function FanList({ className }: { className?: string }) {
                       aria-expanded={open}
                       aria-controls={open ? `fan-detail-${i}` : undefined}
                       title={open ? "Hide details" : "Show details"}
-                      className="focus-inset grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3.5 gap-y-[5px] py-2 text-left tight:py-1.5"
+                      className="focus-inset -mx-2 w-[calc(100%+16px)] rounded-[8px] px-2 transition-colors duration-(--dur-instant) hover:bg-hover active:bg-pressed grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3.5 gap-y-[5px] py-2 text-left tight:py-1.5"
                     >
                       <span className="flex min-w-0 items-center gap-1.5 text-[13px] font-medium leading-[17px] text-ink">
                         <span className="truncate" title={name !== f.name ? `${name} (${f.name})` : undefined}>

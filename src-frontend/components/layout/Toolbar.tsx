@@ -10,13 +10,12 @@ import {
   SEARCH_HOTKEY_LABEL,
   UPDATE_TEXT,
   VIEW_TITLES,
-  type HealthCondition,
   type SystemHealth,
   type ViewId,
 } from "../../types";
 import { errorMessage } from "../../lib/api";
 import { cn, fmtClock } from "../../lib/format";
-import { alertState, healthLevelTone, healthPillTitle, runHealthAction } from "../../lib/status";
+import { alertState, healthLevelTone, healthPillTitle, healthRows, runHealthAction, type HealthRow } from "../../lib/status";
 import { useHealth } from "../../hooks/useHealth";
 import { useHealthAlerts } from "../../hooks/useHealthAlerts";
 import { useNow } from "../../hooks/useNow";
@@ -80,13 +79,12 @@ function SlidersIcon({ size = 17 }: { size?: number }) {
 /* Health pill + condition list                                        */
 /* ------------------------------------------------------------------ */
 
-function conditionsHeading(health: SystemHealth): string {
-  const n = health.conditions.length;
+function conditionsHeading(health: SystemHealth, n: number): string {
   if (n === 0) return health.level === "checking" ? "Checking" : "No active conditions";
   return n === 1 ? "1 active condition" : `${n} active conditions`;
 }
 
-function ConditionRow({ c, onDone }: { c: HealthCondition; onDone: () => void }) {
+function ConditionRow({ c, onDone }: { c: HealthRow; onDone: () => void }) {
   const [busy, setBusy] = useState(false);
   const action = c.action;
   const run = async () => {
@@ -154,7 +152,8 @@ function HealthPill() {
     };
   }, [open, close]);
 
-  const n = health.conditions.length;
+  const rows = healthRows(health.conditions);
+  const n = rows.length;
   const evaluated = snapshot.evaluatedTs;
   const showRules = rulesToggled ?? n === 0;
 
@@ -179,15 +178,15 @@ function HealthPill() {
           className="absolute top-[calc(100%+8px)] left-0 z-50 flex max-h-[calc(100vh-140px)] w-[440px] max-w-[calc(100vw-var(--sidebar-w)-48px)] animate-fade-in flex-col rounded-[12px] bg-white px-3.5 py-3 shadow-popover"
         >
           <div className="mb-2 flex shrink-0 items-baseline justify-between gap-3">
-            <h2 className="text-headline text-ink">{conditionsHeading(health)}</h2>
+            <h2 className="text-headline text-ink">{conditionsHeading(health, n)}</h2>
             {evaluated != null && <span className="tnum text-callout text-ink-3">evaluated {fmtClock(evaluated)}</span>}
           </div>
           {/* The negative margin keeps the buttons' outline rings inside the scroll box. */}
           <div className="-mx-3.5 min-h-0 overflow-y-auto px-3.5">
             {n > 0 ? (
               <ul>
-                {health.conditions.map((c) => (
-                  <ConditionRow key={c.id} c={c} onDone={() => close(false)} />
+                {rows.map((r) => (
+                  <ConditionRow key={r.key} c={r} onDone={() => close(false)} />
                 ))}
               </ul>
             ) : (

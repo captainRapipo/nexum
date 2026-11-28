@@ -105,7 +105,14 @@ function Tile({
         disabled && "text-ink-disabled hover:bg-card",
       )}
     >
-      <span className={cn("flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-lg bg-inset", disabled ? "text-ink-disabled" : "text-icon-2")}>
+      {/* Tight mode: five tiles share a narrow row, so the icon well gives its width to the text (the spinner still shows). */}
+      <span
+        className={cn(
+          "flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-lg bg-inset",
+          !pending && "tight:hidden",
+          disabled ? "text-ink-disabled" : "text-icon-2",
+        )}
+      >
         {pending ? <Loader2 size={16} className="animate-spin" aria-hidden="true" /> : <Icon size={16} aria-hidden="true" />}
       </span>
       <span className="min-w-0 flex-1">

@@ -115,11 +115,12 @@ export function unwrapEvent<T>(raw: unknown): T {
 
 export function fmtDuration(ms: number): string {
   if (!Number.isFinite(ms) || ms < 0) return "—";
-  if (ms < 1000) return `${Math.max(0.1, ms / 1000).toFixed(1)}s`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  // A space before the unit, as everywhere else in the app ("2.3 s", "30 s", "2 min 5 s").
+  if (ms < 1000) return `${Math.max(0.1, ms / 1000).toFixed(1)} s`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`;
   const m = Math.floor(ms / 60_000);
   const s = Math.round((ms % 60_000) / 1000);
-  return `${m}m ${s}s`;
+  return `${m} min ${s} s`;
 }
 
 /**

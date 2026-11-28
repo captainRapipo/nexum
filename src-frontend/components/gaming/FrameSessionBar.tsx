@@ -1,10 +1,10 @@
 import { useMemo, useState, type ReactNode } from "react";
-import { Loader2 } from "lucide-react";
+import { Loader2, Pause } from "lucide-react";
 import type { FrameSession, HealthCondition } from "../../types";
 import { errorMessage } from "../../lib/api";
 import { fmtClock } from "../../lib/format";
 import { Button, HealthBanner } from "../ui";
-import { SESSION_ERROR_HINT, SESSION_FAILED, SESSION_PAUSED, SESSION_STARTING, signatureTitle } from "./gamingText";
+import { SESSION_ERROR_HINT, SESSION_FAILED, SESSION_PAUSED, SESSION_STARTING, SESSION_WAITING_SENSORS, signatureTitle } from "./gamingText";
 
 export interface FrameSessionBarProps {
   session: FrameSession | null;
@@ -12,12 +12,14 @@ export interface FrameSessionBarProps {
   setEnabled: (on: boolean) => Promise<void>;
   /** Sensor reading is up (frame capture is started by the same background service). */
   agentRunning: boolean;
+  /** Sensor reading was given up (the app banner shows `Try again`): nothing is about to start by itself. */
+  sensorsFailed?: boolean;
   /** Controls shown before `Turn off` (the statistics window selector). */
   trailing?: ReactNode;
 }
 
 /** Session line shown whenever capture is enabled (CONTRACT §4.10.1, §1.6.6). */
-export default function FrameSessionBar({ session, setEnabled, agentRunning, trailing }: FrameSessionBarProps) {
+export default function FrameSessionBar({ session, setEnabled, agentRunning, sensorsFailed = false, trailing }: FrameSessionBarProps) {
   const [busy, setBusy] = useState<"off" | "retry" | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -72,6 +74,14 @@ export default function FrameSessionBar({ session, setEnabled, agentRunning, tra
           <b className="font-medium text-ink">Intel-signed PresentMon {session.backendVersion}</b>
           {` · session ${session.sessionName} · capturing since ${fmtClock(session.sinceTs, false)}`}
         </span>
+      </>
+    );
+  } else if (sensorsFailed && session?.state !== "starting") {
+    // No spinner: nothing is in progress until the user chooses Try again in the banner above.
+    body = (
+      <>
+        <Pause size={14} className="shrink-0 text-ink-3" aria-hidden="true" />
+        <span className="min-w-0 flex-1 truncate">{SESSION_WAITING_SENSORS}</span>
       </>
     );
   } else {

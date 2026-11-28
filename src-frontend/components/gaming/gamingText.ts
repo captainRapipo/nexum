@@ -45,6 +45,8 @@ export const OPT_IN_TILES: readonly { title: string; body: string }[] = [
 /** Session line while nothing is running yet (CONTRACT §4.8.1). */
 export const SESSION_STARTING = "Starting frame capture…";
 export const SESSION_PAUSED = "Frame capture is paused. It starts again by itself.";
+/** Sensor reading could not be brought back (the banner above offers `Try again`): nothing restarts by itself. */
+export const SESSION_WAITING_SENSORS = "Frame capture is paused until Nexum can read sensors again.";
 export const SESSION_FAILED = "Frame capture is not running.";
 
 export const EXCLUDES_HINT =

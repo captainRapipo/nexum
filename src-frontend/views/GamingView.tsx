@@ -127,7 +127,13 @@ export default function GamingView() {
     <div className="flex min-h-0 flex-1 flex-col">
       <PageHeader view="gaming" description={PAGE_DESCRIPTION} />
       <div className="flex min-h-0 flex-1 flex-col gap-(--grid-gap)">
-        <FrameSessionBar session={session} setEnabled={setEnabled} agentRunning={!!agent?.running} trailing={windowControl} />
+        <FrameSessionBar
+          session={session}
+          setEnabled={setEnabled}
+          agentRunning={!!agent?.running}
+          sensorsFailed={agent?.phase === "failed"}
+          trailing={windowControl}
+        />
 
         {hasTarget ? (
           <>
@@ -184,7 +190,9 @@ export default function GamingView() {
                   ? NO_TARGET_TITLE
                   : session?.state === "error"
                     ? "Frame capture stopped"
-                    : "Frame capture is not running yet"
+                    : agent?.phase === "failed"
+                      ? "Frame capture is paused"
+                      : "Frame capture is not running yet"
               }
               body={
                 running || session?.state === "starting"

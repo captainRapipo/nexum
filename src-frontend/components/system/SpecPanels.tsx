@@ -643,15 +643,26 @@ export function GraphicsPanel({ gpus, ctx }: { gpus: GpuSpec[]; ctx: RowCtx }) {
                 { label: "PCIe link", value: link, title: PCIE_IDLE_HINT },
               ]}
             />
-            <SpecCard title={gpus.length > 1 ? `GPU ${i + 1} details` : "Details"} rows={gpuRows(g, ctx)}>
-              {g.link && (
-                <Note>
-                  {g.link.source === "adl" ? "Link read through the AMD driver. " : g.link.source === "devpkey" ? "Link reported by Windows. " : ""}
-                  {PCIE_IDLE_HINT}
-                </Note>
-              )}
-              {g.link?.note && <Note>{g.link.note}</Note>}
-            </SpecCard>
+            {/* Adapter (7) + Driver (5), the same split as Mainboard: no row stretches across the whole page. */}
+            <div className={GRID}>
+              <SpecCard title="Adapter" className="col-span-7" rows={gpuRows(g, ctx).filter((r) => !r.label.startsWith("Driver"))}>
+                {g.link && (
+                  <Note>
+                    {g.link.source === "adl" ? "Link read through the AMD driver. " : g.link.source === "devpkey" ? "Link reported by Windows. " : ""}
+                    {PCIE_IDLE_HINT}
+                  </Note>
+                )}
+                {g.link?.note && <Note>{g.link.note}</Note>}
+              </SpecCard>
+              <SpecCard
+                title="Driver"
+                className="col-span-5"
+                rows={gpuRows(g, ctx)
+                  .filter((r) => r.label.startsWith("Driver"))
+                  // The card is titled "Driver": its rows read "Version" and "Date".
+                  .map((r) => ({ ...r, label: r.label.replace(/^Driver (.)/, (_m, c: string) => c.toUpperCase()) }))}
+              />
+            </div>
           </div>
         );
       })}

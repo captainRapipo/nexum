@@ -71,10 +71,11 @@ export default function DashboardView() {
   const fill = useFillHeight(rootRef);
   const health = useHealth();
   const { settings } = useSettings();
-  // While a drive banner is up, the Health card shows that condition as one line (the banner has the
-  // rest), so the chart row may give up more height before the page has to scroll.
+  // While every condition is already shown by a drive banner, the Health card lists one line per
+  // condition (the banner has the rest), so the chart row may give up more height before the page
+  // has to scroll. With any other condition the card keeps room for a whole row: title, detail, button.
   const dismissed = settings?.dismissedAlerts ?? [];
-  const bannerUp = health.conditions.some((c) => hasBanner(c, dismissed));
+  const bannerUp = health.conditions.length > 0 && health.conditions.every((c) => hasBanner(c, dismissed));
 
   const cpuShort = info?.cpuName ? shortCpuName(info.cpuName) : null;
   const gpuName = pickPrimaryGpu(info?.gpuNames);
@@ -101,7 +102,7 @@ export default function DashboardView() {
       <div
         className={cn(
           "mb-(--grid-gap) grid h-[340px] shrink grid-cols-12 gap-(--grid-gap) tight:h-[296px]",
-          bannerUp ? "min-h-[258px] tight:min-h-[230px]" : "min-h-[300px] tight:min-h-[283px]",
+          bannerUp ? "min-h-[258px] tight:min-h-[236px]" : "min-h-[300px] tight:min-h-[283px]",
         )}
       >
         <section aria-label="Load" className="col-span-8 min-h-0 min-w-0">

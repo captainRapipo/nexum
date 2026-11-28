@@ -4,6 +4,7 @@ import { DEFAULT_SETTINGS, type TrashCategory } from "../types";
 import { api } from "../lib/api";
 import { onRescanRequest } from "../lib/nav";
 import { useSettings } from "../hooks/useSettings";
+import { useTightMode } from "../hooks/useTightMode";
 import { fmtBytes, fmtClock } from "../lib/format";
 import GlassCard from "../components/layout/GlassCard";
 import { PageHeader, usePageChrome } from "../components/layout/PageChrome";
@@ -201,41 +202,49 @@ export default function CleanerView() {
   };
 
   const remeasure = () => void rescan(includeBrowser, recycleAgeRef.current);
+  // Regular mode: right of the large title. Tight mode: in the Categories card header (SPEC, "Page actions").
+  const tight = useTightMode();
+  const measureButton = (
+    <Button
+      size={tight ? "sm" : "md"}
+      icon={<RefreshCw size={tight ? 13 : 15} className={scanner.phase === "scanning" ? "animate-spin" : undefined} aria-hidden="true" />}
+      onClick={remeasure}
+      disabled={scanner.phase === "scanning" || engine.running}
+      title="Measure again (F5)"
+    >
+      Measure again
+    </Button>
+  );
+  const hasHistory = engine.history.length > 0;
 
   return (
     <div className="flex flex-1 flex-col">
-      <PageHeader
-        view="cleaner"
-        description={PAGE_DESCRIPTION}
-        actions={
-          <Button
-            icon={<RefreshCw size={15} className={scanner.phase === "scanning" ? "animate-spin" : undefined} aria-hidden="true" />}
-            onClick={remeasure}
-            disabled={scanner.phase === "scanning" || engine.running}
-            title="Measure again (F5)"
-          >
-            Measure again
-          </Button>
-        }
-      />
+      <PageHeader view="cleaner" description={PAGE_DESCRIPTION} actions={measureButton} tightActions="none" />
 
-      <div className="grid flex-1 grid-cols-[minmax(0,1fr)_380px] items-stretch gap-(--grid-gap) tight:grid-cols-[minmax(0,1fr)_340px]">
+      {/* Every card ends at its content: a short state (cleaning, the result, an empty history) is a short
+          card on the canvas, never a tall blank panel. */}
+      <div className="grid grid-cols-[minmax(0,1fr)_380px] items-start gap-(--grid-gap) tight:grid-cols-[minmax(0,1fr)_340px]">
         <GlassCard
           padded={false}
           bodyClassName="flex flex-col"
           title={engine.running ? "Cleaning…" : showSummary ? "Cleanup finished" : "Categories"}
           actions={
-            idle && scanner.scan ? (
-              <span className="flex gap-3.5">
-                <InkLink chevron={false} onClick={selection.resetOverrides} title="Back to the categories that are on by default">
-                  Select defaults
-                </InkLink>
-                <InkLink chevron={false} onClick={() => selection.setAll(true)}>
-                  All
-                </InkLink>
-                <InkLink chevron={false} onClick={() => selection.setAll(false)}>
-                  None
-                </InkLink>
+            idle && (scanner.scan || tight) ? (
+              <span className="flex items-center gap-3.5">
+                {scanner.scan && (
+                  <>
+                    <InkLink chevron={false} onClick={selection.resetOverrides} title="Back to the categories that are on by default">
+                      Select defaults
+                    </InkLink>
+                    <InkLink chevron={false} onClick={() => selection.setAll(true)}>
+                      All
+                    </InkLink>
+                    <InkLink chevron={false} onClick={() => selection.setAll(false)}>
+                      None
+                    </InkLink>
+                  </>
+                )}
+                {tight && measureButton}
               </span>
             ) : undefined
           }
@@ -355,7 +364,6 @@ export default function CleanerView() {
           </GlassCard>
 
           <GlassCard
-            className="flex-1"
             bodyClassName="flex flex-col"
             title="History"
             actions={
@@ -366,14 +374,16 @@ export default function CleanerView() {
               ) : undefined
             }
             footer={
-              <>
-                <span>Freed this session</span>
-                <b className="tnum font-semibold text-ink">{fmtBytes(sessionFreed, 2)}</b>
-              </>
+              hasHistory ? (
+                <>
+                  <span>Freed this session</span>
+                  <b className="tnum font-semibold text-ink">{fmtBytes(sessionFreed, 2)}</b>
+                </>
+              ) : undefined
             }
           >
-            {engine.history.length === 0 ? (
-              <p className="border-t border-divider py-3 text-callout text-ink-2">No cleanups yet this session.</p>
+            {!hasHistory ? (
+              <p className="border-t border-divider pt-3 text-callout text-ink-2">No cleanups yet this session.</p>
             ) : (
               <ul className="tnum max-h-[300px] min-h-0 flex-1 overflow-y-auto">
                 {engine.history.map((h) => (

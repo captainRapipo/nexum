@@ -310,6 +310,15 @@ export default function SmartDrawer({ tele, disk, health, tempUnit, readTs = nul
   const tone = STATUS_CLASS[view.tone];
   const advice = needsAttention(health) ? "Back up important files and plan a replacement." : null;
   const heroTitle = health.state === "unknown" ? health.label : life != null ? `${healthWord(health)} · ${life}% life left` : healthWord(health);
+  // The reason often starts with the same "44% life left" the title carries: keep only what it adds.
+  const heroDetail =
+    life != null && health.reason
+      ? health.reason
+          .split(" · ")
+          .filter((part) => part.trim().toLowerCase() !== `${life}% life left`)
+          .join(" · ")
+          .replace(/^./, (c) => c.toUpperCase())
+      : health.reason;
 
   const doCopy = async () => {
     if (!tele) return;
@@ -358,7 +367,7 @@ export default function SmartDrawer({ tele, disk, health, tempUnit, readTs = nul
               <StatusIcon tone={view.tone} size={15} />
               <span className="min-w-0 truncate">{heroTitle}</span>
             </div>
-            {health.reason && (!tight || life == null) && <div className="mt-1 text-callout text-ink-2">{health.reason}</div>}
+            {heroDetail && (!tight || life == null) && <div className="mt-1 text-callout text-ink-2">{heroDetail}</div>}
           </div>
         </div>
         {life != null && (

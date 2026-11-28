@@ -452,6 +452,9 @@ export function deriveHealth(input: DeriveHealthInput): SystemHealth {
   return { level, label, summary: summarize(level, label, conditions), conditions, rules };
 }
 
+/** Pill summary while the only conditions are limited mode and what follows from it (CONTRACT §5.3). */
+export const LIMITED_SUMMARY = { admin: "needs administrator", pawnIo: "needs PawnIO driver" } as const;
+
 function summarize(level: SystemHealthLevel, label: string, conditions: HealthCondition[]): string | null {
   if (level === "optimal" || level === "checking" || conditions.length === 0) return null;
   const topSev = conditions[0].severity;
@@ -463,7 +466,12 @@ function summarize(level: SystemHealthLevel, label: string, conditions: HealthCo
     else groups.set(c.group, [c]);
   }
   let text: string;
-  if (groups.size === 1) {
+  const limited = topSev === "info" ? top.find((c) => c.id === "limited-mode") : undefined;
+  if (limited) {
+    // CONTRACT §5.3: limited mode names its cause; drives whose health is unknown because of it are
+    // not a list of "alerts".
+    text = limited.action && "command" in limited.action && limited.action.command === "getPawnIo" ? LIMITED_SUMMARY.pawnIo : LIMITED_SUMMARY.admin;
+  } else if (groups.size === 1) {
     const [members] = [...groups.values()];
     const short = members[0].short;
     text = members.length > 1 && short.startsWith("1 drive") ? short.replace(/^1 drive/, `${members.length} drives`) : short;
@@ -472,6 +480,53 @@ function summarize(level: SystemHealthLevel, label: string, conditions: HealthCo
   }
   // "Partial sensors · Partial sensors" carries no information.
   return text === label ? null : text;
+}
+
+/** One row of a condition list: a single condition, or several drives that share one "health unknown" cause. */
+export interface HealthRow {
+  key: string;
+  severity: HealthSeverity;
+  title: string;
+  detail: string;
+  rule: string;
+  action: HealthAction | null;
+  /** The conditions this row stands for (one, or the folded drives). */
+  members: HealthCondition[];
+}
+
+/** `C: (model) — Health unknown — run as administrator` → the part after the drive name. */
+function unknownLabel(title: string): string {
+  const i = title.indexOf(" — ");
+  return i >= 0 ? title.slice(i + 3) : title;
+}
+
+/**
+ * The conditions as the Health card and the pill's list show them. Every condition is one row, except
+ * drives whose health is unknown for the same reason (rule 10: typically all of them while Nexum runs
+ * without administrator rights): those fold into one row, `3 drives — <label>`, so the list does not
+ * repeat one sentence per drive. Order is unchanged; nothing is dropped (`members` has every condition).
+ */
+export function healthRows(conditions: readonly HealthCondition[]): HealthRow[] {
+  const rows: HealthRow[] = [];
+  const folded = new Map<string, HealthRow>();
+  for (const c of conditions) {
+    if (c.group === "drive-unknown") {
+      const label = unknownLabel(c.title);
+      const k = `${label}\u0000${c.detail ?? ""}`;
+      const row = folded.get(k);
+      if (row) {
+        row.members.push(c);
+        row.title = `${row.members.length} drives — ${label}`;
+        continue;
+      }
+      const first: HealthRow = { key: c.id, severity: c.severity, title: c.title, detail: c.detail ?? "", rule: c.rule, action: c.action ?? null, members: [c] };
+      folded.set(k, first);
+      rows.push(first);
+      continue;
+    }
+    rows.push({ key: c.id, severity: c.severity, title: c.title, detail: c.detail ?? "", rule: c.rule, action: c.action ?? null, members: [c] });
+  }
+  return rows;
 }
 
 /** Pill text: `Attention · 1 drive worn`. */

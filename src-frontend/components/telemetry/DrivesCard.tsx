@@ -74,7 +74,10 @@ export default function DrivesCard({ className }: { className?: string }) {
     return total > 0 ? { free, total } : null;
   }, [volumes]);
 
-  const readAt = latest && tele.length > 0 ? fmtClock(latest.ts, false) : null;
+  // "Read" only when at least one drive actually reported health: without administrator rights the
+  // drives are listed but nothing was read, and the footer must not claim otherwise.
+  const anyRead = tele.some((t) => t.health != null && t.health.state !== "unknown");
+  const readAt = latest && anyRead ? fmtClock(latest.ts, false) : null;
   const isAdmin = info?.isAdmin ?? true;
 
   return (
@@ -104,7 +107,7 @@ export default function DrivesCard({ className }: { className?: string }) {
       ) : (
         <ul className="-mt-[9px] flex flex-col" aria-label="Physical drives">
           {rows.map((r) => (
-            <DriveRow key={r.key} row={r} isAdmin={isAdmin} />
+            <DriveRow key={r.key} row={r} isAdmin={isAdmin} smartRead={anyRead} />
           ))}
         </ul>
       )}
@@ -117,7 +120,7 @@ function chipText(h: DriveHealth): string {
   return h.state === "unknown" ? "Unknown" : h.label || "Unknown";
 }
 
-function DriveRow({ row, isAdmin }: { row: Row; isAdmin: boolean }) {
+function DriveRow({ row, isAdmin, smartRead }: { row: Row; isAdmin: boolean; smartRead: boolean }) {
   const { disk, tele, health, letter, freeBytes } = row;
   const view = driveHealthView(health);
   const life = finite(tele?.healthPct) ? Math.round(clamp(tele!.healthPct!, 0, 100)) : null;
@@ -132,7 +135,10 @@ function DriveRow({ row, isAdmin }: { row: Row; isAdmin: boolean }) {
           ? "Life not read without administrator"
           : tele
             ? "No wear counter"
-            : NOT_AVAILABLE_TEXT;
+            : smartRead
+              ? // Other drives were read, this one was not: it (or its USB bridge) reports nothing. Not a passing state.
+                "No S.M.A.R.T. data"
+              : NOT_AVAILABLE_TEXT;
   const open = () => requestNavigate(tele ? { view: "storage", focus: tele.id } : { view: "storage" });
   return (
     <li className="border-b border-divider last:border-b-0">
@@ -140,7 +146,8 @@ function DriveRow({ row, isAdmin }: { row: Row; isAdmin: boolean }) {
         type="button"
         onClick={open}
         title={`${letter ? `${letter} ` : ""}${model}\n${view.label}${health.reason ? `. ${health.reason}` : ""}\nOpen in Storage`}
-        className="focus-inset grid w-full grid-cols-[30px_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-[3px] py-[9px] text-left tight:py-[7px]"
+        // The hover plate reaches 8 px past the text on both sides, so the content keeps the card's edges.
+        className="focus-inset -mx-2 w-[calc(100%+16px)] rounded-[8px] px-2 transition-colors duration-(--dur-instant) hover:bg-hover active:bg-pressed grid grid-cols-[30px_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-[3px] py-[9px] text-left tight:py-[7px]"
       >
         <span
           aria-hidden="true"
