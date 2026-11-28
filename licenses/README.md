@@ -46,9 +46,28 @@ files; it is a "Larger Work" under MPL-2.0 §3.3 and is licensed under GPL-3.0.
 | Lucide icons (`lucide-react`) | 0.468.x | ISC (portions MIT, from Feather) | [ISC-Lucide.txt](ISC-Lucide.txt) |
 | Inter typeface (`@fontsource/inter`) | 5.x | SIL Open Font License 1.1 | [OFL-1.1-Inter.txt](OFL-1.1-Inter.txt) |
 | JetBrains Mono typeface (`@fontsource/jetbrains-mono`) | 5.x | SIL Open Font License 1.1 | [OFL-1.1-JetBrainsMono.txt](OFL-1.1-JetBrainsMono.txt) |
-| Tauri (`tauri`, `@tauri-apps/api`, plugins: shell, single-instance, notification) and other Rust crates | 2.x | MIT or Apache-2.0 | see each crate in `src-tauri/Cargo.lock` |
+| Tauri (`tauri`, `@tauri-apps/api`, plugins: shell, single-instance, notification, updater) and other Rust crates | 2.x | MIT or Apache-2.0 | see each crate in `src-tauri/Cargo.lock` |
 
 The fonts are embedded unmodified. Under the OFL they may be bundled with software, but not sold on their own.
+
+### In-app updater (since 1.2)
+
+`tauri-plugin-updater` 2.14.1 (MIT or Apache-2.0, <https://github.com/tauri-apps/plugins-workspace>) is used from Rust
+only, to check for and download Nexum's own updates from GitHub. It brings an HTTPS client and a signature verifier
+into `Nexum.exe`. Versions are the ones resolved in `src-tauri/Cargo.lock`.
+
+| Crate | Version | Licence | Text |
+| --- | --- | --- | --- |
+| `minisign-verify` (verifies every update) | 0.3.0 | MIT | [rust-crates/minisign-verify-LICENSE.txt](rust-crates/minisign-verify-LICENSE.txt) |
+| `reqwest` | 0.13.5 | MIT or Apache-2.0 | in the crate |
+| `hyper`, `hyper-util` | 1.13.0, 0.1.21 | MIT | in the crates |
+| `hyper-rustls`, `rustls` | 0.27.10, 0.23.46 | Apache-2.0, ISC or MIT | in the crates |
+| `tokio-rustls`, `rustls-pki-types`, `rustls-platform-verifier`, `rustls-native-certs`, `zeroize`, `semver`, `base64` | as locked | MIT or Apache-2.0 | in the crates |
+| `rustls-webpki` | 0.103.17 | ISC | [rust-crates/rustls-webpki-LICENSE.txt](rust-crates/rustls-webpki-LICENSE.txt) |
+| `ring` | 0.17.14 | Apache-2.0 and ISC | [ring-LICENSE.txt](rust-crates/ring-LICENSE.txt), [ring-LICENSE-BoringSSL.txt](rust-crates/ring-LICENSE-BoringSSL.txt), [ring-LICENSE-other-bits.txt](rust-crates/ring-LICENSE-other-bits.txt) |
+| `untrusted` | 0.9.0 | ISC | [rust-crates/untrusted-LICENSE.txt](rust-crates/untrusted-LICENSE.txt) |
+| `subtle` | 2.6.1 | BSD-3-Clause | [rust-crates/subtle-LICENSE.txt](rust-crates/subtle-LICENSE.txt) |
+| `schannel` | 0.1.30 | MIT | in the crate |
 
 ## Used as a reference or called on your system (not included)
 

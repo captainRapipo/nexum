@@ -1,14 +1,28 @@
 #!/usr/bin/env node
-// CONTRACT §4.8 / §7.4 (ROADMAP MF-4, §6.6): banned words in user-visible UI copy.
+// CONTRACT §4.8 / §7 items 4 and 13 (ROADMAP MF-4, §6.6): banned words in user-visible
+// UI copy.
 //
-// Parses every src-frontend/**/*.tsx file with the TypeScript compiler (already a
-// devDependency) and checks the text people can see: JSX text, string and
-// template literals, and string values of JSX attributes. Identifiers, import
-// paths, className values, object keys and type-level strings are exempt, as are
-// "code-like" literals with no spaces (event names, ids such as "purge-progress").
+// Pass 1 (frontend): parses every src-frontend/**/*.ts and *.tsx file with the
+// TypeScript compiler (already a devDependency) and checks the text people can see:
+// JSX text, string and template literals, and string values of JSX attributes.
+// Identifiers, import paths, className values, object keys and type-level strings are
+// exempt, as are "code-like" literals with no spaces (event names, ids such as
+// "purge-progress", "agent-status", "agentOffline").
+//
+// Pass 2 (Rust core, since 1.2): every string literal in src-tauri/src/**/*.rs is
+// checked for the word "agent" only, because Rust strings reach the screen as command
+// errors, event payloads, the tray tooltip and saved reports. Exempt: #[cfg(test)] and
+// #[test] items, comments, attributes, literals without spaces ("nexum-agent.exe",
+// "agent-status"), arguments of logging and assertion macros (eprintln!, println!,
+// format_args!, panic!, assert!, the log macros) and of .expect(…), and literals that
+// are only compared with (starts_with, contains, ==, match arms). The sidecar
+// (nexum-agent/**) is not scanned: it is frozen in 1.2 and its texts were reviewed by
+// hand (CONTRACT §4.8.1).
 //
 // A hit is allowed only when ".github/copy-allowlist.txt" lists it as
 // "<path>:<line>" (one line) or "<path>:<line>:<word>" (one word on that line).
+// CONTRACT §7 item 13: there are no exceptions for "agent". An allow-list entry never
+// excuses it, and a word entry naming it is itself reported as an error.
 //
 // Usage: node .github/scripts/check-copy.mjs [repoRoot]
 // Exit code 0 = clean, 1 = banned word found, 2 = script error.
@@ -16,6 +30,7 @@
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { createRequire } from "node:module";
+import { lexRust, inRanges, enclosingCalls } from "./lib/rust-lex.mjs";
 
 const root = process.argv[2] ?? process.cwd();
 const require = createRequire(join(process.cwd(), "package.json"));
@@ -28,6 +43,7 @@ try {
 }
 
 const SRC = join(root, "src-frontend");
+const RUST_SRC = join(root, "src-tauri", "src");
 const ALLOWLIST = join(root, ".github", "copy-allowlist.txt");
 
 // CONTRACT §4.8: case-insensitive, whole word. "purge" is banned as a button/CTA
@@ -45,7 +61,15 @@ const BANNED = [
   ["junk", /\bjunk\b/i],
   ["trash", /\btrash\b/i],
   ["outdated", /\boutdated\b/i],
+  // CONTRACT §4.8 [NEW 1.2]: nothing a user can read says "agent" (also "agents",
+  // "agent's"). \b keeps "reagent" out; identifiers such as "userAgent" have no space
+  // and are exempt as code-like literals.
+  ["agent", /\bagents?\b/i],
 ];
+// The Rust pass checks this word only (CONTRACT §7 item 13).
+const RUST_BANNED = BANNED.filter(([label]) => label === "agent");
+// Words that can never be allow-listed.
+const NEVER_ALLOWED = new Set(["agent"]);
 
 // JSX attributes whose values are never shown to people.
 const NON_VISIBLE_ATTRS = new Set([
@@ -60,6 +84,20 @@ const NON_VISIBLE_CALLS = new Set([
   "dispatchEvent", "CustomEvent", "Event", "getItem", "setItem", "removeItem",
   "includes", "startsWith", "endsWith", "indexOf", "split", "replace", "match", "test",
   "RegExp", "cn", "clsx", "classNames", "Symbol",
+]);
+
+// Rust macros whose string arguments go to stderr, stdout or a panic message, and
+// methods whose string argument is a panic message or a pattern to compare with.
+const RUST_LOG_MACROS = new Set([
+  "eprintln", "eprint", "println", "print", "format_args", "dbg",
+  "panic", "unreachable", "unimplemented", "todo",
+  "assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne",
+  "trace", "debug", "info", "warn", "error",
+]);
+const RUST_NON_VISIBLE_CALLS = new Set([
+  "expect", "starts_with", "ends_with", "contains", "strip_prefix", "strip_suffix",
+  "eq", "ne", "eq_ignore_ascii_case", "find", "rfind", "matches", "split", "rsplit",
+  "split_once", "rsplit_once", "trim_start_matches", "trim_end_matches",
 ]);
 
 function toPosix(p) {
@@ -85,12 +123,12 @@ function loadAllowlist() {
   return { lines, words };
 }
 
-function* walk(dir) {
+function* walk(dir, exts) {
   for (const e of readdirSync(dir, { withFileTypes: true })) {
     const full = join(dir, e.name);
     if (e.isDirectory()) {
-      if (e.name !== "node_modules") yield* walk(full);
-    } else if (e.isFile() && e.name.endsWith(".tsx")) {
+      if (e.name !== "node_modules" && e.name !== "target") yield* walk(full, exts);
+    } else if (e.isFile() && exts.some((x) => e.name.endsWith(x)) && !e.name.endsWith(".d.ts")) {
       yield full;
     }
   }
@@ -143,6 +181,24 @@ function isExemptPosition(node) {
   return false;
 }
 
+// True when a Rust string literal cannot reach the screen because of where it sits.
+function rustLiteralIsExempt(code, lit) {
+  const chain = enclosingCalls(code, lit.start);
+  for (let i = 0; i < chain.length; i++) {
+    const c = chain[i];
+    if (c.attribute) return true; // #[serde(rename = "…")], #[doc = "…"]
+    if (c.macro && RUST_LOG_MACROS.has(c.name)) return true;
+    if (i === 0 && !c.macro && RUST_NON_VISIBLE_CALLS.has(c.name)) return true;
+  }
+  // Comparisons and match arms: x == "…", "…" == x, "…" => …, "…" | "…" => …
+  const before = code.slice(Math.max(0, lit.start - 12), lit.start).trimEnd();
+  const after = code.slice(lit.end, lit.end + 12).trimStart();
+  if (/(==|!=)$/.test(before)) return true;
+  if (/^(==|!=|=>)/.test(after)) return true;
+  if (/^\|(?!\|)/.test(after) || /(?<!\|)\|$/.test(before)) return true;
+  return false;
+}
+
 function main() {
   if (!existsSync(SRC)) {
     console.error("check-copy: src-frontend/ not found");
@@ -153,11 +209,32 @@ function main() {
   const hits = [];
   let files = 0;
 
-  for (const file of walk(SRC)) {
+  for (const w of allow.words) {
+    const word = w.slice(w.lastIndexOf(":") + 1);
+    if (NEVER_ALLOWED.has(word)) {
+      hits.push({
+        rel: ".github/copy-allowlist.txt", line: 1, label: word,
+        snippet: `allow-list entry "${w}" is not permitted: "${word}" has no exceptions (CONTRACT §7 item 13)`,
+      });
+      used.add(w);
+    }
+  }
+  const allowed = (key, label) => {
+    const l = label.toLowerCase();
+    if (NEVER_ALLOWED.has(l)) return false;
+    const wkey = `${key}:${l}`;
+    if (allow.lines.has(key)) { used.add(key); return true; }
+    if (allow.words.has(wkey)) { used.add(wkey); return true; }
+    return false;
+  };
+
+  // Pass 1: frontend (.ts and .tsx).
+  for (const file of walk(SRC, [".ts", ".tsx"])) {
     files++;
     const rel = toPosix(relative(root, file));
     const text = readFileSync(file, "utf8");
-    const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+    const kind = file.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+    const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, kind);
 
     const check = (node, value, codeLikeExempt) => {
       if (!value || !/[A-Za-z]/.test(value)) return;
@@ -172,9 +249,7 @@ function main() {
         const pos = idx >= 0 ? start + idx : start;
         const line = sf.getLineAndCharacterOfPosition(pos).line + 1;
         const key = `${rel}:${line}`;
-        const wkey = `${key}:${label.toLowerCase()}`;
-        if (allow.lines.has(key)) { used.add(key); continue; }
-        if (allow.words.has(wkey)) { used.add(wkey); continue; }
+        if (allowed(key, label)) continue;
         hits.push({ rel, line, label, snippet: value.replace(/\s+/g, " ").trim().slice(0, 120) });
         if (label === "deep purge") break; // do not double-report the inner "purge"
       }
@@ -192,11 +267,39 @@ function main() {
         }
       } else if (ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node)) {
         const tpl = node.parent && (ts.isTemplateExpression(node.parent) ? node.parent : node.parent.parent);
-        if (!tpl || !isExemptPosition(tpl)) check(node, node.text, false);
+        // A piece without whitespace is code-like (a path such as `…\purge-logs\${name}`).
+        if (!tpl || !isExemptPosition(tpl)) check(node, node.text, true);
       }
       ts.forEachChild(node, visit);
     };
     visit(sf);
+  }
+
+  // Pass 2: Rust string literals (the word "agent" only).
+  let rustFiles = 0;
+  if (existsSync(RUST_SRC)) {
+    for (const file of walk(RUST_SRC, [".rs"])) {
+      rustFiles++;
+      const rel = toPosix(relative(root, file));
+      const text = readFileSync(file, "utf8");
+      const { code, strings, tests } = lexRust(text);
+      for (const lit of strings) {
+        const value = lit.value;
+        if (!value || !/\s/.test(value.trim())) continue; // code-like: no whitespace
+        const matched = RUST_BANNED.filter(([, re]) => re.test(value));
+        if (!matched.length) continue;
+        if (inRanges(lit.start, tests)) continue;
+        if (rustLiteralIsExempt(code, lit)) continue;
+        for (const [label, re] of matched) {
+          // Report on the line where the word is (literals can span lines).
+          const raw = text.slice(lit.start, lit.end);
+          const idx = raw.search(re);
+          const line = lit.line + (idx > 0 ? raw.slice(0, idx).split("\n").length - 1 : 0);
+          if (allowed(`${rel}:${line}`, label)) continue;
+          hits.push({ rel, line, label, snippet: value.replace(/\s+/g, " ").trim().slice(0, 120) });
+        }
+      }
+    }
   }
 
   for (const k of [...allow.lines, ...allow.words]) {
@@ -204,15 +307,16 @@ function main() {
   }
 
   if (hits.length) {
-    console.log(`Copy-rules check FAILED: ${hits.length} banned word(s) in user-visible text (${files} .tsx files).`);
+    console.log(`Copy-rules check FAILED: ${hits.length} banned word(s) in user-visible text (${files} .ts/.tsx files, ${rustFiles} .rs files).`);
     for (const h of hits) {
       console.log(`::error file=${h.rel},line=${h.line}::banned word "${h.label}" in UI copy (CONTRACT §4.8): "${h.snippet}"`);
     }
-    console.log('Replace per CONTRACT §4.8 ("Trash"/"junk" -> "Reclaimable caches", "Deep Purge" -> "Cache cleanup",');
-    console.log('top-bar button "Clean caches (F9)"). Genuine exceptions go in .github/copy-allowlist.txt as path:line[:word].');
+    console.log('Replace per CONTRACT §4.8 ("Trash"/"junk" -> "Reclaimable caches", "Deep Purge" -> "Cache cleanup") and');
+    console.log('§4.8.1 ("agent" -> say what the person sees: "Not available right now", "Sensors", "Nexum").');
+    console.log('Genuine exceptions go in .github/copy-allowlist.txt as path:line[:word]. "agent" has no exceptions.');
     process.exit(1);
   }
-  console.log(`Copy-rules check OK: ${files} .tsx files, ${BANNED.length} banned terms, ${allow.lines.size + allow.words.size} allow-list entries.`);
+  console.log(`Copy-rules check OK: ${files} .ts/.tsx files, ${rustFiles} .rs files, ${BANNED.length} banned terms, ${allow.lines.size + allow.words.size} allow-list entries.`);
 }
 
 main();

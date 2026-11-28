@@ -6,12 +6,21 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      # CONTRACT §7 item 14 (g). A rehearsal builds, signs and self-checks exactly what a
+      # pushed tag would, and publishes nothing (the sign / preview jobs only run for a
+      # real tag). Use a preview number no real tag will use, e.g. v1.2.0-preview.0.
+      rehearse_tag:
+        description: "Rehearsal: build as if this tag had been pushed (e.g. v1.2.0-preview.0). Makes the updater signature and checks it; publishes nothing."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: build-${{ github.ref }}
+  group: build-${{ github.ref }}${{ inputs.rehearse_tag && '-rehearsal' || '' }}
   cancel-in-progress: true
 
 env:
@@ -33,16 +42,31 @@ jobs:
           node-version: 22
           cache: npm
 
-      # MF-11: no network clients in Rust, C# or frontend sources (.github/network-allowlist.txt).
-      - name: No network code (MF-11)
+      # MF-11 / CONTRACT §7 item 12: the only network code is the updater module
+      # (src-tauri/src/updater.rs) plus the one line that registers its plugin. No
+      # network API in the frontend or the sidecar, no "updater:" permission for the
+      # WebView, no host but this repository on github.com (.github/network-allowlist.txt).
+      - name: No network code outside the updater (MF-11)
         run: node .github/scripts/check-network.mjs
 
       - name: Install frontend dependencies (typescript parser for the copy check)
         run: npm ci --ignore-scripts
 
-      # CONTRACT §4.8 / §7.4: banned words in UI copy (.github/copy-allowlist.txt).
+      # The checks check themselves: lexer, SemVer order, minisign verification against
+      # published test vectors, manifest rules, and each policy check on small fixtures.
+      - name: CI script self-test
+        run: node .github/scripts/selftest.mjs
+
+      # CONTRACT §4.8 / §7 items 4 and 13: banned words in UI copy, in .ts/.tsx text and
+      # (the word "agent") in Rust string literals (.github/copy-allowlist.txt).
       - name: UI copy rules (CONTRACT §4.8)
         run: node .github/scripts/check-copy.mjs
+
+      # CONTRACT §7 item 15 / §4.9: hex colours, retired dark-theme classes and the list
+      # of crimson primary buttons. Report-only (job summary) while the 1.2 redesign is
+      # integrated; add --enforce to make findings fail the job.
+      - name: Design hygiene (CONTRACT §4.9, report-only)
+        run: node .github/scripts/check-design.mjs
 
       # CONTRACT §0 / §1.7.1 / §7.9: v1.1 reads AMD ADL tuning data only. No ADL "_Set"
       # entry point anywhere, imports only in Tuning/AdlNative.cs, whitelist enforced.
@@ -82,7 +106,7 @@ jobs:
       # download: the script re-checks SHA-256 + Authenticode (Valid, CN=Intel Corporation)
       # on every run and fails the job otherwise. URL and hash: .github/presentmon.json.
       - name: Cache PresentMon download
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/presentmon
           key: presentmon-${{ hashFiles('.github/presentmon.json') }}
@@ -100,6 +124,37 @@ jobs:
           $v = (npx --no-install tauri --version) -replace '[^0-9.]', ''
           Write-Host "tauri-cli $v"
           if ([version]$v -lt [version]'2.9.3') { throw "@tauri-apps/cli $v is older than 2.9.3 (MF-8 item 2)" }
+          "TAURI_CLI_VERSION=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      # CONTRACT §2.15.2 / §7 item 14. Decides what this build is:
+      #   * not a release tag (branch, pull request, fork): built exactly as committed,
+      #     no update channel, no updater signature;
+      #   * tag vX.Y.Z or vX.Y.Z-preview.N: the app version is the tag's version, and,
+      #     only when the secret TAURI_SIGNING_PRIVATE_KEY exists, the build gets its
+      #     update channel (stable / preview) and updater artifacts (.sig);
+      #   * "Run workflow" with a rehearsal tag: planned exactly like that tag, so the
+      #     release path can be proven before a tag exists. Nothing is published.
+      # Only "is the secret set" reaches this step, never the secret itself. The step
+      # also fails early when the tag does not match the committed version or when
+      # docs/CHANGELOG.md has no section for it (the update dialog shows that text).
+      - name: Release plan (version, update channel, updater artifacts)
+        id: plan
+        shell: pwsh
+        env:
+          HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+          REHEARSE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.rehearse_tag || '' }}
+        run: |
+          $ref = $env:GITHUB_REF
+          $rehearsal = 'false'
+          if ($env:REHEARSE_TAG) {
+            # The script refuses anything that is not vX.Y.Z or vX.Y.Z-preview.N.
+            $ref = "refs/tags/$($env:REHEARSE_TAG)"
+            $rehearsal = 'true'
+            Write-Host "::notice::Rehearsal of tag $($env:REHEARSE_TAG): nothing from this run is published."
+          }
+          node .github/scripts/updater-manifest.mjs plan --ref $ref --has-key "$env:HAS_UPDATER_KEY" --cli-version "$env:TAURI_CLI_VERSION" --out build/tauri.release.conf.json
+          if ($LASTEXITCODE -ne 0) { throw "release plan failed" }
+          "rehearsal=$rehearsal" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
 
       - name: Typecheck & build frontend
         run: npm run build
@@ -206,12 +261,39 @@ jobs:
 
       # Bundle formats come from bundle.targets in src-tauri/tauri.conf.json (single
       # source of truth, documented in docs/SIGNING.md).
+      #
+      # Updater (CONTRACT §7 item 14): bundle.createUpdaterArtifacts is NOT in the committed
+      # config. For a release tag the plan step wrote build/tauri.release.conf.json
+      # (version, and createUpdaterArtifacts only when the signing key exists), passed
+      # here with --config. The key is in the environment of THIS step only and is never
+      # printed; without it the three variables are removed again, so the build is the
+      # same as before 1.2. NEXUM_UPDATE_CHANNEL is read at compile time (option_env!).
       - name: Build Nexum (exe + installers)
         shell: pwsh
+        env:
+          NEXUM_RELEASE_CONFIG: ${{ steps.plan.outputs.config }}
+          NEXUM_UPDATE_CHANNEL: ${{ steps.plan.outputs.channel }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ steps.plan.outputs.updater == 'true' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: |
           $targets = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).bundle.targets
           Write-Host "bundle.targets: $($targets -join ', ')"
-          npm run tauri -- build
+          $updater = '${{ steps.plan.outputs.updater }}' -eq 'true'
+          if (-not $updater) {
+            foreach ($n in 'NEXUM_UPDATE_CHANNEL', 'TAURI_SIGNING_PRIVATE_KEY', 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD') {
+              Remove-Item "Env:$n" -ErrorAction Ignore
+            }
+          }
+          Write-Host "update channel: $(if ($updater) { $env:NEXUM_UPDATE_CHANNEL } else { '(none)' }); updater artifacts: $updater"
+          if ($env:NEXUM_RELEASE_CONFIG) {
+            # --ci: never prompt. The key has no password; with --ci (or CI=true) the
+            # bundler uses an empty one instead of asking (tauri-cli bundle.rs).
+            $override = (Resolve-Path $env:NEXUM_RELEASE_CONFIG).Path
+            Write-Host "config override: $(Get-Content $override -Raw)"
+            npm run tauri -- build --ci --config $override
+          } else {
+            npm run tauri -- build
+          }
           if ($LASTEXITCODE -ne 0) { throw "tauri build failed" }
 
       - name: Collect artifacts
@@ -233,6 +315,46 @@ jobs:
           Copy-Item $pm.dest "out/portable/presentmon/$($pm.asset)" -Force
           Get-ChildItem src-tauri/target/release/bundle -Recurse -Include *.exe,*.msi | ForEach-Object { Copy-Item $_.FullName out/ }
           Get-ChildItem out -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+
+      # CONTRACT §2.15.2: a release build must produce Nexum_<version>_x64-setup.exe (the
+      # name is part of the updater signature). With the signing key, the bundler wrote
+      # <installer>.sig next to it: keep it apart from the installers (those go to
+      # SignPath) and prove here that it verifies against the public key in
+      # tauri.conf.json and is bound to this file name and version.
+      - name: Updater signature of the unsigned build (self-check)
+        if: steps.plan.outputs.release == 'true'
+        shell: pwsh
+        env:
+          # Only set during a key rotation (docs/SIGNING.md); empty otherwise.
+          NEXUM_UPDATE_VERIFY_PUBKEY: ${{ vars.NEXUM_UPDATE_VERIFY_PUBKEY }}
+        run: |
+          $name = '${{ steps.plan.outputs.installer }}'
+          $version = '${{ steps.plan.outputs.version }}'
+          if (-not (Test-Path "out/$name")) { throw "expected installer out/$name was not built (found: $((Get-ChildItem out -File).Name -join ', '))" }
+          if ('${{ steps.plan.outputs.updater }}' -ne 'true') { Write-Host "No updater signing key: no .sig for this build."; exit 0 }
+          $sig = @(Get-ChildItem src-tauri/target/release/bundle -Recurse -File -Filter "$name.sig")
+          if ($sig.Count -ne 1) { throw "expected exactly one $name.sig from the bundler, found $($sig.Count)" }
+          New-Item -ItemType Directory -Force out/updater | Out-Null
+          Copy-Item $sig[0].FullName "out/updater/$name.sig" -Force
+          node .github/scripts/updater-manifest.mjs verify-sig --file "out/$name" --sig "out/updater/$name.sig" --version $version
+          if ($LASTEXITCODE -ne 0) { throw "the updater signature of the build does not verify" }
+
+      # Rehearsal only (CONTRACT §7 item 14 (g)): the manifest update-manifest.yml would
+      # write for this installer, built from the local files and put through the same
+      # checks, except "the URL answers 200" (nothing is published, so it does not exist).
+      # A rehearsal without the signing key proves nothing about updates, so it fails.
+      - name: Update manifest rehearsal (not published)
+        if: steps.plan.outputs.rehearsal == 'true'
+        shell: pwsh
+        env:
+          REHEARSE_TAG: ${{ inputs.rehearse_tag }}
+          NEXUM_UPDATE_VERIFY_PUBKEY: ${{ vars.NEXUM_UPDATE_VERIFY_PUBKEY }}
+        run: |
+          if ('${{ steps.plan.outputs.updater }}' -ne 'true') { throw "a rehearsal needs the secret TAURI_SIGNING_PRIVATE_KEY" }
+          $name = '${{ steps.plan.outputs.installer }}'
+          node .github/scripts/updater-manifest.mjs rehearse --file "out/$name" --sig "out/updater/$name.sig" --tag $env:REHEARSE_TAG --out out/updater
+          if ($LASTEXITCODE -ne 0) { throw "the rehearsal manifest did not pass its checks" }
+          Get-Content out/updater/manifest.json -Raw | Write-Host
 
       # Unpacks the installers (7-Zip for NSIS incl. $PLUGINSDIR, msiexec /a for MSI)
       # and does a silent test install to capture uninstall.exe. Report-only.
@@ -297,7 +419,7 @@ jobs:
 
       - name: Upload portable binaries (unsigned)
         id: upload-portable
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: nexum-portable-unsigned
           path: out/portable/
@@ -305,7 +427,7 @@ jobs:
 
       - name: Upload installers (unsigned)
         id: upload-installers
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: nexum-installers-unsigned
           path: |
@@ -314,15 +436,38 @@ jobs:
           if-no-files-found: error
 
       - name: Upload SHA-256 list (unsigned)
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: nexum-sha256-unsigned
           path: build/hashes/SHA256SUMS-unsigned.txt
           if-no-files-found: error
 
+      # The updater signature of the UNSIGNED installer. The preview job publishes it;
+      # the sign job discards it, because Authenticode signing changes the installer.
+      - name: Upload updater signature (unsigned build)
+        if: steps.plan.outputs.updater == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: nexum-updater-signature-unsigned
+          path: out/updater/*.sig
+          if-no-files-found: error
+
+      - name: Upload rehearsal manifest (not published)
+        if: steps.plan.outputs.rehearsal == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: nexum-update-manifest-rehearsal
+          path: out/updater/manifest.json
+          if-no-files-found: error
+
     outputs:
       portable-artifact-id: ${{ steps.upload-portable.outputs.artifact-id }}
       installers-artifact-id: ${{ steps.upload-installers.outputs.artifact-id }}
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+      channel: ${{ steps.plan.outputs.channel }}
+      updater: ${{ steps.plan.outputs.updater }}
+      installer: ${{ steps.plan.outputs.installer }}
 
   # Code signing via SignPath Foundation (free for open source).
   # Runs only for release tags (not -preview tags) once the project is approved and the
@@ -343,9 +488,12 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+          cache: npm
 
+      # The signing policy needs a maintainer's approval, so wait longer than the
+      # action's default of 10 minutes (two requests, inside the job's 120 minutes).
       - name: Sign installers
-        uses: signpath/github-action-submit-signing-request@v1
+        uses: signpath/github-action-submit-signing-request@v2
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
@@ -354,10 +502,11 @@ jobs:
           artifact-configuration-slug: installers
           github-artifact-id: ${{ needs.build.outputs.installers-artifact-id }}
           wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3000
           output-artifact-directory: signed/installers
 
       - name: Sign portable binaries
-        uses: signpath/github-action-submit-signing-request@v1
+        uses: signpath/github-action-submit-signing-request@v2
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
@@ -366,6 +515,7 @@ jobs:
           artifact-configuration-slug: portable
           github-artifact-id: ${{ needs.build.outputs.portable-artifact-id }}
           wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3000
           output-artifact-directory: signed/portable
 
       - name: Expand signed installers for inspection
@@ -400,6 +550,52 @@ jobs:
           ./.github/scripts/check-presentmon-shipped.ps1 -Label 'PresentMon (signed release)' -Path signed, build/inspect-signed -Require signed/portable, build/inspect-signed
           if ($LASTEXITCODE -ne 0) { throw "PresentMon check failed - not publishing" }
 
+      # CONTRACT §2.15.2 "Signature" / §7 item 14 (d). Authenticode signing changed the
+      # installer's bytes, so the updater signature made by the build no longer matches
+      # and is never downloaded here. A new one is made over the SIGNED file, after all
+      # the checks above, under the name Nexum_<version>_x64-setup.exe (the name and the
+      # version go into the signature's trusted comment; the app binds the offered
+      # version to them). The key is in the environment of this one step only.
+      - name: Install the Tauri CLI (for the updater signature)
+        if: needs.build.outputs.updater == 'true'
+        run: npm ci --ignore-scripts
+
+      - name: Updater signature over the SIGNED installer
+        if: needs.build.outputs.updater == 'true'
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          NEXUM_VERSION: ${{ needs.build.outputs.version }}
+          NEXUM_INSTALLER: ${{ needs.build.outputs.installer }}
+        run: |
+          $file = Join-Path 'signed/installers' $env:NEXUM_INSTALLER
+          if (-not (Test-Path $file)) { throw "SignPath did not return $env:NEXUM_INSTALLER (found: $((Get-ChildItem signed/installers -File).Name -join ', '))" }
+          Remove-Item "$file.sig" -ErrorAction Ignore
+          # stdin is closed, so the CLI cannot wait for a password: the key has none
+          # (tauri-cli assumes an empty password when stdin is not a terminal).
+          $null | node node_modules/@tauri-apps/cli/tauri.js signer sign --app-version $env:NEXUM_VERSION $file | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "tauri signer sign failed (exit $LASTEXITCODE)" }
+          if (-not (Test-Path "$file.sig")) { throw "tauri signer sign did not write $file.sig" }
+
+      # The self-check runs WITHOUT the key: signature, signing key = the public key in
+      # tauri.conf.json, signed file name and signed version.
+      - name: Updater signature self-check
+        if: needs.build.outputs.updater == 'true'
+        shell: pwsh
+        env:
+          # Only set during a key rotation (docs/SIGNING.md); empty otherwise.
+          NEXUM_UPDATE_VERIFY_PUBKEY: ${{ vars.NEXUM_UPDATE_VERIFY_PUBKEY }}
+        run: |
+          $file = Join-Path 'signed/installers' '${{ needs.build.outputs.installer }}'
+          node .github/scripts/updater-manifest.mjs verify-sig --file $file --sig "$file.sig" --version '${{ needs.build.outputs.version }}'
+          if ($LASTEXITCODE -ne 0) { throw "the updater signature does not verify - not publishing" }
+
+      - name: No updater signature (warning)
+        if: needs.build.outputs.updater != 'true'
+        run: echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set. This release has no update channel and no updater signature; installed copies will not be offered it from inside the app."
+
       - name: Zip portable build
         shell: pwsh
         run: Compress-Archive -Path signed/portable/* -DestinationPath "signed/Nexum_${{ github.ref_name }}_x64-portable.zip"
@@ -408,23 +604,42 @@ jobs:
       - name: SHA-256 hashes and release notes
         shell: pwsh
         run: |
-          $files = @(Get-ChildItem signed/installers -File) + @(Get-ChildItem signed -File -Filter 'Nexum_*_x64-portable.zip')
+          $files = @(Get-ChildItem signed/installers -File | Where-Object Extension -ne '.sig') + @(Get-ChildItem signed -File -Filter 'Nexum_*_x64-portable.zip')
           $lines = foreach ($f in $files) { "{0}  {1}" -f (Get-FileHash -Algorithm SHA256 -LiteralPath $f.FullName).Hash.ToLowerInvariant(), $f.Name }
           $lines | Set-Content -Encoding ascii signed/SHA256SUMS.txt
           $lines | ForEach-Object { Write-Host $_ }
           $repo = "${{ github.server_url }}/${{ github.repository }}"
+          node .github/scripts/updater-manifest.mjs notes --version '${{ needs.build.outputs.version }}' --out signed/CHANGES.txt
+          if ($LASTEXITCODE -ne 0) { throw "docs/CHANGELOG.md has no usable section for this version" }
+          $changes = (Get-Content signed/CHANGES.txt -Raw -Encoding utf8).Trim()
+          $updater = if ('${{ needs.build.outputs.updater }}' -eq 'true') {
+            "**Updating from inside Nexum:** installed copies are offered this version once this release is published (Settings > Updates > Check now). The ``.sig`` file next to the installer is its updater signature; Nexum verifies it before anything runs."
+          } else {
+            "This release was built without the updater signing key, so it is not offered from inside Nexum. Download it here."
+          }
           @(
+            "## What changed",
+            "",
+            $changes,
+            "",
+            "## Files",
+            "",
             "Signed release built from tag ``${{ github.ref_name }}`` (commit ${{ github.sha }}) by GitHub Actions.",
             "",
             "Verify your download before running it: ``Get-FileHash -Algorithm SHA256 <file>`` must match ``SHA256SUMS.txt``, and ``Get-AuthenticodeSignature <file>`` must report ``Valid``.",
             "",
             '```text', ($lines -join "`n"), '```',
             "",
+            $updater,
+            "",
             "Code signing policy: $repo#code-signing-policy · Security: $repo/blob/main/SECURITY.md"
           ) -join "`n" | Set-Content -Encoding utf8 signed/RELEASE_NOTES.md
 
+      # A DRAFT: nothing points at it yet. When a maintainer publishes it, the "Update
+      # manifests" workflow (update-manifest.yml) verifies the public files and only then
+      # writes stable.json and preview.json (CONTRACT §2.15.2 "Publishing order").
       - name: Publish GitHub release (draft)
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           draft: true
           body_path: signed/RELEASE_NOTES.md
@@ -445,29 +660,67 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v8
         with:
           name: nexum-installers-unsigned
           path: preview/installers
 
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           name: nexum-portable-unsigned
           path: preview/portable
 
+      # CONTRACT §7 item 14 (c): the preview installer is not changed after the build, so
+      # the updater signature the bundler made is the one that is published.
+      - uses: actions/download-artifact@v8
+        if: needs.build.outputs.updater == 'true'
+        with:
+          name: nexum-updater-signature-unsigned
+          path: preview/updater
+
       - name: Label files, zip portable, hash, write notes
         shell: pwsh
+        env:
+          # Only set during a key rotation (docs/SIGNING.md); empty otherwise.
+          NEXUM_UPDATE_VERIFY_PUBKEY: ${{ vars.NEXUM_UPDATE_VERIFY_PUBKEY }}
         run: |
           $tag = "${{ github.ref_name }}"
+          $version = '${{ needs.build.outputs.version }}'
+          $installer = '${{ needs.build.outputs.installer }}'
+          $updater = '${{ needs.build.outputs.updater }}' -eq 'true'
           New-Item -ItemType Directory -Force release | Out-Null
+          if ($updater) {
+            # Checked under its build name (the name is part of the signature), before
+            # the asset is renamed. Renaming does not change the bytes.
+            node .github/scripts/updater-manifest.mjs verify-sig --file "preview/installers/$installer" --sig "preview/updater/$installer.sig" --version $version
+            if ($LASTEXITCODE -ne 0) { throw "the updater signature does not verify - not publishing" }
+          }
           Get-ChildItem preview/installers -File | ForEach-Object {
             Copy-Item $_.FullName ("release/{0}-UNSIGNED-PREVIEW{1}" -f $_.BaseName, $_.Extension)
           }
+          if ($updater) {
+            $base = [IO.Path]::GetFileNameWithoutExtension($installer)
+            Copy-Item "preview/updater/$installer.sig" "release/$base-UNSIGNED-PREVIEW.exe.sig"
+          }
           Compress-Archive -Path preview/portable/* -DestinationPath "release/Nexum_${tag}_x64-portable-UNSIGNED-PREVIEW.zip"
-          $lines = foreach ($f in Get-ChildItem release -File) { "{0}  {1}" -f (Get-FileHash -Algorithm SHA256 -LiteralPath $f.FullName).Hash.ToLowerInvariant(), $f.Name }
+          $lines = foreach ($f in (Get-ChildItem release -File | Where-Object Extension -ne '.sig')) { "{0}  {1}" -f (Get-FileHash -Algorithm SHA256 -LiteralPath $f.FullName).Hash.ToLowerInvariant(), $f.Name }
           $lines | Set-Content -Encoding ascii release/SHA256SUMS.txt
           $lines | ForEach-Object { Write-Host $_ }
           $repo = "${{ github.server_url }}/${{ github.repository }}"
+          node .github/scripts/updater-manifest.mjs notes --version $version --out preview/CHANGES.txt
+          if ($LASTEXITCODE -ne 0) { throw "docs/CHANGELOG.md has no usable section for this version" }
+          $changes = (Get-Content preview/CHANGES.txt -Raw -Encoding utf8).Trim()
+          $updaterNote = if ($updater) {
+            "**Updating from inside Nexum:** installed copies that get preview versions are offered this version (Settings > Updates > Check now). The ``.sig`` file is the installer's updater signature; Nexum verifies it before anything runs. Because the installer is not code-signed, Windows may still warn about it or block it."
+          } else {
+            "This build was made without the updater signing key, so it is not offered from inside Nexum."
+          }
           @(
             "> [!WARNING]",
             "> **Preview — unsigned — will not run with Smart App Control on.**",
@@ -475,17 +728,25 @@ jobs:
             "> They are published so the project has a public release history (a SignPath Foundation requirement).",
             "> Test them in a virtual machine or on a PC with Smart App Control off. Signed releases follow once code signing is approved.",
             "",
+            "## What changed",
+            "",
+            $changes,
+            "",
+            "## Files",
+            "",
             "Built from tag ``$tag`` (commit ${{ github.sha }}) by GitHub Actions, workflow run ${{ github.run_id }}.",
             "Nexum runs as Administrator, can control fans and, only if you turn frame capture on, starts the bundled Intel-signed PresentMon: read the [README]($repo#readme) and [SECURITY.md]($repo/blob/main/SECURITY.md) first.",
             "",
             "SHA-256:",
             '```text', ($lines -join "`n"), '```',
             "",
+            $updaterNote,
+            "",
             "Code signing policy: $repo#code-signing-policy"
           ) -join "`n" | Set-Content -Encoding utf8 release/RELEASE_NOTES.md
 
       - name: Publish pre-release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: "Nexum ${{ github.ref_name }} — Preview — unsigned — will not run with Smart App Control on"
           prerelease: true
@@ -494,6 +755,20 @@ jobs:
           body_path: release/RELEASE_NOTES.md
           files: |
             release/*.exe
+            release/*.exe.sig
             release/*.msi
             release/*.zip
             release/SHA256SUMS.txt
+
+  # CONTRACT §7 item 14 (c): only AFTER the pre-release is public, verify its public
+  # files and write preview.json to the "updates" release. (A release made with the
+  # workflow token does not fire the "release: published" event, so it is called here.)
+  preview-manifest:
+    name: Update manifest (preview channel)
+    needs: [build, preview]
+    if: needs.build.outputs.updater == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/update-manifest.yml
+    with:
+      tag: ${{ github.ref_name }}

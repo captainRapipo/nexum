@@ -1,11 +1,16 @@
-# Copy-rules allow-list (read by .github/scripts/check-copy.mjs, CONTRACT §4.8 / §7.4).
+# Copy-rules allow-list (read by .github/scripts/check-copy.mjs, CONTRACT §4.8 / §7 items 4 and 13).
 #
 # Banned in user-visible text (case-insensitive, whole word): boost, optimize/optimise,
 # speed up, free RAM, junk, trash, purge (as a button/CTA or heading), deep purge,
-# outdated. Identifiers in code are exempt automatically.
+# outdated, and (since 1.2) agent. Checked in src-frontend/**/*.ts and *.tsx; "agent" is
+# also checked in the string literals of src-tauri/src/**/*.rs. Identifiers in code and
+# literals without spaces ("agent-status", "nexum-agent.exe") are exempt automatically.
 #
 # Format, one entry per line, followed by a comment saying why it is acceptable:
 #   <repo-relative path>:<line>           allow every banned word on that line
 #   <repo-relative path>:<line>:<word>    allow one banned word on that line
 # Example:
 #   src-frontend/components/system/CpuTab.tsx:40:boost   # AMD "Precision Boost" is a CPU feature name
+#
+# "agent" has NO exceptions (CONTRACT §7 item 13): a line entry does not excuse it, and a
+# word entry naming it fails the check. Say what the person sees instead (CONTRACT §4.8.1).

@@ -287,6 +287,24 @@ Each item names its evidence. The **release gate** is all of MF-1 to MF-13 merge
 - **GPU tuning step 0: probe + read-only panel:** in v1.1, read-only only (`tuningGet`, `tuningProbe write:false`, Cooling → GPU tuning tab; CI blocks any ADL `_Set` entry point). Deferred: the probe's `write:true` path, waiting for the owner's consent (Q5); both the agent and Rust reject it.
 - **Cleaner extras:** in v1.1 (top-50 drill-down per category; Recycle Bin age filter 1/14/30/60 days, default 30, current user's bin only).
 
+**v1.1 shipped.** The v1.1 round is complete on `main` (commit `b274964`, 2026-11-27, CI green). No separate 1.1
+release was published; the on-rig gates of §4.3 are still open and are carried into the 1.2 release gate.
+
+**v1.2.0 status (CONTRACT 1.2.0, 2026-11-27).** Version 1.2.0 is an owner-requested round. It is not one of the rows
+of the "v1.2+" table below, whose items keep their order and move to later versions.
+
+- **Redesign:** in v1.2.0. A light theme in white with one crimson accent (Nexum Crimson), a sidebar and toolbar in
+  place of the top bar, header strip and status bar, native window frame, Inter with tabular figures, status always as
+  icon + word + tint. The design package is in [`design/`](design/) (`SPEC.md`, `RATIONALE.md`, `tokens.css`,
+  `contrast.txt`, logo sources); CONTRACT §4.6.1, §4.7, §4.9 and §4.10.3 are binding. This supersedes the dark look
+  described in §6 of this document and in `DESIGN-SPEC.md`; the rules of §6.1 (status separate from series colours),
+  §6.5 (pages and keys) and §6.6 (copy rules) still hold. Light theme only; dark mode is not in 1.2.
+- **In-app updates:** in v1.2.0, by owner decision (see the note on the "Auto-updater" row under "Not doing").
+  Opt-in check, click to install, signature-verified, stable and preview channels (CONTRACT §2.15). Open before the
+  first 1.2 release: the manual updater gate of CONTRACT §7 item 18 on a real PC or VM.
+- **Plain wording:** in v1.2.0. Nothing a user can read says "agent"; one banner ("Nexum can't read sensors right
+  now.") appears only after automatic restarts have failed (CONTRACT §2.3.1, §4.8.1). CI checks the wording.
+
 ### v1.2+
 
 | Item | What | Why | Effort | Depends on | Contract changes |
@@ -319,7 +337,7 @@ Each item names its evidence. The **release gate** is all of MF-1 to MF-13 merge
 | AMD TDC limit | ADLX itself says "not currently implemented in a production application" (oc report, ADLX header; `[Unsourced]`: no URL was given, so cite the header line or drop the quote. The decision stands regardless, since Nexum uses no ADLX code) |
 | WinRing0 or any bundled kernel driver other than the user-installed PawnIO | CVE-2020-14979 ([NVD](https://nvd.nist.gov/vuln/detail/CVE-2020-14979)); see MF-3 |
 | Localhost HTTP/WebSocket API (DESIGN-SPEC §4) | DriverHub bug class ([mrbruh.com](https://mrbruh.com/asusdriverhub/)) |
-| Auto-updater that downloads and runs installers | Same; users update from GitHub Releases using published hashes |
+| Auto-updater that downloads and runs installers | Same; users update from GitHub Releases using published hashes. **Owner decision, 1.2.0 (2026-11-27):** in-app updates were added at the owner's request, as a must-have. What stays "not doing" is the silent kind. Nexum checks only after the user has agreed (it makes no request until the first-start question is answered), installs only after a click, accepts only an installer from this repository's GitHub Releases that is signed with Nexum's own update key and is strictly newer than the running version, and stages it where only administrators can write ([`CONTRACT.md`](../CONTRACT.md) §2.15, [`SECURITY.md`](../SECURITY.md#in-app-updates)). Updating by hand from GitHub Releases with the published hashes stays fully supported. |
 | Telemetry, accounts, cloud sync, bundled offers | [Microsoft PUA criteria](https://learn.microsoft.com/en-us/defender-xdr/criteria); the CCleaner history above |
 | Startup App Manager (DESIGN-SPEC §9) | Duplicates Task Manager → Startup apps and drifts toward "speed up your PC" framing |
 | Silently installing PawnIO | Kernel drivers require explicit consent (MF-3) |

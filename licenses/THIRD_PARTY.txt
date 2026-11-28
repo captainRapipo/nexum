@@ -63,9 +63,46 @@ Inter typeface (@fontsource/inter)      OFL-1.1       OFL-1.1-Inter.txt
   https://github.com/rsms/inter
 JetBrains Mono (@fontsource/jetbrains-mono)  OFL-1.1  OFL-1.1-JetBrainsMono.txt
   https://github.com/JetBrains/JetBrainsMono
-Tauri 2.x and plugins (shell, single-instance, notification) and the other Rust
-crates listed in src-tauri/Cargo.lock   MIT or Apache-2.0 (per crate)
+Tauri 2.x and plugins (shell, single-instance, notification, updater) and the other
+Rust crates listed in src-tauri/Cargo.lock   MIT or Apache-2.0 (per crate), except
+the crates named below
   https://github.com/tauri-apps/tauri
+
+In-app updater (since Nexum 1.2): tauri-plugin-updater 2.14.1   MIT or Apache-2.0
+  https://github.com/tauri-apps/plugins-workspace
+  Used from Rust only, to check for and download Nexum's own updates from GitHub.
+  It brings an HTTPS client and a signature verifier into Nexum.exe. Versions are
+  the ones resolved in src-tauri/Cargo.lock:
+
+  minisign-verify 0.3.0            MIT                 rust-crates/minisign-verify-LICENSE.txt
+    https://github.com/jedisct1/rust-minisign-verify   (verifies every update)
+  reqwest 0.13.5                   MIT or Apache-2.0
+    https://github.com/seanmonstar/reqwest
+  hyper 1.13.0, hyper-util 0.1.21  MIT
+    https://github.com/hyperium/hyper
+  hyper-rustls 0.27.10             Apache-2.0, ISC or MIT
+    https://github.com/rustls/hyper-rustls
+  tokio-rustls 0.26.6              MIT or Apache-2.0
+    https://github.com/rustls/tokio-rustls
+  rustls 0.23.46                   Apache-2.0, ISC or MIT
+    https://github.com/rustls/rustls
+  rustls-pki-types 1.16.0, rustls-platform-verifier 0.7.1,
+  rustls-native-certs 0.8.5        MIT or Apache-2.0 (rustls-native-certs: also ISC)
+    https://github.com/rustls
+  rustls-webpki 0.103.17           ISC                 rust-crates/rustls-webpki-LICENSE.txt
+    https://github.com/rustls/webpki
+  ring 0.17.14                     Apache-2.0 and ISC  rust-crates/ring-LICENSE.txt,
+    https://github.com/briansmith/ring                 ring-LICENSE-BoringSSL.txt,
+                                                       ring-LICENSE-other-bits.txt
+  untrusted 0.9.0                  ISC                 rust-crates/untrusted-LICENSE.txt
+    https://github.com/briansmith/untrusted
+  subtle 2.6.1                     BSD-3-Clause        rust-crates/subtle-LICENSE.txt
+    https://github.com/dalek-cryptography/subtle
+  zeroize 1.9.2                    Apache-2.0 or MIT
+    https://github.com/RustCrypto/utils
+  schannel 0.1.30                  MIT
+    https://github.com/steffengy/schannel-rs
+  semver 1.0.28, base64 0.23.1     MIT or Apache-2.0
 
 
 4. NOT SHIPPED: USED AS A REFERENCE OR CALLED ON THE USER'S SYSTEM

@@ -1,0 +1,147 @@
+name: Update manifests
+
+# Writes the files the in-app updater reads (CONTRACT §2.15.2, §7 item 14):
+#
+#   https://github.com/captainRapipo/nexum/releases/download/updates/stable.json
+#   https://github.com/captainRapipo/nexum/releases/download/updates/preview.json
+#
+# Both are assets of ONE permanent pre-release tagged "updates". stable.json describes
+# the newest stable release, preview.json the newest release of any kind.
+#
+# A manifest is written only AFTER the release it points to is public:
+#   * a preview release is published by build.yml, which then calls this workflow;
+#   * a signed release is a draft until a maintainer publishes it, which fires the
+#     "release: published" event below;
+#   * "Run workflow" (workflow_dispatch) repairs or re-creates a manifest by hand.
+#
+# Before anything is uploaded the installer is downloaded from its public URL and its
+# updater signature is verified against the public key in src-tauri/tauri.conf.json,
+# exactly as the app does. This workflow never sees the signing key.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published release tag to describe (vX.Y.Z or vX.Y.Z-preview.N)"
+        required: true
+        type: string
+      force:
+        description: "Replace a NEWER published manifest with this older version (withdraw a bad release)"
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      tag:
+        description: "Published release tag to describe"
+        required: true
+        type: string
+      force:
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  manifest:
+    name: Verify the release and write its update manifest
+    # Updates only ever come from the upstream repository (the app has its URL built in),
+    # so a fork never writes manifests. The "updates" release itself is ignored.
+    if: >-
+      github.repository == 'captainRapipo/nexum' &&
+      (inputs.tag != '' || (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    # One writer at a time; never cancel a half-finished upload.
+    concurrency:
+      group: update-manifests
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+      FORCE: ${{ inputs.force == true }}
+      # Only set during a key rotation (docs/SIGNING.md); empty otherwise.
+      NEXUM_UPDATE_VERIFY_PUBKEY: ${{ vars.NEXUM_UPDATE_VERIFY_PUBKEY }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Read the published release
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]+)?$ ]]; then
+            echo "::error::'$TAG' is not a release tag (vX.Y.Z or vX.Y.Z-preview.N)"
+            exit 1
+          fi
+          # Drafts are not returned by tag, so a draft can never be referenced.
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > "$RUNNER_TEMP/release.json"
+
+      # Downloads the installer and its .sig from the public release URLs, verifies the
+      # signature, the signing key, the signed file name and the signed version, and
+      # writes the manifest (notes come from docs/CHANGELOG.md).
+      - name: Build the manifest from the public files
+        id: make
+        run: node .github/scripts/updater-manifest.mjs make --release "$RUNNER_TEMP/release.json" --out "$RUNNER_TEMP/manifest"
+
+      # CONTRACT §7 item 14 (e), on the finished file: JSON shape, version = tag, both
+      # platform keys identical, URL prefix, URL answers 200, signed name and version,
+      # and the signature of the downloaded bytes against the app's public key.
+      - name: Self-check the manifest
+        run: node .github/scripts/updater-manifest.mjs verify --manifest "$RUNNER_TEMP/manifest/manifest.json" --tag "$TAG"
+
+      - name: Create the "updates" release if it does not exist
+        run: |
+          if gh release view updates --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "The 'updates' release exists."
+          else
+            gh release create updates --repo "$GITHUB_REPOSITORY" --prerelease --latest=false \
+              --title "Update manifests" \
+              --notes "stable.json and preview.json are read by Nexum's built-in update check. They are not downloads. Get Nexum from the newest release on the releases page."
+          fi
+
+      - name: Upload the manifest to its channel(s)
+        env:
+          CHANNELS: ${{ steps.make.outputs.channels }}
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/manifest/manifest.json"
+          published=$(gh release view updates --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          for ch in $CHANNELS; do
+            cur="$RUNNER_TEMP/current/$ch.json"
+            rm -rf "$RUNNER_TEMP/current"; mkdir -p "$RUNNER_TEMP/current"
+            if grep -qx "$ch.json" <<< "$published"; then
+              gh release download updates --repo "$GITHUB_REPOSITORY" --pattern "$ch.json" --dir "$RUNNER_TEMP/current"
+            fi
+            # Exit code 3 = the published manifest is newer: keep it.
+            rc=0
+            node .github/scripts/updater-manifest.mjs gate --manifest "$src" --current "$cur" --channel "$ch" --force "$FORCE" || rc=$?
+            if [ "$rc" -eq 3 ]; then
+              echo "- \`$ch.json\`: kept (a newer version is published)" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            elif [ "$rc" -ne 0 ]; then
+              exit "$rc"
+            fi
+            mkdir -p "$RUNNER_TEMP/upload"
+            cp "$src" "$RUNNER_TEMP/upload/$ch.json"
+            gh release upload updates "$RUNNER_TEMP/upload/$ch.json" --clobber --repo "$GITHUB_REPOSITORY"
+            # What the app will fetch must now be exactly this file.
+            url="https://github.com/$GITHUB_REPOSITORY/releases/download/updates/$ch.json"
+            ok=0
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              if curl -fsSL --retry 2 -o "$RUNNER_TEMP/served.json" "$url" && cmp -s "$RUNNER_TEMP/served.json" "$src"; then ok=1; break; fi
+              sleep 6
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "::error::$url does not serve the uploaded manifest"
+              exit 1
+            fi
+            echo "- \`$ch.json\` now offers **${TAG#v}** ($url)" >> "$GITHUB_STEP_SUMMARY"
+          done

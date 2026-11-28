@@ -1,14 +1,21 @@
-# MF-11 network allow-list (read by .github/scripts/check-network.mjs).
+# Network allow-list (read by .github/scripts/check-network.mjs; CONTRACT §7 item 12).
 #
-# Nexum has no network code: no telemetry, no analytics, no update checks, no
-# localhost listeners. CI fails on any network-client API in src-tauri/src/**,
-# nexum-agent/**/*.cs and src-frontend/** (reqwest, ureq, hyper, HttpClient,
-# WebClient, HttpWebRequest, TcpClient, TcpListener, TcpStream, UdpClient,
-# UdpSocket, HttpListener, WebSocket, XMLHttpRequest, EventSource(, sendBeacon,
-# fetch(, axios) unless the exact line is listed here.
+# Nexum makes exactly one kind of network request: the update check, and the update
+# download after the user clicks Install (CONTRACT §2.15). All of that code lives in one
+# file. CI fails on any network-client API in src-tauri/src/**, nexum-agent/**/*.cs and
+# src-frontend/** (reqwest, ureq, hyper, HttpClient, WebClient, HttpWebRequest, TcpClient,
+# TcpListener, TcpStream, UdpClient, UdpSocket, HttpListener, WebSocket, XMLHttpRequest,
+# EventSource(, sendBeacon, fetch(, axios, tauri_plugin_updater, updater_builder) outside
+# the entries below.
 #
-# Format: one entry per line, "<repo-relative path>:<line number>", followed by a
-# comment saying why the use is not network traffic or who approved it, e.g.
-#   src-frontend/lib/example.ts:12   # reads a bundled asset via fetch("/x.json"); approved in PR #NN
+# This list can hold exactly two entries, and the script rejects anything else:
 #
-# An entry needs the maintainer's approval in review. Keep this list empty.
+#   src-tauri/src/updater.rs            the updater module, as a whole file
+#   src-tauri/src/lib.rs:<line>         the ONE line that registers the updater plugin
+#                                       (.plugin(tauri_plugin_updater::Builder::new().build()))
+#
+# The frontend and the sidecar cannot be allow-listed. When the registration line moves,
+# the check fails and prints the new line number to write here.
+
+src-tauri/src/updater.rs
+src-tauri/src/lib.rs:236              # .plugin(tauri_plugin_updater::Builder::new().build())
