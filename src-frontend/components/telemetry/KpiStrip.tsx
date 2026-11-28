@@ -278,7 +278,8 @@ function KpiCell({ kpi }: { kpi: Kpi }) {
       {...interactive}
       className={cn(
         "min-w-0 border-l border-divider px-[18px] pb-3 pt-3.5 first:border-l-0 tight:px-3.5 tight:pb-2.5 tight:pt-3",
-        clickable && "focus-inset transition-colors duration-[80ms] hover:bg-hover active:bg-pressed",
+        // The focus ring follows the card's corners when the cell is the first or the last one.
+        clickable && "focus-inset transition-colors duration-[80ms] first:rounded-l-card last:rounded-r-card hover:bg-hover active:bg-pressed",
       )}
     >
       {/* Fixed height: an 18 px tag in one cell must not push that cell's figures below its neighbours'. */}
