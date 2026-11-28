@@ -12,8 +12,11 @@
     <Version>1.1.0</Version>
     <AssemblyVersion>1.1.0.0</AssemblyVersion>
     <FileVersion>1.1.0.0</FileVersion>
-    <Product>Nexum Agent</Product>
-    <Description>Nexum hardware telemetry sidecar (NDJSON over stdio)</Description>
+    <!-- What Windows shows for this file (Task Manager, file properties): plain words, no internal names. -->
+    <Product>Nexum</Product>
+    <Company>Nexum</Company>
+    <AssemblyTitle>Nexum sensor service</AssemblyTitle>
+    <Description>Reads hardware sensors for Nexum</Description>
 
     <!-- Runs asInvoker; the elevated Tauri parent passes its token to the child. -->
     <ApplicationManifest>app.manifest</ApplicationManifest>
