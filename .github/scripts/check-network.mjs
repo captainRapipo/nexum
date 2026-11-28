@@ -12,7 +12,13 @@
 //      grants an "updater:" permission, package.json lists @tauri-apps/plugin-updater,
 //      or the CSP connect-src is wider than 'self' ipc: http://ipc.localhost;
 //   4. the updater names a host other than this repository on github.com: a URL in a
-//      string literal of updater.rs (outside tests), or an endpoint in tauri.conf.json.
+//      string literal of updater.rs (outside tests), or an endpoint in tauri.conf.json;
+//   5. the updater's safety switches are weakened: plugins.updater in tauri.conf.json
+//      lacks "requireSignedVersion": true, turns on a "dangerous…" switch or
+//      "allowDowngrades", or carries any other key; the plugin is registered with
+//      anything but a plain Builder::new().build() (for example another public key);
+//      or updater.rs calls the plugin's own installer (it writes to %TEMP%), overrides
+//      the public key or switches certificate checks off.
 //
 // The frontend and the sidecar stay at zero: nothing there can be allow-listed.
 //
@@ -31,6 +37,25 @@ const ALLOWLIST = join(root, ".github", "network-allowlist.txt");
 const UPDATER_MODULE = "src-tauri/src/updater.rs";
 const PLUGIN_HOST_FILE = "src-tauri/src/lib.rs";
 const PLUGIN_REGISTRATION = /\btauri_plugin_updater::Builder\b/;
+// The registration must be exactly this: no .pubkey(…), no .installer_args(…), no
+// .default_version_comparator(…) set at registration (a trailing line comment is fine).
+const PLUGIN_REGISTRATION_EXACT = /^\s*\.plugin\(tauri_plugin_updater::Builder::new\(\)\.build\(\)\)\s*(\/\/.*)?$/;
+// plugins.updater in tauri.conf.json (CONTRACT §2.15.2): the only keys it may hold, the
+// one that must be true, and the ones that may only be absent or false.
+const UPDATER_CONFIG_KEYS = ["pubkey", "endpoints", "requireSignedVersion"];
+const UPDATER_CONFIG_MUST_BE_OFF = [
+  "dangerousInsecureTransportProtocol", "dangerousAcceptInvalidCerts", "dangerousAcceptInvalidHostnames", "allowDowngrades",
+];
+// Calls the updater module must never make (code of updater.rs outside tests and
+// comments; CONTRACT §2.15.5).
+const UPDATER_FORBIDDEN_CALLS = [
+  [/\bdownload_and_install\b/, "the plugin's own installer writes the download to %TEMP%, which non-elevated processes can write to"],
+  [/\.install\s*\(/, "the plugin's own installer writes the download to %TEMP%, which non-elevated processes can write to"],
+  [/\.pubkey\s*\(/, "the public key is the one in tauri.conf.json and is never overridden"],
+  [/\bdanger_accept_invalid_(certs|hostnames)\b/, "certificate checks are never switched off"],
+  [/\bdangerous_[a-z_]+\b/, "the plugin's dangerous switches are never used"],
+  [/\ballow_downgrades\b/, "downgrades are never allowed"],
+];
 // The only place updates come from (CONTRACT §2.15.1 rule 1, UPDATE_REPO_URL in types.ts).
 const UPDATE_REPO_URL = "https://github.com/captainRapipo/nexum";
 const UPDATE_ENDPOINT_PREFIX = `${UPDATE_REPO_URL}/releases/download/updates/`;
@@ -196,6 +221,29 @@ function checkWebViewSurface() {
         }
       }
     }
+    // 5. The plugin's safety switches.
+    const updater = conf.plugins?.updater;
+    if (updater !== undefined) {
+      if (updater === null || typeof updater !== "object" || Array.isArray(updater)) {
+        problem("src-tauri/tauri.conf.json", 1, "plugins.updater is not an object");
+      } else {
+        if (updater.requireSignedVersion !== true) {
+          problem("src-tauri/tauri.conf.json", 1,
+            'plugins.updater.requireSignedVersion must be true: an installer whose signature does not carry the announced version is refused (CONTRACT §2.15.5 step 2)');
+        }
+        for (const key of UPDATER_CONFIG_MUST_BE_OFF) {
+          if (updater[key] !== undefined && updater[key] !== false) {
+            problem("src-tauri/tauri.conf.json", 1, `plugins.updater.${key} must stay off (CONTRACT §2.15.2)`);
+          }
+        }
+        for (const key of Object.keys(updater)) {
+          if (!UPDATER_CONFIG_KEYS.includes(key) && !UPDATER_CONFIG_MUST_BE_OFF.includes(key)) {
+            problem("src-tauri/tauri.conf.json", 1,
+              `plugins.updater.${key} is not allowed: the only keys are ${UPDATER_CONFIG_KEYS.join(", ")} (CONTRACT §2.15.2)`);
+          }
+        }
+      }
+    }
   }
 }
 
@@ -204,7 +252,17 @@ function checkUpdaterHosts() {
   const abs = join(root, UPDATER_MODULE);
   if (!existsSync(abs)) return false;
   const text = readFileSync(abs, "utf8");
-  const { strings, tests } = lexRust(text);
+  const { code, strings, tests } = lexRust(text);
+  // 5. Calls the updater never makes. `code` has comments and string bodies blanked.
+  code.split(/\r?\n/).reduce((offset, line, i) => {
+    if (!inRanges(offset, tests)) {
+      for (const [re, why] of UPDATER_FORBIDDEN_CALLS) {
+        const m = re.exec(line);
+        if (m) problem(UPDATER_MODULE, i + 1, `the updater must not use "${m[0].trim()}": ${why} (CONTRACT §2.15.5)`);
+      }
+    }
+    return offset + line.length + 1;
+  }, 0);
   for (const lit of strings) {
     if (inRanges(lit.start, tests)) continue;
     for (const m of lit.value.matchAll(/[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>\\)]+/g)) {
@@ -246,6 +304,8 @@ function main() {
             // The allow-listed line may be the plugin registration and nothing else.
             if (label !== "tauri_plugin_updater" || !PLUGIN_REGISTRATION.test(text)) {
               problem(rel, i + 1, `the allow-listed line is not the updater plugin registration (found "${label}"): ${text.trim().slice(0, 160)}`);
+            } else if (!PLUGIN_REGISTRATION_EXACT.test(text)) {
+              problem(rel, i + 1, `the updater plugin must be registered as .plugin(tauri_plugin_updater::Builder::new().build()) and nothing more (no other public key, arguments or version rule; CONTRACT §2.15.2): ${text.trim().slice(0, 160)}`);
             }
             continue;
           }

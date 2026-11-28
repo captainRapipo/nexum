@@ -116,11 +116,11 @@ eligibility for individuals is confirmed (ROADMAP Q12).
 
 | Check | Where | Fails the job when |
 | --- | --- | --- |
-| **No network code outside the updater** (MF-11, CONTRACT §7 item 12) — `.github/scripts/check-network.mjs` | `policy` job | `reqwest`, `ureq`, `hyper`, `HttpClient`, `WebClient`, `HttpWebRequest`, `TcpClient`, `TcpListener`, `TcpStream`, `UdpClient`, `UdpSocket`, `HttpListener`, `WebSocket`, `XMLHttpRequest`, `EventSource(`, `sendBeacon`, `fetch(`, `axios`, `tauri_plugin_updater` or `updater_builder` appears in `src-tauri/src/**`, `nexum-agent/**/*.cs` or `src-frontend/**` outside the two entries `.github/network-allowlist.txt` may hold (the whole file `src-tauri/src/updater.rs`, and the one line of `src-tauri/src/lib.rs` that registers the plugin); the allow-list holds anything else; a capability grants an `updater:` permission; `package.json` lists `@tauri-apps/plugin-updater`; the CSP `connect-src` is not exactly `'self' ipc: http://ipc.localhost`; or a string in `updater.rs` (outside its tests) or an endpoint in `tauri.conf.json` names an address outside `https://github.com/captainRapipo/nexum` |
+| **No network code outside the updater** (MF-11, CONTRACT §7 item 12) — `.github/scripts/check-network.mjs` | `policy` job | `reqwest`, `ureq`, `hyper`, `HttpClient`, `WebClient`, `HttpWebRequest`, `TcpClient`, `TcpListener`, `TcpStream`, `UdpClient`, `UdpSocket`, `HttpListener`, `WebSocket`, `XMLHttpRequest`, `EventSource(`, `sendBeacon`, `fetch(`, `axios`, `tauri_plugin_updater` or `updater_builder` appears in `src-tauri/src/**`, `nexum-agent/**/*.cs` or `src-frontend/**` outside the two entries `.github/network-allowlist.txt` may hold (the whole file `src-tauri/src/updater.rs`, and the one line of `src-tauri/src/lib.rs` that registers the plugin); the allow-list holds anything else; a capability grants an `updater:` permission; `package.json` lists `@tauri-apps/plugin-updater`; the CSP `connect-src` is not exactly `'self' ipc: http://ipc.localhost`; or a string in `updater.rs` (outside its tests) or an endpoint in `tauri.conf.json` names an address outside `https://github.com/captainRapipo/nexum`; `plugins.updater` lacks `requireSignedVersion: true`, sets `allowDowngrades` or a `dangerous…` switch, or holds any other key; the plugin registration is anything but `.plugin(tauri_plugin_updater::Builder::new().build())`; or the code of `updater.rs` uses the plugin's own installer (`download_and_install`, `.install(`), `.pubkey(`, or switches certificate checks off |
 | **UI copy rules** (CONTRACT §4.8) — `.github/scripts/check-copy.mjs` | `policy` job | a banned word (boost, optimize, speed up, free RAM, junk, trash, purge, deep purge, outdated, agent) is in user-visible text in `src-frontend/**/*.ts` or `*.tsx`, unless allow-listed in `.github/copy-allowlist.txt`; or the word "agent" is in a string literal of `src-tauri/src/**/*.rs` that can reach the screen (not in tests, log or assertion macros, comparisons or identifiers). "agent" cannot be allow-listed |
 | **CI script self-test** — `.github/scripts/selftest.mjs` | `policy` job | one of the checks above, the release planner, the manifest rules or the signature verifier misbehaves on its fixtures (the verifier is tested against the published minisign test vectors) |
 | **Design hygiene** (CONTRACT §4.9) — `.github/scripts/check-design.mjs` | `policy` job | enforcing (`--enforce`): hex colours outside the token files and retired dark-theme classes fail the job. The list of crimson primary buttons in the job summary is a report |
-| **Release plan** (CONTRACT §7 item 14) — `updater-manifest.mjs plan` | `build`, before compiling | the tag is not `vX.Y.Z` / `vX.Y.Z-preview.N`; it does not match the version in `tauri.conf.json`, `package.json` and `Cargo.toml`; `CHANGELOG.md` has no section for it or the section breaks the UI copy rules; the update key is set but `tauri.conf.json` has no public key; or `@tauri-apps/cli` is older than 2.12.0 while the key is set |
+| **Release plan** (CONTRACT §7 item 14) — `updater-manifest.mjs plan` | `build`, before compiling | the tag is not `vX.Y.Z` / `vX.Y.Z-preview.N`; a pushed tag uses preview number 0, or a rehearsal uses anything but `vX.Y.Z-preview.0`; it does not match the version in `tauri.conf.json`, `package.json` and `Cargo.toml`; `CHANGELOG.md` has no section for it or the section breaks the UI copy rules; the update key is set but `tauri.conf.json` has no public key; or `@tauri-apps/cli` is older than 2.12.0 while the key is set |
 | **Updater signature self-check** — `updater-manifest.mjs verify-sig` | `build`, `preview`, `sign` (only with the update key) | the `.sig` does not verify against `plugins.updater.pubkey`, was made with another key, or is not bound to `Nexum_<version>_x64-setup.exe` and to the version |
 | **Update manifest** (CONTRACT §7 item 14 e) — `updater-manifest.mjs make`, `verify`, `gate` | `update-manifest.yml` | the release is a draft; a `-preview` tag is not marked pre-release (or the reverse); the installer or its `.sig` is missing; the public URL does not answer 200; the downloaded bytes do not verify; the manifest's version is not the tag's; the two platform entries differ; the URL is outside this repository's release. A published manifest is never replaced by an older version |
 | **Forbidden kernel drivers** (MF-3) — `.github/scripts/check-forbidden-drivers.mjs` | `build` and `sign` | `WinRing0*.sys`, `inpout*.sys` or `OpenHardwareMonitorLib.sys` is anywhere in the agent publish output, the Tauri bundle output, the portable folder or the unpacked installers |
@@ -183,6 +183,34 @@ The in-app updater (CONTRACT §2.15, [`SECURITY.md`](../SECURITY.md#in-app-updat
 * **It is not Authenticode.** It has no certificate, no publisher name and no expiry, Windows does not know it, and
   SignPath is not involved. It only lets an installed Nexum recognise the next Nexum.
 
+### Who can use the key
+
+A repository secret is available to every workflow run that starts from a branch or tag **of this repository**. So
+anyone who can push here can write a workflow that signs with the key, whatever `build.yml` itself does. Pull requests
+from forks cannot: they get no secrets. Treat push access to this repository as access to the update key, and keep
+the list of people who have it as short as the list of people who may release.
+
+To narrow it further (recommended once there is more than one person with push access): move the secret into a GitHub
+**environment** (Settings → Environments, for example `release-signing`) with *required reviewers* and *deployment
+tags* limited to `v*`, delete the repository-level secret, and add `environment: release-signing` to the `build` and
+`sign` jobs. A run then gets the key only for a `v*` tag and only after a reviewer approves it. This is a repository
+setting and is not done yet; a rehearsal would then have to be approved like a release.
+
+### Pinned actions
+
+Third-party actions in [`build.yml`](../.github/workflows/build.yml) are referenced by commit, with the version in a
+comment, because the `build` job later holds the update key and the `sign` and `preview` jobs can write releases: a
+tag or branch can be moved to different code, a commit cannot. To update one, look up the commit of the new version
+(`gh api repos/<owner>/<repo>/commits/<tag> --jq .sha`), read what changed, and replace the commit and the comment
+together. GitHub's own `actions/*` are referenced by major version.
+
+| Action | Pinned to |
+| --- | --- |
+| `dtolnay/rust-toolchain` | `df2a88e9fe4098bad09cb42c3dec7187f15861fc` (master, 2026-11-15; `toolchain: stable`) |
+| `Swatinem/rust-cache` | `d1527c8f67ef9af357290475d4af4b0fab8f12e0` (v2.9.3) |
+| `signpath/github-action-submit-signing-request` | `c92b958760219087e01f8d67a1669ed57afe2627` (v2.3) |
+| `softprops/action-gh-release` | `8a0cd651e5b2365bd640854a3fa5dfc70e4875f3` (v3.0.4) |
+
 ### What the build does with it
 
 | Build | Update channel compiled in (`NEXUM_UPDATE_CHANNEL`) | Updater artifacts |
@@ -191,7 +219,7 @@ The in-app updater (CONTRACT §2.15, [`SECURITY.md`](../SECURITY.md#in-app-updat
 | Tag, but the secret is not set | none | none (the build still succeeds, with a warning) |
 | Tag `vX.Y.Z-preview.N` with the secret | `preview` | `.sig` from the bundler, over the unsigned installer |
 | Tag `vX.Y.Z` with the secret | `stable` | the bundler's `.sig` is discarded; a new one is made after SignPath |
-| Rehearsal (`Run workflow` with `rehearse_tag`) | the tag's channel | as for that tag, as run artifacts only; nothing is published |
+| Rehearsal (`Run workflow` with `rehearse_tag` = `vX.Y.Z-preview.0`) | `preview` | as for a preview tag, as run artifacts only; nothing is published |
 
 The decision is made by one step (`Release plan`), which only learns *whether* the secret exists. It writes
 `build/tauri.release.conf.json` (`{"version": "<tag version>"}` plus `"bundle": {"createUpdaterArtifacts": true}` with
@@ -199,8 +227,12 @@ the key), and `tauri build --config` merges it over the committed config.
 
 ### Rehearsal: try the release path without a tag
 
-`Actions` → `Build` → `Run workflow` → `rehearse_tag` = a tag that will never be pushed, for example
-`v1.2.0-preview.0` (keep preview number 0 for rehearsals). The build job then plans, builds and signs exactly as it
+`Actions` → `Build` → `Run workflow` → `rehearse_tag` = `vX.Y.Z-preview.0` for the committed version, for example
+`v1.2.0-preview.0`. **Preview number 0 belongs to rehearsals and to nothing else:** a rehearsal signs its installer
+with the real update key, and that installer is not a release, so it must never carry a version a release can have.
+The release plan enforces both halves: a rehearsal with any other tag (a stable `vX.Y.Z`, or a preview number above
+0) is refused, a pushed tag `vX.Y.Z-preview.0` is refused, and `update-manifest.yml` refuses to describe a
+`-preview.0` release. Number real previews from 1. The build job then plans, builds and signs exactly as it
 would for that tag: tag version, update channel, updater `.sig`, the signature self-check. It also builds the manifest
 that `update-manifest.yml` would write and runs the manifest checks on it, except "the URL answers 200" (the file is not
 published, so the URL does not exist). The `sign`, `preview` and manifest jobs do not run. The installer, the `.sig`
@@ -221,8 +253,9 @@ installer, which changes those bytes. So for a signed release:
 
 The file must have the name `Nexum_<version>_x64-setup.exe` when it is signed. The Tauri CLI writes the file name and
 the app version into the signature's *trusted comment* (`timestamp:…<TAB>file:Nexum_<version>_x64-setup.exe<TAB>version:<version>`),
-which the signature itself covers. Nexum compares both with the version a manifest offers, so an old signed installer
-cannot be served as a new version. Renaming the published asset afterwards (previews get `-UNSIGNED-PREVIEW`) is fine.
+which the signature itself covers. Nexum requires both and compares both with the version a manifest offers, so an
+old signed installer cannot be served as a new version, and a signature made without `--app-version`, or for a file
+of another name, is refused by the app (and by the CI checks before it is ever published). Renaming the published asset afterwards (previews get `-UNSIGNED-PREVIEW`) is fine.
 This needs `@tauri-apps/cli` 2.12.0 or newer (the lockfile pins a newer one; the plan step checks it).
 
 For a **preview** nothing changes the installer after the build, so the bundler's `.sig` is the one that is published.

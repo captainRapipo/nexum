@@ -19,7 +19,7 @@ import { decodePublicKey, decodeSignature, verifyMinisign, trustedFields } from 
 import {
   parseTag, installerName, changelogNotes, checkNotes, verifyInstaller, buildManifest,
   checkManifestShape, planRelease, gateDecision, updaterConfig, cmdMake, cmdVerify, CheckError,
-  rehearseManifest,
+  rehearseManifest, isRehearsalTag,
 } from "./updater-manifest.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -174,8 +174,14 @@ test("manifest: a rehearsal (local files, nothing published) passes the same che
   eq(r.channels, "preview");
   eq(r.manifest.version, version);
   eq(r.manifest.platforms["windows-x86_64-nsis"].url, `${PREFIX}v${version}/${installerName(version)}`);
-  throws(() => rehearseManifest({ ...args, tag: "v1.2.0" }), /made for a file named/, "signature of another version");
+  throws(() => rehearseManifest({ ...args, tag: "v1.3.0-preview.0" }), /made for a file named/, "signature of another version");
   throws(() => rehearseManifest({ ...args, tag: "main" }), /not a release tag/, "not a tag");
+  // A rehearsal never produces the manifest of a version a release can have.
+  for (const real of ["v1.2.0", "v1.2.0-preview.1"]) {
+    const realVersion = real.slice(1);
+    const realSig = key.signFile(data, `timestamp:1\tfile:${installerName(realVersion)}\tversion:${realVersion}`);
+    throws(() => rehearseManifest({ ...args, signature: realSig, tag: real }), /must use a tag of the form vX\.Y\.Z-preview\.0/, `rehearsal of ${real}`);
+  }
   const other = makeKey();
   throws(() => rehearseManifest({ ...args, pubkey: other.pubkey, tag: `v${version}` }), /signature check failed/, "wrong key");
 });
@@ -208,6 +214,21 @@ test("plan: tags, channels and the key", () => {
   throws(() => planRelease({ ...base, cliVersion: "2.9.3", ref: "refs/tags/v1.2.0", hasKey: true }), /older than 2\.12\.0/, "old CLI");
   eq(parseTag("v1.2.0-preview.1").base, "1.2.0");
   eq(parseTag("updates"), null);
+});
+test("plan: preview number 0 is for rehearsals, and rehearsals use nothing else", () => {
+  const base = { confVersion: "1.2.0", otherVersions: { "package.json": "1.2.0" }, hasPubkey: true, cliVersion: "2.12.6", hasKey: true };
+  eq([parseTag("v1.2.0-preview.0").previewNumber, parseTag("v1.2.0-preview.12").previewNumber, parseTag("v1.2.0").previewNumber], [0, 12, null]);
+  eq([isRehearsalTag(parseTag("v1.2.0-preview.0")), isRehearsalTag(parseTag("v1.2.0-preview.1")), isRehearsalTag(parseTag("v1.2.0")), isRehearsalTag(null)], [true, false, false, false]);
+  // A rehearsal: planned exactly like a preview tag, signed, on the preview channel.
+  const r = planRelease({ ...base, ref: "refs/tags/v1.2.0-preview.0", rehearsal: true });
+  eq([r.release, r.version, r.channel, r.updater], [true, "1.2.0-preview.0", "preview", true]);
+  // The real update key never signs a version a release can have outside a release.
+  throws(() => planRelease({ ...base, ref: "refs/tags/v1.2.0", rehearsal: true }), /must use a tag of the form vX\.Y\.Z-preview\.0/, "rehearsal of a stable version");
+  throws(() => planRelease({ ...base, ref: "refs/tags/v1.2.0-preview.1", rehearsal: true }), /must use a tag of the form vX\.Y\.Z-preview\.0/, "rehearsal of a real preview");
+  // And a pushed tag never uses the rehearsal number.
+  throws(() => planRelease({ ...base, ref: "refs/tags/v1.2.0-preview.0" }), /kept for rehearsals/, "pushed preview.0 tag");
+  // A branch build stays a branch build, rehearsal flag or not.
+  eq(planRelease({ ...base, ref: "refs/heads/main", rehearsal: false }).release, false);
 });
 test("notes: changelog section as plain text", () => {
   const md = "# Changelog\n\n## 1.3.0\n\n- Later\n\n## 1.2.0\n\n### New\n\n- A **new** look, see [the docs](https://example.org).\n* Updates from `inside` the app.\n\n\n\n## 1.1.0\n\n- Old\n";
@@ -290,11 +311,14 @@ function run(script, dir) {
   return { code: r.status, out: `${r.stdout}${r.stderr}` };
 }
 const CSP = "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'";
+const UPDATER_CONF = { pubkey: "x", endpoints: ["https://github.com/captainRapipo/nexum/releases/download/updates/stable.json"], requireSignedVersion: true };
+const confWith = (updater) => JSON.stringify({ app: { security: { csp: CSP } }, plugins: { updater } });
+const UPDATER_RS = 'use tauri_plugin_updater::UpdaterExt;\nconst URL: &str = "https://github.com/captainRapipo/nexum/releases/download/updates/stable.json";\n';
 const baseTree = (extra = {}) => ({
   "src-tauri/src/lib.rs": "mod updater;\nfn main() {\n    builder\n        .plugin(tauri_plugin_updater::Builder::new().build())\n        .run();\n}\n",
   "src-tauri/src/updater.rs": 'use tauri_plugin_updater::UpdaterExt;\nconst URL: &str = "https://github.com/captainRapipo/nexum/releases/download/updates/stable.json";\nfn c(app: &App) { let _ = app.updater_builder(); }\n#[cfg(test)]\nmod tests { const BAD: &str = "https://evil.example/x.exe"; }\n',
   "src-tauri/capabilities/default.json": '{ "permissions": ["core:default"] }',
-  "src-tauri/tauri.conf.json": JSON.stringify({ app: { security: { csp: CSP } }, plugins: { updater: { pubkey: "x", endpoints: ["https://github.com/captainRapipo/nexum/releases/download/updates/stable.json"] } } }),
+  "src-tauri/tauri.conf.json": JSON.stringify({ app: { security: { csp: CSP } }, plugins: { updater: UPDATER_CONF } }),
   "nexum-agent/Program.cs": "class P {}\n",
   "src-frontend/main.ts": "export const x = 1;\n",
   "package.json": '{ "dependencies": {} }',
@@ -304,6 +328,20 @@ const baseTree = (extra = {}) => ({
 
 test("check-network: the updater module and its registration line pass", () => {
   const dir = fixture(baseTree());
+  const r = run("check-network.mjs", dir);
+  rmSync(dir, { recursive: true, force: true });
+  ok(r.code === 0, r.out);
+});
+test("check-network: switches spelled out as off, comments, strings and tests are not findings", () => {
+  const dir = fixture(baseTree({
+    "src-tauri/tauri.conf.json": confWith({ ...UPDATER_CONF, allowDowngrades: false, dangerousAcceptInvalidCerts: false }),
+    "src-tauri/src/lib.rs": "mod updater;\nfn main() {\n    builder\n        .plugin(tauri_plugin_updater::Builder::new().build()) // the only line\n        .run();\n}\n",
+    "src-tauri/src/updater.rs": UPDATER_RS +
+      "// The plugin's own `install` and download_and_install are never called.\n" +
+      'const T: &str = "never .install( or .pubkey( here";\n' +
+      "fn install_dir() {}\nfn f() { install_dir(); provider().install_default(); }\n" +
+      "#[cfg(test)]\nmod tests { fn t(u: Update) { let _ = u.install(vec![]); } }\n",
+  }));
   const r = run("check-network.mjs", dir);
   rmSync(dir, { recursive: true, force: true });
   ok(r.code === 0, r.out);
@@ -319,6 +357,18 @@ const netCases = [
   ["the JS updater package", { "package.json": '{ "dependencies": { "@tauri-apps/plugin-updater": "^2" } }' }, /@tauri-apps\/plugin-updater/],
   ["a wider CSP", { "src-tauri/tauri.conf.json": JSON.stringify({ app: { security: { csp: "connect-src 'self' ipc: http://ipc.localhost https://github.com" } } }) }, /CSP connect-src/],
   ["a foreign endpoint", { "src-tauri/tauri.conf.json": JSON.stringify({ app: { security: { csp: CSP } }, plugins: { updater: { endpoints: ["https://example.org/stable.json"] } } }) }, /updater endpoint/],
+  ["an updater that does not require the signed version", { "src-tauri/tauri.conf.json": confWith({ pubkey: "x", endpoints: UPDATER_CONF.endpoints }) }, /requireSignedVersion must be true/],
+  ["requireSignedVersion switched off", { "src-tauri/tauri.conf.json": confWith({ ...UPDATER_CONF, requireSignedVersion: false }) }, /requireSignedVersion must be true/],
+  ["downgrades allowed in the configuration", { "src-tauri/tauri.conf.json": confWith({ ...UPDATER_CONF, allowDowngrades: true }) }, /allowDowngrades must stay off/],
+  ["certificate checks switched off in the configuration", { "src-tauri/tauri.conf.json": confWith({ ...UPDATER_CONF, dangerousAcceptInvalidCerts: true }) }, /dangerousAcceptInvalidCerts must stay off/],
+  ["plain http allowed in the configuration", { "src-tauri/tauri.conf.json": confWith({ ...UPDATER_CONF, dangerousInsecureTransportProtocol: true }) }, /dangerousInsecureTransportProtocol must stay off/],
+  ["a kebab-case spelling of a switch", { "src-tauri/tauri.conf.json": confWith({ ...UPDATER_CONF, "allow-downgrades": true }) }, /plugins\.updater\.allow-downgrades is not allowed/],
+  ["installer arguments in the configuration", { "src-tauri/tauri.conf.json": confWith({ ...UPDATER_CONF, windows: { installerArgs: ["/D=C:\\x"] } }) }, /plugins\.updater\.windows is not allowed/],
+  ["another public key at registration", { "src-tauri/src/lib.rs": 'mod updater;\nfn main() {\n    builder\n        .plugin(tauri_plugin_updater::Builder::new().pubkey("other").build())\n        .run();\n}\n' }, /registered as \.plugin\(tauri_plugin_updater::Builder::new\(\)\.build\(\)\)/],
+  ["the plugin's own installer", { "src-tauri/src/updater.rs": UPDATER_RS + "async fn i(u: Update) { let _ = u.download_and_install(|_, _| {}, || {}).await; }\n" }, /must not use "download_and_install"/],
+  ["the plugin's install()", { "src-tauri/src/updater.rs": UPDATER_RS + "fn i(u: Update, b: Vec<u8>) { let _ = u.install(b); }\n" }, /must not use "\.install\("/],
+  ["a public key set in code", { "src-tauri/src/updater.rs": UPDATER_RS + 'fn c(app: &App) { let _ = app.updater_builder().pubkey("other"); }\n' }, /must not use "\.pubkey\("/],
+  ["certificate checks switched off in code", { "src-tauri/src/updater.rs": UPDATER_RS + "fn c(b: ClientBuilder) -> ClientBuilder { b.danger_accept_invalid_certs(true) }\n" }, /must not use "danger_accept_invalid_certs"/],
   ["another host in the updater", { "src-tauri/src/updater.rs": 'use tauri_plugin_updater::UpdaterExt;\nconst M: &str = "https://objects.githubusercontent.com/x";\n' }, /the only host it may name/],
 ];
 for (const [name, patch, re] of netCases) {

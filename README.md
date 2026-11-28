@@ -100,12 +100,12 @@ control:
   version exists and, if so, shows a quiet **Update available** button in the toolbar. No pop-up, no notification.
   Nothing is downloaded and nothing is installed until you click **Install update**.
 * **Verified before it runs.** The download is checked against Nexum's update signing key, which is compiled into the
-  app, before anything is started. A file that fails the check is not run. The signature also carries the version it
-  was made for, so an older installer cannot be passed off as a newer one, and Nexum never installs a version that is
-  not newer than the one you have.
+  app, before anything is started. A file that fails the check is not run. The signature also carries the installer's
+  name and the version it was made for, so an older installer cannot be passed off as a newer one; a signature that
+  does not name both is refused, and Nexum never installs a version that is not newer than the one you have.
 * **Only from here.** The app can contact one place: this repository on `github.com` (GitHub forwards downloads to its
-  own file servers). The request is a plain download. It carries no identifier and nothing about you, your PC or your
-  Nexum version; GitHub sees what it sees for any download (your IP address and a generic client name).
+  own file servers), over HTTPS only. The request is a plain download. It carries no identifier and nothing about you,
+  your PC or your Nexum version; GitHub sees what it sees for any download (your IP address and a generic client name).
 
 **Turning it off or on:** Settings → Updates → *Check for updates*: *Automatically, once a day* or *Only when I ask*.
 With *Only when I ask* Nexum goes online only when you press **Check now**. You can also ignore the feature completely
@@ -119,7 +119,7 @@ JSON file on the permanent [`updates`](../../releases/tag/updates) release (`sta
 files are read by the app and are not downloads.
 
 **What happens when you click Install update:** Nexum downloads the installer into memory, verifies it, saves it in
-its own program folder (which only administrators can write to), returns the fans to BIOS control, starts the
+a folder it creates inside its program folder for administrators only, returns the fans to BIOS control, starts the
 installer and closes. If Nexum does not open again by itself afterwards, start it from the Start menu. Builds you compile
 yourself, and builds from forks, do not update from inside the app.
 
@@ -376,6 +376,12 @@ download is signature-verified before it runs. The check downloads one small fil
 sends no identifier and no information about you, your PC or your Nexum version. GitHub, like any web server, sees the
 IP address the request comes from; see GitHub's privacy statement for how it handles that. Choose *Only when I ask* in
 Settings → Updates and never press **Check now**, and Nexum never goes online.
+
+Two parts of Windows that Nexum relies on act on their own account, not Nexum's. The Microsoft Edge WebView2 Runtime,
+which draws Nexum's window, may contact Microsoft by itself (its own updates and diagnostic data, according to your
+Windows settings); Nexum gives it no web address to load, and the page it shows is built into the app. And when Nexum
+checks for an update, Windows validates GitHub's certificate, which can include a request to the certificate's issuer,
+as for any secure connection.
 
 Besides that, network access happens only outside Nexum: when *you* click a link (a vendor driver portal, the PawnIO
 site or the releases page opens in your browser) or when the installer downloads the Microsoft WebView2 runtime if it

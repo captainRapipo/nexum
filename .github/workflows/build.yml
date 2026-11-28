@@ -8,10 +8,12 @@ on:
   workflow_dispatch:
     inputs:
       # CONTRACT §7 item 14 (g). A rehearsal builds, signs and self-checks exactly what a
-      # pushed tag would, and publishes nothing (the sign / preview jobs only run for a
-      # real tag). Use a preview number no real tag will use, e.g. v1.2.0-preview.0.
+      # pushed preview tag would, and publishes nothing (the sign / preview jobs only run
+      # for a real tag). Its installer is signed with the real update key, so it must
+      # never carry a version a release can have: the tag must be vX.Y.Z-preview.0, and
+      # no pushed tag may use preview number 0 (the release plan enforces both).
       rehearse_tag:
-        description: "Rehearsal: build as if this tag had been pushed (e.g. v1.2.0-preview.0). Makes the updater signature and checks it; publishes nothing."
+        description: "Rehearsal: build as if this tag had been pushed. Must be vX.Y.Z-preview.0 (e.g. v1.2.0-preview.0). Makes the updater signature and checks it; publishes nothing."
         required: false
         type: string
         default: ""
@@ -94,9 +96,15 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Third-party actions are pinned to a commit, not to a tag or branch that can be
+      # moved: this job later holds the update signing key, and the sign / preview jobs
+      # can write releases. To update one, replace the commit and the version comment
+      # together (docs/SIGNING.md, "Pinned actions").
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, 2026-11-15
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
 
@@ -147,12 +155,12 @@ jobs:
           $ref = $env:GITHUB_REF
           $rehearsal = 'false'
           if ($env:REHEARSE_TAG) {
-            # The script refuses anything that is not vX.Y.Z or vX.Y.Z-preview.N.
+            # The script refuses anything that is not vX.Y.Z-preview.0.
             $ref = "refs/tags/$($env:REHEARSE_TAG)"
             $rehearsal = 'true'
             Write-Host "::notice::Rehearsal of tag $($env:REHEARSE_TAG): nothing from this run is published."
           }
-          node .github/scripts/updater-manifest.mjs plan --ref $ref --has-key "$env:HAS_UPDATER_KEY" --cli-version "$env:TAURI_CLI_VERSION" --out build/tauri.release.conf.json
+          node .github/scripts/updater-manifest.mjs plan --ref $ref --rehearsal $rehearsal --has-key "$env:HAS_UPDATER_KEY" --cli-version "$env:TAURI_CLI_VERSION" --out build/tauri.release.conf.json
           if ($LASTEXITCODE -ne 0) { throw "release plan failed" }
           "rehearsal=$rehearsal" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
 
@@ -493,7 +501,7 @@ jobs:
       # The signing policy needs a maintainer's approval, so wait longer than the
       # action's default of 10 minutes (two requests, inside the job's 120 minutes).
       - name: Sign installers
-        uses: signpath/github-action-submit-signing-request@v2
+        uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627 # v2.3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
@@ -506,7 +514,7 @@ jobs:
           output-artifact-directory: signed/installers
 
       - name: Sign portable binaries
-        uses: signpath/github-action-submit-signing-request@v2
+        uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627 # v2.3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
@@ -639,7 +647,7 @@ jobs:
       # manifests" workflow (update-manifest.yml) verifies the public files and only then
       # writes stable.json and preview.json (CONTRACT §2.15.2 "Publishing order").
       - name: Publish GitHub release (draft)
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           draft: true
           body_path: signed/RELEASE_NOTES.md
@@ -746,7 +754,7 @@ jobs:
           ) -join "`n" | Set-Content -Encoding utf8 release/RELEASE_NOTES.md
 
       - name: Publish pre-release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           name: "Nexum ${{ github.ref_name }} — Preview — unsigned — will not run with Smart App Control on"
           prerelease: true

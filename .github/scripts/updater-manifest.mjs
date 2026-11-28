@@ -56,8 +56,22 @@ export function parseTag(tag) {
   const m = TAG_RE.exec(tag ?? "");
   if (!m) return null;
   const preview = Boolean(m[5]);
-  return { version: `${m[1]}${m[5] ?? ""}`, base: m[1], preview, channel: preview ? "preview" : "stable" };
+  return {
+    version: `${m[1]}${m[5] ?? ""}`,
+    base: m[1],
+    preview,
+    previewNumber: preview ? Number(m[6]) : null,
+    channel: preview ? "preview" : "stable",
+  };
 }
+
+// Preview number 0 belongs to rehearsals (CONTRACT §7 item 14 (g)). A rehearsal signs its
+// installer with the real update key, and what it signed is not a release: so a rehearsal
+// may only ever use a version that no release uses, and no release may use that version.
+export function isRehearsalTag(t) {
+  return Boolean(t && t.preview && t.previewNumber === 0);
+}
+const REHEARSAL_ONLY = "preview number 0 is kept for rehearsals (build.yml, \"Run workflow\"); number real previews from 1";
 
 function stripBom(text) {
   return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
@@ -298,12 +312,16 @@ function output(pairs) {
 // ---------------------------------------------------------------- commands
 
 // Pure part of `plan`, unit-tested by selftest.mjs.
-export function planRelease({ ref, hasKey, confVersion, otherVersions = {}, hasPubkey, cliVersion }) {
+export function planRelease({ ref, hasKey, confVersion, otherVersions = {}, hasPubkey, cliVersion, rehearsal = false }) {
   const none = { release: false, version: confVersion, channel: "", updater: false, warnings: [] };
   if (!ref || !ref.startsWith("refs/tags/v")) return none;
   const tag = ref.slice("refs/tags/".length);
   const t = parseTag(tag);
   if (!t) fail(`tag "${tag}" is not a release tag. Use vX.Y.Z for a stable release or vX.Y.Z-preview.N for a preview.`);
+  if (rehearsal && !isRehearsalTag(t)) {
+    fail(`a rehearsal must use a tag of the form vX.Y.Z-preview.0, not "${tag}": its installer is signed with the real update key, so it must never carry the version of a release`);
+  }
+  if (!rehearsal && isRehearsalTag(t)) fail(`tag ${tag}: ${REHEARSAL_ONLY}`);
   if (t.base !== confVersion) {
     fail(`tag ${tag} does not match the committed version ${confVersion} in src-tauri/tauri.conf.json (bump package.json, tauri.conf.json and Cargo.toml first)`);
   }
@@ -341,6 +359,7 @@ function cmdPlan(a) {
     otherVersions: others,
     hasPubkey: Boolean(updaterConfig(conf).pubkey),
     cliVersion: a["cli-version"] || null,
+    rehearsal: a.rehearsal === "true",
   });
   for (const w of plan.warnings) console.log(`::warning::${w}`);
   let override = "";
@@ -389,6 +408,7 @@ export async function cmdMake(a) {
   const rel = readJson(a.release, "release description");
   const t = parseTag(rel.tag_name);
   if (!t) fail(`release tag "${rel.tag_name}" is not vX.Y.Z or vX.Y.Z-preview.N`);
+  if (isRehearsalTag(t)) fail(`release ${rel.tag_name} cannot be offered through in-app updates: ${REHEARSAL_ONLY}`);
   if (rel.draft !== false) fail(`release ${rel.tag_name} is a draft; a manifest may only point at a published release`);
   if (t.preview && rel.prerelease !== true) fail(`tag ${rel.tag_name} is a preview but the release is not marked as a pre-release`);
   if (!t.preview && rel.prerelease === true) {
@@ -432,6 +452,7 @@ export async function cmdMake(a) {
 export function rehearseManifest({ data, signature, pubkey, prefix, tag, notes, pubDate }) {
   const t = parseTag(tag);
   if (!t) fail(`"${tag}" is not a release tag (vX.Y.Z or vX.Y.Z-preview.N)`);
+  if (!isRehearsalTag(t)) fail(`a rehearsal must use a tag of the form vX.Y.Z-preview.0, not "${tag}"`);
   const sig = verifyInstaller({ data, signature, pubkey, version: t.version });
   const manifest = buildManifest({
     version: t.version,
@@ -470,6 +491,7 @@ export async function cmdVerify(a) {
   const cfg = requireUpdaterConfig(a.config ?? "src-tauri/tauri.conf.json");
   const t = parseTag(a.tag);
   if (!t) fail(`"${a.tag}" is not a release tag`);
+  if (isRehearsalTag(t)) fail(`${a.tag} cannot be offered through in-app updates: ${REHEARSAL_ONLY}`);
   const manifest = readJson(a.manifest, "manifest");
   const { url, signature } = checkManifestShape(manifest, { version: t.version, prefix: cfg.prefix });
   const data = await download(url, "installer");
