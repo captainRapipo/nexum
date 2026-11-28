@@ -190,7 +190,9 @@ export default function GamingView() {
                   ? NO_TARGET_TITLE
                   : session?.state === "error"
                     ? "Frame capture stopped"
-                    : agent?.phase === "failed"
+                    : // Same condition as the session line above it ("Frame capture is paused. …"): sensor
+                      // reading is not running, so capture waits for it.
+                      agent?.phase === "failed" || !agent?.running
                       ? "Frame capture is paused"
                       : "Frame capture is not running yet"
               }
