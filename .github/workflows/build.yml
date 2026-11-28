@@ -63,10 +63,10 @@ jobs:
         run: node .github/scripts/check-copy.mjs
 
       # CONTRACT §7 item 15 / §4.9: hex colours, retired dark-theme classes and the list
-      # of crimson primary buttons. Report-only (job summary) while the 1.2 redesign is
-      # integrated; add --enforce to make findings fail the job.
-      - name: Design hygiene (CONTRACT §4.9, report-only)
-        run: node .github/scripts/check-design.mjs
+      # of crimson primary buttons. Enforcing since the 1.2 redesign was integrated with
+      # no findings: a finding fails the job. The list of primary buttons is a report.
+      - name: Design hygiene (CONTRACT §4.9)
+        run: node .github/scripts/check-design.mjs --enforce
 
       # CONTRACT §0 / §1.7.1 / §7.9: v1.1 reads AMD ADL tuning data only. No ADL "_Set"
       # entry point anywhere, imports only in Tuning/AdlNative.cs, whitelist enforced.
