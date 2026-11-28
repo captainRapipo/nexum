@@ -32,6 +32,8 @@ The section of a version is also what the app shows under "what changed" when it
 - When sensors work, Nexum says nothing about how it reads them. If reading stops, Nexum restarts it by itself. Only
   if that does not help, one message appears: "Nexum can't read sensors right now." with a "Try again" button.
 - Values that cannot be read show a dash with the hint "Not available right now".
+- A number is never left frozen on screen: while sensor reading is being restarted, figures show the dash instead of
+  the last number. The Sensors page keeps the last values in grey and says "Showing the last values received".
 
 ## 1.1.0
 

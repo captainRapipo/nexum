@@ -253,7 +253,13 @@ function SensorRowImpl(props: SensorRowProps) {
       <span
         role="gridcell"
         aria-colindex={2}
-        className={cn(CELL, "flex items-center justify-end whitespace-nowrap font-semibold group-data-[stale=true]/grid:opacity-55", hotText)}
+        // Last values received (sensor reading is not up): regular weight in the secondary grey. A colour
+        // step, not opacity, so the numbers stay at 4.5:1 or better on every row background.
+        className={cn(
+          CELL,
+          "flex items-center justify-end whitespace-nowrap font-semibold group-data-[stale=true]/grid:font-normal group-data-[stale=true]/grid:text-ink-2",
+          hotText,
+        )}
         title={hot && limit ? `${hot === "crit" ? "Critical" : "Attention"}: at or above ${hot === "crit" ? "the limit" : "the attention level"}. ${limit.title}` : undefined}
       >
         {value == null ? (
@@ -273,13 +279,13 @@ function SensorRowImpl(props: SensorRowProps) {
       </span>
 
       {/* Min / Max / Avg: numbers only */}
-      <span role="gridcell" aria-colindex={3} className={cn(CELL, "truncate text-right text-ink-2 group-data-[stale=true]/grid:opacity-55")}>
+      <span role="gridcell" aria-colindex={3} className={cn(CELL, "truncate text-right text-ink-2 group-data-[stale=true]/grid:text-ink-3")}>
         {num(stats?.min)}
       </span>
-      <span role="gridcell" aria-colindex={4} className={cn(CELL, "truncate text-right text-ink-2 group-data-[stale=true]/grid:opacity-55")}>
+      <span role="gridcell" aria-colindex={4} className={cn(CELL, "truncate text-right text-ink-2 group-data-[stale=true]/grid:text-ink-3")}>
         {num(stats?.max)}
       </span>
-      <span role="gridcell" aria-colindex={5} className={cn(CELL, "truncate text-right text-ink-2 group-data-[stale=true]/grid:opacity-55")}>
+      <span role="gridcell" aria-colindex={5} className={cn(CELL, "truncate text-right text-ink-2 group-data-[stale=true]/grid:text-ink-3")}>
         {num(stats?.avg)}
       </span>
 

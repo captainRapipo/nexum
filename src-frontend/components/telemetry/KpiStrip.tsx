@@ -69,10 +69,10 @@ function buildKpis(
   const cpu = latest?.cpu ?? null;
   const gpu = latest?.gpu ?? null;
   const ram = latest?.ram ?? null;
-  // Nothing is read right now: the large dash already says so (hover: "Not available right now"), so the
-  // meta line stays empty instead of showing a second dash under it.
-  const missingReason = resolveUnavailable(agent, "none");
-  const missing = !latest && missingReason === "agentOffline" ? null : <Unavailable reason={missingReason} />;
+  // Nothing is read right now (no packet: before the first one, during a restart, or after Rust gave
+  // up): the large dash already says so (hover: "Not available right now"), so the meta line stays empty
+  // instead of showing a second dash, or a cause that is not known yet, under it.
+  const missing = !latest ? null : <Unavailable reason={resolveUnavailable(agent, "none")} />;
 
   /* ---- CPU: load, package temperature, effective clock ---- */
   const cpuLoad = cpu?.loadTotal;

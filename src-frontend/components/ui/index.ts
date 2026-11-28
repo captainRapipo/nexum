@@ -7,7 +7,7 @@ export { TrendArrow, type TrendArrowProps } from "./TrendArrow";
 export { Toggle, type ToggleProps } from "./Toggle";
 export { Button, type ButtonProps, type ButtonVariant, type ButtonSize } from "./Button";
 export { EChart, NEXUM_CHART_THEME, type EChartProps } from "./EChart";
-export { Modal, isModalOpen, type ModalProps, type ModalSize } from "./Modal";
+export { Modal, isModalOpen, useModalLayer, type ModalProps, type ModalSize } from "./Modal";
 export { Segmented, type SegmentedProps, type SegmentedOption } from "./Segmented";
 export {
   STATUS_HEX,

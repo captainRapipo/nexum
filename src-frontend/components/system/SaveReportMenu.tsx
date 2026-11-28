@@ -29,20 +29,42 @@ export function SaveReportMenu({ disabled }: { disabled?: boolean }) {
     const onDown = (e: MouseEvent) => {
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
     };
+    const root = rootRef.current;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.stopPropagation();
         setOpen(false);
+        // The focused item goes away with the menu: hand the focus back to the button that opened it.
+        root?.querySelector<HTMLElement>('[aria-haspopup="menu"]')?.focus();
       }
+    };
+    // Tab out of the menu closes it.
+    const onFocusOut = (e: FocusEvent) => {
+      if (e.relatedTarget instanceof Node && root && !root.contains(e.relatedTarget)) setOpen(false);
     };
     window.addEventListener("mousedown", onDown);
     window.addEventListener("keydown", onKey, true);
+    root?.addEventListener("focusout", onFocusOut);
     itemRefs.current[0]?.focus();
     return () => {
       window.removeEventListener("mousedown", onDown);
       window.removeEventListener("keydown", onKey, true);
+      root?.removeEventListener("focusout", onFocusOut);
     };
   }, [open]);
+
+  // The chosen item went away with the menu and the button was busy while the file was written: when
+  // that ends and nothing else took the focus, it returns to the button.
+  const wasSaving = useRef(false);
+  useEffect(() => {
+    if (saving !== null) {
+      wasSaving.current = true;
+      return;
+    }
+    if (!wasSaving.current) return;
+    wasSaving.current = false;
+    if (document.activeElement === document.body) rootRef.current?.querySelector<HTMLElement>('[aria-haspopup="menu"]:not(:disabled)')?.focus();
+  }, [saving]);
 
   const openFolder = (path: string) => {
     api.openExternal(dirnameOf(path)).catch((e: unknown) => toast(`Could not open the folder: ${errorMessage(e)}`, "warn"));

@@ -101,8 +101,8 @@ export default function HealthAlertsCard() {
         </>
       ) : (
         <ScrollFade className="min-h-0 flex-1 pr-1">
-          {/* pb: the last row's button draws its outline as a shadow, which the scroll box would clip. */}
-          <ul className="flex flex-col pb-0.5">
+          {/* pb: the focus ring of the last row's button reaches 3 px outside it, which the scroll box would clip. */}
+          <ul className="flex flex-col pb-1">
             {rows.map((r) => (
               <AlertRow
                 key={r.key}

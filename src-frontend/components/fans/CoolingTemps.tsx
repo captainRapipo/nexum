@@ -5,7 +5,7 @@ import { Sparkline, Unavailable, UNAVAILABLE_TEXT } from "../ui";
 import { useSensors } from "../../hooks/useSensors";
 import { useSensorLabels } from "../../hooks/useSensorLabels";
 import { COOLING_TEMP_RULES, resolveRules } from "../../lib/sensors";
-import { resolveUnavailable } from "../../lib/status";
+import { resolveUnavailable, sensorsUp } from "../../lib/status";
 import { cn, toTempUnit } from "../../lib/format";
 import { needForHardware } from "./fanHelpers";
 
@@ -21,6 +21,9 @@ export default function CoolingTemps({ agent, tempUnit, className }: { agent: Ag
   const { tree, byId, statsOf, historyOf } = useSensors();
   const { labelOf } = useSensorLabels();
   const metas = useMemo(() => resolveRules(tree, COOLING_TEMP_RULES), [tree]);
+  // While sensor reading is not up the held values are the last ones of a process that is gone:
+  // the rows show "—" (hover "Not available right now"), not frozen numbers.
+  const up = sensorsUp(agent);
   const num = (c: number | null | undefined, decimals: number) => (c == null || !Number.isFinite(c) ? null : toTempUnit(c, tempUnit).toFixed(decimals));
 
   return (
@@ -54,7 +57,7 @@ export default function CoolingTemps({ agent, tempUnit, className }: { agent: Ag
           <tbody>
             {metas.map((m) => {
               const hw = byId.get(m.id)?.hw;
-              const st = statsOf(m.id);
+              const st = up ? statsOf(m.id) : null;
               const name = labelOf(m.id, m.name);
               const now = num(st?.value, m.decimals);
               const max = num(st?.max, m.decimals);
@@ -76,7 +79,7 @@ export default function CoolingTemps({ agent, tempUnit, className }: { agent: Ag
                   </td>
                   <td className={cn(TD, "text-right text-ink-2")}>{max ?? "—"}</td>
                   <td className={cn(TD, "pl-[18px]")}>
-                    <Sparkline data={historyOf(m.idx)} height={14} strokeWidth={1.25} />
+                    {up && <Sparkline data={historyOf(m.idx)} height={14} strokeWidth={1.25} />}
                   </td>
                 </tr>
               );

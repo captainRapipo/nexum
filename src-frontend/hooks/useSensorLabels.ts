@@ -1,4 +1,4 @@
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useRef } from "react";
 import { resolveDefaultPins } from "../lib/sensors";
 import type { SensorLabelMeta } from "../types";
 import { useSensors } from "./useSensors";
@@ -33,7 +33,11 @@ export function useSensorLabels(): SensorLabelsValue {
 
   const labels = settings.sensorLabels ?? {};
   const explicitPins = settings.pinnedSensors;
-  const tele = latest?.disks;
+  // `latest` is null while sensor reading is not up: the default pins keep using the drives last seen, so
+  // the pinned list does not lose its drive row for the length of a restart.
+  const seenDisks = useRef(latest?.disks);
+  if (latest?.disks) seenDisks.current = latest.disks;
+  const tele = latest?.disks ?? seenDisks.current;
 
   // Telemetry disks change identity every tick; the default pins only depend on ids/serials/numbers.
   const teleKey = (tele ?? []).map((d) => `${d.id}:${d.serial ?? ""}:${d.diskNumber ?? ""}`).join("|");

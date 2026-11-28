@@ -144,10 +144,15 @@ function visibleIndexes(total: number, count: number, selected: number): number[
 const MENU_ITEM =
   "focus-inset flex h-7 w-full items-center rounded-sm px-2.5 text-left text-body text-ink hover:bg-hover active:bg-pressed";
 
-/** Closes a menu on an outside press or on Esc. */
+/**
+ * Menu behaviour shared by the two menus: an outside press, Esc or the focus leaving closes it (Esc
+ * hands the focus back to the button that opened it), and the arrow keys, Home and End move between
+ * the items.
+ */
 function useMenuDismiss(open: boolean, wrap: RefObject<HTMLElement | null>, close: () => void) {
   useEffect(() => {
     if (!open) return;
+    const root = wrap.current;
     const onDown = (e: MouseEvent) => {
       if (wrap.current && !wrap.current.contains(e.target as Node)) close();
     };
@@ -155,13 +160,30 @@ function useMenuDismiss(open: boolean, wrap: RefObject<HTMLElement | null>, clos
       if (e.key === "Escape") {
         e.stopPropagation();
         close();
+        root?.querySelector<HTMLElement>('[aria-haspopup="menu"]')?.focus();
+        return;
       }
+      if (e.key !== "ArrowDown" && e.key !== "ArrowUp" && e.key !== "Home" && e.key !== "End") return;
+      const items = Array.from(root?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? []);
+      if (items.length === 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const at = items.findIndex((n) => n === document.activeElement);
+      const last = items.length - 1;
+      const next =
+        e.key === "Home" ? 0 : e.key === "End" ? last : e.key === "ArrowDown" ? (at < 0 || at === last ? 0 : at + 1) : at <= 0 ? last : at - 1;
+      items[next]?.focus();
+    };
+    const onFocusOut = (e: FocusEvent) => {
+      if (e.relatedTarget instanceof Node && root && !root.contains(e.relatedTarget)) close();
     };
     window.addEventListener("mousedown", onDown);
     window.addEventListener("keydown", onKey, true);
+    root?.addEventListener("focusout", onFocusOut);
     return () => {
       window.removeEventListener("mousedown", onDown);
       window.removeEventListener("keydown", onKey, true);
+      root?.removeEventListener("focusout", onFocusOut);
     };
   }, [open, wrap, close]);
 }

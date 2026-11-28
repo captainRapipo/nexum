@@ -86,6 +86,8 @@ export interface StatusPillProps {
   onClick?: () => void;
   /** aria-expanded for the popover; turns the chevron. */
   expanded?: boolean;
+  /** DOM id of the popover the pill opens: sets aria-controls and aria-haspopup="dialog" (with `onClick`). */
+  controls?: string;
   /** Ignored since 1.2 (nothing pulses). Kept so call sites compile. */
   pulse?: boolean;
   /** Replaces the default per-tone icon. */
@@ -95,7 +97,7 @@ export interface StatusPillProps {
   className?: string;
 }
 
-export function StatusPill({ tone, children, size = "chip", summary, onClick, expanded, icon, title, className }: StatusPillProps) {
+export function StatusPill({ tone, children, size = "chip", summary, onClick, expanded, controls, icon, title, className }: StatusPillProps) {
   const c = classesFor(tone);
   const pill = size === "pill";
   const iconSize = pill ? 15 : 13;
@@ -107,18 +109,23 @@ export function StatusPill({ tone, children, size = "chip", summary, onClick, ex
     pill && c.border,
     // A chip has no border; the neutral one sits on white, so it gets a hairline to stay visible.
     !pill && tone === "checking" && "shadow-[inset_0_0_0_1px_var(--color-subtle)]",
-    // Hover darkens the tint by 4 % without touching the text.
-    onClick && "hover:bg-[linear-gradient(var(--color-hover),var(--color-hover))] active:bg-[linear-gradient(var(--color-pressed),var(--color-pressed))]",
+    // Hover darkens the tint by 4 %, pressed by 8 % (SPEC §4).
+    onClick && "group/pill hover:bg-[linear-gradient(var(--color-hover),var(--color-hover))] active:bg-[linear-gradient(var(--color-pressed),var(--color-pressed))]",
     className,
   );
+  // The label darkens with the tint, so the pair stays at 4.5:1 or better in every tone ("Optimal" on
+  // its hovered tint would otherwise be 4.46:1, pressed 4.08:1). `currentColor` is the tone's text colour.
+  const press = onClick
+    ? "group-hover/pill:text-[color:color-mix(in_srgb,currentColor_88%,black)] group-active/pill:text-[color:color-mix(in_srgb,currentColor_88%,black)]"
+    : undefined;
   const body = (
     <>
       <span aria-hidden="true" className="flex shrink-0 items-center">
         {icon != null ? <span className={cn("flex items-center", c.icon)}>{renderIcon(icon, iconSize)}</span> : <StatusIcon tone={tone} size={iconSize} />}
       </span>
-      <span>{children}</span>
+      <span className={press}>{children}</span>
       {summary != null && summary !== "" && summary !== false && (
-        <span className="font-medium">
+        <span className={cn("font-medium", press)}>
           <span aria-hidden="true" className="mr-1.5 ml-px font-semibold">
             ·
           </span>
@@ -136,7 +143,15 @@ export function StatusPill({ tone, children, size = "chip", summary, onClick, ex
   );
   if (onClick) {
     return (
-      <button type="button" title={title} aria-expanded={expanded} onClick={onClick} className={cls}>
+      <button
+        type="button"
+        title={title}
+        aria-expanded={expanded}
+        aria-haspopup={controls ? "dialog" : undefined}
+        aria-controls={controls && expanded ? controls : undefined}
+        onClick={onClick}
+        className={cls}
+      >
         {body}
       </button>
     );

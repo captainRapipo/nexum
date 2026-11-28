@@ -65,9 +65,27 @@ const FOCUSABLE =
 const stack: string[] = [];
 const EXIT_MS = 160;
 
-/** True while any <Modal> is open (used by global hotkeys so they don't act behind a dialog). */
+/** True while any <Modal> or modal layer is open (used by global hotkeys so they don't act behind a dialog). */
 export function isModalOpen(): boolean {
   return stack.length > 0;
+}
+
+/**
+ * Registers a modal surface that is not a <Modal> (a sheet with its own layout, scrim and focus
+ * trap) for as long as `active` is true, so `isModalOpen()` covers it and the global hotkeys stay
+ * off behind its scrim. A <Modal> opened later still sits on top of it.
+ */
+export function useModalLayer(active: boolean): void {
+  const id = useId();
+  useEffect(() => {
+    if (!active) return;
+    const key = `layer${id}`;
+    stack.push(key);
+    return () => {
+      const i = stack.lastIndexOf(key);
+      if (i >= 0) stack.splice(i, 1);
+    };
+  }, [active, id]);
 }
 
 export function Modal({
@@ -146,6 +164,20 @@ export function Modal({
       if (restore && document.contains(restore)) restore.focus({ preventScroll: true });
     };
   }, [open, mounted, id, initialFocusRef]);
+
+  // Keep the focus inside the top-most modal. When the focused control goes away (the buttons of
+  // the update dialog while it downloads) or is disabled under the focus (a button that turns into
+  // its "saved" state), the browser leaves the focus on <body> or on a control that no longer takes
+  // keys: Esc and the screen reader's place would be lost. Runs after every render of the dialog.
+  useEffect(() => {
+    if (!open || !mounted || stack[stack.length - 1] !== id) return;
+    const panel = panelRef.current;
+    if (!panel) return;
+    const active = document.activeElement;
+    const lost = active == null || active === document.body;
+    const dead = active instanceof HTMLElement && panel.contains(active) && active.matches(":disabled");
+    if (lost || dead) panel.focus({ preventScroll: true });
+  });
 
   // Esc + focus trap (top-most modal only).
   useEffect(() => {

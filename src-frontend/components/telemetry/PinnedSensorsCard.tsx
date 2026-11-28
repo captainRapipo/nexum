@@ -32,6 +32,7 @@ export default function PinnedSensorsCard({ className }: { className?: string })
   // The tree itself comes from get_sensor_tree; values are needed only while something is pinned.
   useSensorStream(pinned.length > 0);
 
+  const up = sensorsUp(agent);
   const shown = pinned.slice(0, MAX_ROWS);
   const more = pinned.length - shown.length;
   const canEdit = !!tree && pinned.length > 0;
@@ -48,7 +49,9 @@ export default function PinnedSensorsCard({ className }: { className?: string })
       <ul className="-mt-1 flex flex-col">
         {shown.map((id) => {
           const entry = byId.get(id);
-          const stats = statsOf(id);
+          // While sensor reading is not up the held values are the last ones of a process that is gone:
+          // the row shows "—" (hover "Not available right now"), not a frozen number.
+          const stats = up ? statsOf(id) : null;
           const name = entry ? labelOf(id, entry.meta.name) : labelOf(id, id.split("/").pop() || id);
           const hwName = entry?.hw.name ?? "Not in the current sensor list";
           const value = stats?.value ?? null;
@@ -56,7 +59,7 @@ export default function PinnedSensorsCard({ className }: { className?: string })
           const max = entry && stats?.max != null && !entry.meta.static ? sensorValueParts(stats.max, entry.meta, tempUnit).num : null;
           // No values packet for the current sensor list yet (just after start, a rescan or a settings
           // change): the value is only missing for a moment, so no cause and no lock are shown.
-          const unavailable = !entry ? "unsupported" : values == null ? "agentOffline" : resolveUnavailable(agent, needForHardware(entry.hw.kind));
+          const unavailable = !entry ? "unsupported" : !up || values == null ? "agentOffline" : resolveUnavailable(agent, needForHardware(entry.hw.kind));
           const hover = entry
             ? `${entry.meta.name} · ${entry.hw.name}\nMin ${fmtSensorValue(stats?.min ?? null, entry.meta, tempUnit)} · Max ${fmtSensorValue(
                 stats?.max ?? null,

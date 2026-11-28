@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as Rea
 import { createPortal } from "react-dom";
 import { Copy, HardDrive, Server, X } from "lucide-react";
 import type { DiskTelemetry, DriveHealth, PhysicalDisk } from "../../types";
-import { Button, IconButton, Meter, StatCells, StatusIcon, STATUS_CLASS, type StatusTone } from "../ui";
+import { Button, IconButton, Meter, StatCells, StatusIcon, STATUS_CLASS, type StatusTone, useModalLayer } from "../ui";
 import { toast } from "../feedback/Toast";
 import { useTightMode } from "../../hooks/useTightMode";
 import { useDriveHistory } from "../../hooks/useDriveHistory";
@@ -278,6 +278,9 @@ export default function SmartDrawer({ tele, disk, health, tempUnit, readTs = nul
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
+
+  // The sheet is modal: the global hotkeys (F1–F9, Ctrl+1..8, Ctrl+K) stay off behind its scrim.
+  useModalLayer(!tight);
 
   // The sheet is modal: move focus into it and give it back on close. The docked inspector is not.
   useEffect(() => {

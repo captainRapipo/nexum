@@ -116,7 +116,7 @@ function ConditionRow({ c, onDone }: { c: HealthRow; onDone: () => void }) {
   );
 }
 
-function HealthPill() {
+function HealthPill({ view }: { view: ViewId }) {
   const health = useHealth();
   const { snapshot } = useHealthAlerts();
   const [open, setOpen] = useState(false);
@@ -129,6 +129,9 @@ function HealthPill() {
     setOpen(false);
     if (refocus) wrapRef.current?.querySelector<HTMLElement>("button")?.focus();
   }, []);
+
+  // The list belongs to the page it was opened on: a view change (F-key, Ctrl+1..8, a tray command) closes it.
+  useEffect(() => setOpen(false), [view]);
 
   useEffect(() => {
     if (!open) {
@@ -158,12 +161,20 @@ function HealthPill() {
   const showRules = rulesToggled ?? n === 0;
 
   return (
-    <div ref={wrapRef} className="relative shrink-0">
+    <div
+      ref={wrapRef}
+      className="relative shrink-0"
+      // Tab out of the list (to Rescan, into the page) closes it; a press on empty space inside it does not.
+      onBlur={(e) => {
+        if (open && e.relatedTarget instanceof Node && !e.currentTarget.contains(e.relatedTarget)) setOpen(false);
+      }}
+    >
       <StatusPill
         size="pill"
         tone={healthLevelTone(health.level)}
         summary={health.summary}
         expanded={open}
+        controls={panelId}
         onClick={() => setOpen((v) => !v)}
         // The native hover text lists the conditions and the rules; the open list already shows them.
         title={open ? undefined : healthPillTitle(health)}
@@ -345,7 +356,7 @@ export function Toolbar({ view, onRefresh, onSettings, onOpenUpdate, refreshing 
         ) : null}
       </div>
 
-      <HealthPill />
+      <HealthPill view={view} />
       <Freshness />
 
       <span className="min-w-0 flex-1" />

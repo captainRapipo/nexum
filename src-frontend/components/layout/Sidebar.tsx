@@ -122,7 +122,7 @@ const NavRow = memo(function NavRow({ id, selected, badge, onNavigate }: NavRowP
       className={cn(
         "mb-px flex h-(--nav-item-h) w-full items-center gap-[9px] rounded-md px-2.5 text-left text-[13px] leading-none font-medium whitespace-nowrap",
         "transition-colors duration-(--dur-instant)",
-        selected ? "focus-inset-on-brand bg-brand text-white" : "focus-inset text-ink hover:bg-hover active:bg-selected",
+        selected ? "focus-inset-on-brand bg-brand text-white" : "group/nav focus-inset text-ink hover:bg-hover active:bg-selected",
       )}
     >
       <Icon size={16} strokeWidth={ICON_STROKE} aria-hidden="true" className={cn("shrink-0", selected ? "text-white" : "text-icon-2")} />
@@ -130,7 +130,15 @@ const NavRow = memo(function NavRow({ id, selected, badge, onNavigate }: NavRowP
       <span className="min-w-0 truncate leading-[18px]">{label}</span>
       {badge && <NavBadge badge={badge} />}
       {key && (
-        <span aria-hidden="true" className={cn("tnum text-[11px] font-medium", badge ? "ml-2" : "ml-auto", selected ? "text-brand-key" : "text-ink-3")}>
+        // On the pressed row (7 % darker) the tertiary grey would drop to 4.39:1: the hint takes the secondary grey there.
+        <span
+          aria-hidden="true"
+          className={cn(
+            "tnum text-[11px] font-medium",
+            badge ? "ml-2" : "ml-auto",
+            selected ? "text-brand-key" : "text-ink-3 group-active/nav:text-ink-2",
+          )}
+        >
           {key}
         </span>
       )}

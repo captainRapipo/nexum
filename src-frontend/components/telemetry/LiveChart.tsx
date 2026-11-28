@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { EChartsOption, LineSeriesOption } from "echarts";
 import { Card, CHART_GRID_WITH_END_LABELS, CHART_HEX, EChart, nexumLine, Segmented, type SeriesKey } from "../ui";
 import { useTelemetry } from "../../hooks/useTelemetryStream";
+import { sensorsUp } from "../../lib/status";
 import { NOT_AVAILABLE_TEXT, type TelemetryPacket } from "../../types";
 import { finite } from "./sensorHelpers";
 
@@ -54,6 +55,7 @@ function toSample(p: TelemetryPacket): Sample {
    (a longer absence shows as a break in the lines, never as invented data). */
 const KEEP_MS = 10 * 60_000 + 10_000;
 let kept: Sample[] = [];
+const NO_SAMPLES: readonly Sample[] = [];
 
 function ingest(history: readonly TelemetryPacket[]): readonly Sample[] {
   if (history.length === 0) return kept;
@@ -200,7 +202,11 @@ export default function LiveChart() {
 
   const [range, setRange] = useState<RangeSec>(120);
   const samples = useMemo(() => ingest(source), [source]);
-  const data = useMemo(() => buildData(samples, range), [samples, range]);
+  // Sensor reading is not up (being restarted, or Rust gave up): the kept samples are not "now" any more.
+  // The chart says so instead of showing frozen lines whose end labels claim live values; when readings
+  // return, the lines come back with a gap.
+  const down = !sensorsUp(agent);
+  const data = useMemo(() => buildData(down ? NO_SAMPLES : samples, range), [down, samples, range]);
 
   const present = useMemo(() => SERIES.filter((s) => data.points[s.key].some((p) => p[1] !== null)), [data]);
   const missing = SERIES.filter((s) => !present.includes(s));

@@ -25,6 +25,9 @@
 //   ?sensors=blocked the same with failReason "blocked" (Windows security)
 //   ?sensors=starting  stays in phase "starting": no banner, pill "Checking", "—" everywhere
 //                    "Try again" goes starting → back to failed after 1.5 s while one of these is set.
+//   ?sensors=crash   the whole §2.3.1 walk: sensors work for 6 s, then sensor reading stops by itself
+//                    (phase "restarting": no message, "—", pill "Checking"), the restarts fail after 7 s
+//                    more (phase "failed": the banner), and "Try again" brings it back for good
 //   ?update=ask      Settings.updateCheck starts at "ask": the first-run update question is shown
 //   ?update=available  an update (1.3.0, sample notes) is on offer; Install walks downloading → ready → installing
 //   ?update=downloading | error | disabled   the dialog / Settings states of CONTRACT §2.15.7
@@ -174,6 +177,10 @@ const SENSORS_DOWN: { phase: "failed" | "starting"; reason: SensorFailReason | n
           ? { phase: "failed", reason: "startFailed" }
           : null;
 const NO_AGENT = SENSORS_DOWN != null;
+/** [NEW 1.2] ?sensors=crash: sensor reading stops mid-session, the automatic restarts fail, "Try again" works. */
+const SENSORS_CRASH = SENSORS_PARAM === "crash";
+const CRASH_AFTER_MS = 6000;
+const CRASH_GIVE_UP_MS = 7000;
 /** [NEW 1.2] ?update=ask|available|downloading|error|disabled (CONTRACT §2.15.7). */
 const UPDATE_PARAM = (readParam("update") ?? "").toLowerCase();
 const DRIVE_FAIL = SCENARIO.has("failing");
@@ -1805,12 +1812,15 @@ const AGENT_PID = 4812;
 
 /** "Try again" was pressed while the sensor service cannot come up (?sensors=…): phase "starting" for 1.5 s. */
 let retrying = false;
+/** ?sensors=crash: the automatic restarts were given up (phase "failed") until "Try again". */
+let crashGaveUp = false;
 
 /** Life-cycle phase as Rust reports it (CONTRACT §2.3.1). */
 function sensorPhase(): SensorServicePhase {
   if (restarting) return "starting"; // restart_agent: "starting" until the new process says hello
   if (agentRunning) return "running";
   if (SENSORS_DOWN) return retrying ? "starting" : SENSORS_DOWN.phase;
+  if (crashGaveUp) return "failed";
   return "restarting"; // it stopped by itself (?failsafe=agentLost) and Rust is bringing it back
 }
 
@@ -1959,6 +1969,21 @@ function boot(): void {
     agentStarted();
     startTimer();
     scheduleLateHardware();
+  }
+  if (SENSORS_CRASH) {
+    // §2.3.1: it stops by itself → "restarting" (the UI says nothing) → the policy gives up → "failed".
+    setTimeout(() => {
+      if (!agentRunning || restarting) return;
+      agentRunning = false;
+      stopTimer();
+      agentDownV11();
+      emitStatus();
+      setTimeout(() => {
+        if (agentRunning || restarting) return;
+        crashGaveUp = true;
+        emitStatus();
+      }, CRASH_GIVE_UP_MS);
+    }, CRASH_AFTER_MS);
   }
   setTimeout(emitStatus, 0);
   // self-usage every 5 s (first event 5 s after start), CONTRACT §2.5.
@@ -4244,6 +4269,7 @@ export const mockBackend = {
     }
     if (restarting) return;
     restarting = true;
+    crashGaveUp = false;
     stopTimer();
     agentDownV11();
     emitStatus();

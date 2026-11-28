@@ -18,8 +18,14 @@ import {
 export const TELEMETRY_HISTORY = 120;
 
 export interface TelemetryContextValue {
+  /**
+   * The newest packet of the sensor reading that is running now. [CHANGED 1.2] null again as soon as
+   * Rust reports that sensor reading is not up (it stopped and is being restarted, or Rust gave up):
+   * the last packet is then no reading any more, so every value renders "—" instead of a frozen
+   * number (CONTRACT §4.8.1, §5.1). The next packet sets it again.
+   */
   latest: TelemetryPacket | null;
-  /** Oldest → newest, at most TELEMETRY_HISTORY packets. */
+  /** Oldest → newest, at most TELEMETRY_HISTORY packets. Emptied when Rust gives up restarting (phase "failed"). */
   history: TelemetryPacket[];
   agent: AgentStatus | null;
   /** Most recent `agent-ack` (new object identity per ack, so effects can react to repeats). */
@@ -168,11 +174,22 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
       setStream({ latest: pkt, history: next });
     });
 
+    // Sensor reading is not up any more: what the views hold is the last packet of a process that is
+    // gone. Drop it, so values read "—" until the next packet; keep the history for a restart (the
+    // charts show it with a gap) and empty it when Rust has given up.
+    const applyStatus = (s: AgentStatus) => {
+      setAgent(s);
+      if (s.running && s.phase === "running") return;
+      const failed = s.phase === "failed";
+      if (failed) buffer.current = [];
+      setStream((prev) => (prev.latest == null && !(failed && prev.history.length > 0) ? prev : { latest: null, history: buffer.current }));
+    };
+
     const offStatus = subscribe<unknown>(EVENTS.agentStatus, (raw) => {
       const s = normalizeAgentStatus(raw);
       if (!s) return;
       gotStatusEvent.current = true;
-      setAgent(s);
+      applyStatus(s);
     });
 
     const offAck = subscribe<AgentAck>(EVENTS.agentAck, (a) => {
@@ -184,7 +201,10 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
       .getAgentStatus()
       .then((s) => {
         // A pushed event is fresher than this initial query; don't overwrite it.
-        if (!disposed && !gotStatusEvent.current) setAgent(normalizeAgentStatus(s));
+        if (disposed || gotStatusEvent.current) return;
+        const status = normalizeAgentStatus(s);
+        if (status) applyStatus(status);
+        else setAgent(null);
       })
       .catch((err) => {
         if (disposed || gotStatusEvent.current) return;

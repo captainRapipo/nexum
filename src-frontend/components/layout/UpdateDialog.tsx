@@ -61,10 +61,14 @@ function Progress({ update }: { update: UpdateState }) {
         : fmtBytes(update.downloadedBytes)
       : null;
   return (
-    <div role="status" aria-live="polite" className="pt-2">
+    <div className="pt-2">
       <ProgressBar value={downloading ? update.progress : 100} indeterminate={downloading && update.progress == null} label={text} />
       <div className="tnum mt-2 flex items-baseline justify-between gap-3 text-callout text-ink-2">
-        <span>{text}</span>
+        {/* Only the step is announced (Downloading… → verified → installing): the byte counter changes
+            four times a second and the progress bar already carries the percentage. */}
+        <span role="status" aria-live="polite">
+          {text}
+        </span>
         {downloading && (
           <span className="text-ink-3">
             {sizes}
