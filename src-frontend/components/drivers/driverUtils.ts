@@ -70,6 +70,45 @@ export function problemText(code: number | null | undefined): string {
   return t ? `Code ${code} · ${t}` : `Code ${code}`;
 }
 
+/** Short lower-case reason for the status chip ("Code 28 · no driver"). Codes not listed show the code only. */
+const PROBLEM_SHORT: Record<number, string> = {
+  1: "not configured",
+  3: "driver damaged",
+  10: "cannot start",
+  12: "no free resources",
+  14: "needs a restart",
+  18: "reinstall driver",
+  19: "registry damaged",
+  21: "being removed",
+  22: "disabled",
+  24: "not working",
+  28: "no driver",
+  29: "off in firmware",
+  31: "not working",
+  32: "service disabled",
+  37: "driver failed",
+  39: "driver missing",
+  40: "registry error",
+  41: "device not found",
+  43: "stopped",
+  44: "stopped",
+  45: "not connected",
+  47: "safe to remove",
+  48: "blocked",
+  52: "signature not verified",
+  54: "resetting",
+};
+
+/** Chip text for a Device Manager code: "Code 28 · no driver" (the full sentence is the hover text). */
+export function problemChipText(code: number | null | undefined): string {
+  if (code == null) return "Problem";
+  const t = PROBLEM_SHORT[code];
+  return t ? `Code ${code} · ${t}` : `Code ${code}`;
+}
+
+/** One selection of the filter bar: everything, one status, or one category. */
+export type DriverScope = "all" | "st:problem" | "st:unsigned" | `cat:${DriverCategory}`;
+
 /** A group of identical driver rows (same device name, version and provider): "Processor × 16". */
 export interface DriverRow {
   key: string;

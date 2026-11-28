@@ -14,7 +14,7 @@ import { cn, fmtSensorValue } from "../../lib/format";
 import { isModalOpen } from "../ui/Modal";
 import { toast } from "../feedback/Toast";
 import { copyText } from "./copyText";
-import { GRID_COLS, SensorRow, type SensorStats } from "./SensorRow";
+import { CELL, CELL_LAST, GRID_COLS, SensorRow, type SensorLimit, type SensorStats } from "./SensorRow";
 import { TreeNodeRow } from "./TreeNodeRow";
 import { ROW_H, sensorIdsOfRow, type SensorRowModel, type TreeRow } from "./sensorTreeModel";
 
@@ -31,8 +31,10 @@ export interface SensorTableProps {
   paint: number;
   tempUnit: "C" | "F";
   nullReason: UnavailableReason;
-  /** Values are frozen (agent offline): dim the numbers. */
+  /** Values are frozen (nothing is arriving right now): dim the numbers. */
   stale: boolean;
+  /** Known limits by sensor id (the Limit column and the hot-row marking). */
+  limits: ReadonlyMap<string, SensorLimit>;
   getStats: (id: string) => SensorStats | null;
   getHistory: (idx: number) => readonly (number | null)[];
   labelOf: (id: string, defaultName: string) => string;
@@ -60,6 +62,7 @@ function SensorTableImpl(props: SensorTableProps) {
     tempUnit,
     nullReason,
     stale,
+    limits,
     getStats,
     getHistory,
     labelOf,
@@ -443,6 +446,8 @@ function SensorTableImpl(props: SensorTableProps) {
           rowIndex={i + 2}
           domId={domIdOf(r.key)}
           top={top}
+          alt={i % 2 === 1}
+          limit={limits.get(r.meta.id) ?? null}
           label={labelOf(r.meta.id, r.meta.name)}
           stats={getStats(r.meta.id)}
           history={r.meta.static ? EMPTY : getHistory(r.meta.idx)}
@@ -472,6 +477,8 @@ function SensorTableImpl(props: SensorTableProps) {
           rowIndex={i + 2}
           domId={domIdOf(r.key)}
           top={top}
+          alt={i % 2 === 1}
+          tempUnit={tempUnit}
           selected={selected}
           focused={focused}
           onPointerSelect={onPointerSelect}
@@ -483,6 +490,7 @@ function SensorTableImpl(props: SensorTableProps) {
 
   // ARIA treegrid (header row + virtualized body). aria-rowcount / aria-rowindex let assistive tech
   // announce positions in the full list although only the visible window is in the DOM.
+  // Full-bleed on the white content surface (SPEC §7): no card, no borders between rows, zebra instead.
   return (
     <div
       ref={gridRef}
@@ -490,36 +498,34 @@ function SensorTableImpl(props: SensorTableProps) {
       aria-label="Hardware sensors"
       aria-multiselectable="true"
       aria-rowcount={rows.length + 1}
-      aria-colcount={6}
+      aria-colcount={7}
       aria-activedescendant={focusKey && focusIndex >= first && focusIndex < last ? domIdOf(focusKey) : undefined}
       tabIndex={0}
+      data-stale={stale ? "true" : "false"}
       onKeyDown={onKeyDown}
       onFocus={(e) => {
         if (e.target === e.currentTarget && focusKey == null && rows.length > 0) setFocusKey(rows[0].key);
       }}
+      // The focus ring is drawn on the focused ROW (inset, graphite), so the container shows none.
       className={cn(
-        "flex min-h-0 flex-1 flex-col rounded-b-lg outline-none",
-        "focus-visible:shadow-[inset_0_0_0_1px_rgba(45,212,191,0.35)]",
-        stale && "[&_.num]:opacity-55",
+        "group/grid flex min-h-0 flex-1 flex-col bg-content outline-none [--sensor-gutter:10px]",
+        "[--sensor-cols:minmax(0,1fr)_112px_76px_76px_76px_72px_168px]",
+        "tight:[--sensor-cols:minmax(0,1fr)_112px_68px_68px_68px_60px_120px]",
       )}
     >
-      {/* Column header (reserves the same scrollbar gutter as the body so columns align) */}
-      <div role="rowgroup" className="shrink-0">
-        <div
-          role="row"
-          aria-rowindex={1}
-          className="grid items-end gap-x-3 overflow-hidden border-b border-line pb-1.5 pr-3 scrollbar-gutter-stable"
-          style={{ gridTemplateColumns: GRID_COLS }}
-        >
+      {/* Column header (reserves the same scrollbar gutter as the body so the columns line up) */}
+      <div role="rowgroup" className="shrink-0 overflow-hidden border-b border-hairline [scrollbar-gutter:stable]">
+        <div role="row" aria-rowindex={1} className="grid h-7 items-center text-[11px] font-semibold tracking-[0.01em] text-ink-2" style={{ gridTemplateColumns: GRID_COLS }}>
           {COLUMNS.map((h, i) => (
             <span
               key={h.label}
               role="columnheader"
               aria-colindex={i + 1}
               aria-label={h.aria}
+              title={h.title}
               className={cn(
-                "label-caps [--label-color:#64748b] [--label-size:10px]",
-                i === 0 ? "pl-3" : i === 5 ? "pl-2 normal-case tracking-[0.08em]" : "text-right",
+                "truncate whitespace-nowrap",
+                i === 0 ? "pl-(--page-pad-x) pr-3" : i === COLUMNS.length - 1 ? CELL_LAST : cn(CELL, "text-right"),
               )}
             >
               {h.label}
@@ -532,7 +538,7 @@ function SensorTableImpl(props: SensorTableProps) {
         ref={scrollRef}
         role="rowgroup"
         onScroll={onScroll}
-        className="relative min-h-0 flex-1 overflow-y-auto overflow-x-hidden scrollbar-gutter-stable"
+        className="relative min-h-0 flex-1 overflow-y-auto overflow-x-hidden [scrollbar-gutter:stable]"
       >
         <div style={{ height: rows.length * ROW_H, position: "relative" }}>{items}</div>
       </div>
@@ -540,13 +546,14 @@ function SensorTableImpl(props: SensorTableProps) {
   );
 }
 
-const COLUMNS: { label: string; aria: string }[] = [
+const COLUMNS: { label: string; aria: string; title?: string }[] = [
   { label: "Sensor", aria: "Sensor" },
   { label: "Value", aria: "Current value" },
   { label: "Min", aria: "Session minimum" },
   { label: "Max", aria: "Session maximum" },
   { label: "Avg", aria: "Session average" },
-  { label: "60 s", aria: "Last 60 seconds" },
+  { label: "Limit", aria: "Limit", title: "The limit Nexum watches for this sensor, where one is known. A reading at or above it is marked." },
+  { label: "Last 60 s", aria: "Last 60 seconds" },
 ];
 
 const EMPTY: readonly (number | null)[] = [];

@@ -1,5 +1,7 @@
 import type { SensorMeta } from "../../types";
-import { cn, fmtSensorValue } from "../../lib/format";
+import { cn, fmtSensorValue, toTempUnit } from "../../lib/format";
+
+// CONTRACT §4.7, §4.8 (units once) / docs/design/SPEC.md §8.
 
 export interface StatCellsProps {
   value: number | null;
@@ -13,23 +15,30 @@ export interface StatCellsProps {
   cellClassName?: string;
 }
 
-/** Value / Min / Max / Avg as four right-aligned tabular-number cells; null → "—". */
+/**
+ * Value / Min / Max / Avg as four right-aligned tabular-number cells; null → "—".
+ * The unit is shown ONCE, in tertiary text after the value; Min, Max and Avg are numbers only.
+ */
 export function StatCells({ value, min, max, avg, meta, tempUnit, className, cellClassName }: StatCellsProps) {
-  const cells: Array<[string, number | null, string]> = [
-    ["Value", value, "text-ink"],
-    ["Min", min, "text-slate-400"],
-    ["Max", max, "text-slate-300"],
-    ["Avg", avg, "text-slate-400"],
+  const toF = meta.unit === "°C" && tempUnit === "F";
+  const unit: string = toF ? "°F" : meta.unit;
+  const bare = { decimals: meta.decimals, kind: meta.kind, unit: "" } as StatCellsProps["meta"];
+  const num = (v: number | null) => fmtSensorValue(v == null || !toF ? v : toTempUnit(v, "F"), bare, "C");
+  const full = (v: number | null) => fmtSensorValue(v, meta, tempUnit);
+  const rest: Array<[string, number | null]> = [
+    ["Min", min],
+    ["Max", max],
+    ["Avg", avg],
   ];
   return (
     <div className={cn("contents", className)}>
-      {cells.map(([label, v, tone]) => (
-        <span
-          key={label}
-          aria-label={`${label}: ${fmtSensorValue(v, meta, tempUnit)}`}
-          className={cn("num whitespace-nowrap text-right tabular-nums", tone, cellClassName)}
-        >
-          {fmtSensorValue(v, meta, tempUnit)}
+      <span aria-label={`Value: ${full(value)}`} className={cn("tnum whitespace-nowrap text-right", value == null ? "text-ink-3" : "font-semibold text-ink", cellClassName)}>
+        {num(value)}
+        {value != null && unit !== "" && <span className="ml-[3px] font-normal text-ink-3">{unit}</span>}
+      </span>
+      {rest.map(([label, v]) => (
+        <span key={label} aria-label={`${label}: ${full(v)}`} className={cn("tnum whitespace-nowrap text-right", v == null ? "text-ink-3" : "text-ink-2", cellClassName)}>
+          {num(v)}
         </span>
       ))}
     </div>

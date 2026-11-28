@@ -1,407 +1,258 @@
-/* Nexum: dark-teal / gold BIOS telemetry theme (Tailwind v4).
-   Scan only src-frontend so build output and Rust/.NET folders are never scanned. */
+/* Nexum 1.2: white + Nexum Crimson, macOS-grade light theme (Tailwind v4). CONTRACT §4.9.
+   Source: docs/design/tokens.css (same values, utility names). Light theme only this round.
+   Scan only src-frontend so build output and the Rust / .NET folders are never scanned.
+
+   The 1.1 dark-theme names are gone (teal, gold, rose, cyan, purple, silver, muted, canvas-0/1 and the
+   .glass / .led-* / .glow-* / .label-caps / .leader classes): every view uses the names below.
+   Status names (ok / warn / crit / info / unknown) are the TEXT colours (AA on white and on their
+   tints); the -icon / -bg / -border variants are for glyphs, tints and outlines.
+
+   Four rules the tokens cannot enforce (docs/design/SPEC.md "Global rules"):
+   1. Crimson (brand) = selected sidebar row, the ONE primary button of a screen, the logo. Nothing else.
+   2. Controls are graphite (toggles, checkboxes, segmented, sliders, meters, focus ring, links).
+   3. Status = icon + word + tint, never colour alone. Critical is vermilion with the filled octagon.
+   4. Chart series never use red, amber or green. */
 @import "tailwindcss" source("../");
+@import "./fonts.css";
 
-@theme {
-  /* Palette (CONTRACT §4 theme tokens) */
-  --color-canvas-0: #070b0e;
-  --color-canvas-1: #0d1b1e;
-  --color-card: rgba(16, 26, 30, 0.72);
-  --color-line: rgba(255, 255, 255, 0.08);
-  --color-teal: #2dd4bf;
-  --color-gold: #d4a359;
-  --color-purple: #9333ea;
-  --color-rose: #e11d48;
-  --color-cyan: #22d3ee;
-  --color-silver: #cbd5e1;
-  --color-ink: #f8fafc;
-  --color-muted: #64748b;
+/* "static": every token below is always emitted as a CSS variable, so var(--color-…) also works in
+   inline styles, SVG and ECharts options (Tailwind would otherwise drop variables no class uses). */
+@theme static {
+  /* ---- Base names kept from 1.1 ---- */
+  --color-card: #ffffff;
+  --color-line: rgba(0, 0, 0, 0.08);
+  --color-ink: #1d1d1f;
 
-  /* Semantic status tokens (CONTRACT §4.9, ROADMAP §6.1). State only; never used for chart series.
-     Gold is brand + GPU series only and never conveys state. Info uses --color-cyan. */
-  --color-ok: #2dd4bf;
-  --color-warn: #f59e0b;
-  --color-crit: #e11d48;
-  --color-unknown: #64748b;
+  /* ---- Status: the bare name is the text colour; -icon / -bg / -border variants ---- */
+  --color-ok: #1b7a3a;       --color-ok-icon: #28a04d;      --color-ok-bg: #eaf6ee;      --color-ok-border: #c5e6cf;
+  --color-warn: #925200;     --color-warn-icon: #c47a00;    --color-warn-bg: #fff5e1;    --color-warn-border: #f6dca6;
+  --color-crit: #b3260f;     --color-crit-icon: #d9381e;    --color-crit-bg: #fdede9;    --color-crit-border: #f5c4b8;
+  --color-info: #0a5fc2;     --color-info-icon: #1f74db;    --color-info-bg: #eaf2fd;    --color-info-border: #c3daf7;
+  --color-unknown: #535a66;  --color-unknown-icon: #7a8291; --color-unknown-bg: #eff1f4; --color-unknown-border: #d6dae1;
 
-  /* Typography: Inter for UI, JetBrains Mono for numeric readouts */
+  /* ---- Brand (selection, one primary action, logo; never data) ---- */
+  --color-brand: #c8102e;
+  --color-brand-hover: #b60e2a;
+  --color-brand-pressed: #a50d27;
+  --color-brand-key: #ffe5ea;      /* F-key hint on the selected nav row, 4.94:1 */
+
+  /* ---- Text and surfaces ---- */
+  --color-ink-2: #5f5f65;
+  --color-ink-3: #646469;
+  --color-ink-disabled: #a2a2a9;
+  --color-canvas: #f5f5f7;
+  --color-content: #ffffff;
+  --color-sidebar: #efeff2;
+  --color-sidebar-card: rgba(255, 255, 255, 0.66);
+  --color-toolbar: #fafafb;
+  --color-inset: #f5f5f7;
+  --color-row-alt: #f7f7f9;
+  --color-selected: rgba(0, 0, 0, 0.07);
+  --color-hover: rgba(0, 0, 0, 0.04);
+  --color-pressed: rgba(0, 0, 0, 0.08);
+  --color-disabled: #f5f5f7;
+  --color-scrim: rgba(29, 29, 31, 0.3);
+  --color-divider: #ececef;
+  --color-hairline: rgba(0, 0, 0, 0.08);
+  --color-subtle: rgba(0, 0, 0, 0.12);
+  --color-strong: rgba(0, 0, 0, 0.2);
+  --color-fill: #000000;           /* codemod target for bg-white/[a] and border-white/[a] overlays */
+  --color-icon: #3a3a3e;
+  --color-icon-2: #55555b;
+
+  /* ---- Graphite controls (SC 1.4.11) ---- */
+  --color-control-border: #86868b;
+  --color-control-on: #2c2c2e;
+  --color-seg-track: #e8e8ec;
+  --color-seg-count: #c4c4ca;      /* counts inside the selected segment */
+  --color-slider-track: #d8d8dd;
+  --color-meter-track: #ebebee;
+  --color-meter-fill: #3a3a3e;
+  --color-meter-warn: #b87200;
+  --color-kbd: #e8e8ec;
+  --color-tag: #efeff2;
+
+  /* ---- Data series (never red / amber / green) ---- */
+  --color-series-cpu: #1e4fc2;
+  --color-series-gpu: #0e97a6;
+  --color-series-ram: #b06cf0;
+  --color-series-vram: #5b5b61;    /* always dashed 4 3 */
+  --color-series-single: #3a3a3e;
+  --color-series-neutral: #8e8e95;
+  --color-chart-grid: #ececef;
+  --color-chart-axis: #c9c9ce;
+  --color-chart-ref: #b9b9bf;
+
+  /* ---- Typography: Inter for UI AND numbers (tabular-nums); JetBrains Mono for identifiers only ---- */
   --font-sans: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
+  /* Only 400 / 500 / 600 are bundled: heavier utilities resolve to 600, never to a synthesised bold. */
+  --font-weight-bold: 600;
+  --font-weight-extrabold: 600;
+  --font-weight-black: 600;
 
-  /* Motion */
+  /* text-<name> sets size, line height, tracking and (where given) weight together.
+     NOTE: the toolbar title size is "toolbar-title", not "toolbar" (text-toolbar is the surface colour). */
+  --text-hero: 84px;           --text-hero--line-height: 1;            --text-hero--letter-spacing: -0.045em;        --text-hero--font-weight: 600;
+  --text-hero-tight: 64px;     --text-hero-tight--line-height: 1;      --text-hero-tight--letter-spacing: -0.04em;   --text-hero-tight--font-weight: 600;
+  --text-display: 36px;        --text-display--line-height: 40px;      --text-display--letter-spacing: -0.03em;      --text-display--font-weight: 600;
+  --text-display-tight: 30px;  --text-display-tight--line-height: 34px; --text-display-tight--letter-spacing: -0.03em; --text-display-tight--font-weight: 600;
+  --text-large-num: 26px;      --text-large-num--line-height: 30px;    --text-large-num--letter-spacing: -0.02em;
+  --text-title-1: 26px;        --text-title-1--line-height: 32px;      --text-title-1--letter-spacing: -0.021em;     --text-title-1--font-weight: 600;
+  --text-toolbar-title: 15px;  --text-toolbar-title--line-height: 19px; --text-toolbar-title--letter-spacing: -0.01em; --text-toolbar-title--font-weight: 600;
+  --text-toolbar-sub: 11.5px;  --text-toolbar-sub--line-height: 14px;
+  --text-title-2: 15px;        --text-title-2--line-height: 20px;      --text-title-2--letter-spacing: -0.009em;     --text-title-2--font-weight: 600;
+  --text-headline: 13px;       --text-headline--line-height: 18px;     --text-headline--font-weight: 600;
+  --text-body: 13px;           --text-body--line-height: 20px;
+  --text-table: 12.5px;        --text-table--line-height: 24px;
+  --text-callout: 12px;        --text-callout--line-height: 17px;
+  --text-caption: 11px;        --text-caption--line-height: 14px;      --text-caption--letter-spacing: 0.01em;
+  --text-mono: 11.5px;         --text-mono--line-height: 16px;
+
+  /* ---- Radii, shadows ---- */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-btn: 7px;
+  --radius-md: 7px;
+  --radius-lg: 10px;
+  --radius-card: 14px;
+  --radius-sheet: 16px;
+
+  --shadow-card: 0 0 0 0.5px rgba(0, 0, 0, 0.07), 0 1px 2px rgba(0, 0, 0, 0.04), 0 2px 8px rgba(0, 0, 0, 0.025);
+  --shadow-raised: 0 0 0 0.5px rgba(0, 0, 0, 0.08), 0 2px 6px rgba(0, 0, 0, 0.06), 0 8px 24px rgba(0, 0, 0, 0.06);
+  --shadow-popover: 0 0 0 0.5px rgba(0, 0, 0, 0.1), 0 10px 30px rgba(0, 0, 0, 0.14);
+  --shadow-sheet: 0 0 0 0.5px rgba(0, 0, 0, 0.12), 0 24px 64px rgba(0, 0, 0, 0.22), 0 4px 12px rgba(0, 0, 0, 0.08);
+  --shadow-control: 0 0 0 1px rgba(0, 0, 0, 0.14), 0 1px 1.5px rgba(0, 0, 0, 0.07);
+  --shadow-control-disabled: 0 0 0 1px rgba(0, 0, 0, 0.08);
+  --shadow-primary: 0 0 0 0.5px rgba(120, 0, 20, 0.3), 0 1px 1.5px rgba(120, 0, 20, 0.25);
+  --shadow-focus: 0 0 0 1px #ffffff, 0 0 0 3px #2c2c2e;
+  --shadow-selected: inset 0 0 0 1px #1d1d1f, 0 0 0 3px rgba(0, 0, 0, 0.08);   /* selected card / tile */
+
+  --breakpoint-compact: 1400px;   /* width only: max-compact:… (use tight: for the width-OR-height rule) */
+
+  /* ---- Motion ---- */
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-emphasized: cubic-bezier(0.3, 0, 0, 1.15);
   --animate-led-pulse: nx-led-pulse 2.2s ease-in-out infinite;
-  --animate-view-in: nx-view-in 280ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
-  --animate-fade-in: nx-fade-in 200ms ease-out both;
-  --animate-sweep: nx-sweep 1.8s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+  --animate-view-in: nx-view-in 220ms cubic-bezier(0.2, 0, 0, 1) both;
+  --animate-fade-in: nx-fade-in 160ms ease-out both;
+  --animate-sweep: nx-sweep 1.6s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+  --animate-dialog-in: nx-dialog-in 300ms cubic-bezier(0.2, 0, 0, 1) both;
 
-  @keyframes nx-led-pulse {
-    0%,
-    100% {
-      opacity: 1;
-    }
-    50% {
-      opacity: 0.4;
-    }
-  }
+  @keyframes nx-led-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+  @keyframes nx-view-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  @keyframes nx-fade-in { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes nx-sweep { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+  @keyframes nx-dialog-in { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: none; } }
+}
 
-  @keyframes nx-view-in {
-    from {
-      opacity: 0;
-      transform: translateY(6px);
-    }
-    to {
-      opacity: 1;
-      transform: none;
-    }
-  }
+/* "tight" = viewport at most 1399 px wide OR at most 899 px tall (TIGHT_MEDIA_QUERY in types.ts,
+   useTightMode() in hooks). Large titles move into the toolbar, the sidebar narrows to 200 px, KPI
+   numerals shrink, the S.M.A.R.T. sheet docks. Usage: tight:hidden / hidden tight:block.
+   "regular" is its exact complement (at least 1400 x 900). */
+@custom-variant tight {
+  @media (max-width: 1399px) { @slot; }
+  @media (max-height: 899px) { @slot; }
+}
+@custom-variant regular {
+  @media (min-width: 1400px) and (min-height: 900px) { @slot; }
+}
 
-  @keyframes nx-fade-in {
-    from {
-      opacity: 0;
-    }
-    to {
-      opacity: 1;
-    }
-  }
+/* Layout and motion constants (docs/design/SPEC.md). Use as w-(--sidebar-w), px-(--page-pad-x), h-(--toolbar-h)… */
+:root {
+  --sidebar-w: 220px;
+  --toolbar-h: 52px;
+  --nav-item-h: 28px;
+  --page-pad-x: 28px;
+  --page-pad-y: 20px;
+  --grid-gap: 16px;
+  --card-pad-x: 20px;
+  --card-pad-y: 16px;
+  --row-h-dense: 24px;      /* Sensors tree, Drivers table */
+  --row-h-regular: 32px;    /* lists inside cards */
+  --inspector-w: 380px;     /* docked S.M.A.R.T. inspector (tight mode) */
+  --sheet-w: 520px;         /* floating S.M.A.R.T. sheet (regular mode) */
+  --dialog-w: 468px;
 
-  @keyframes nx-sweep {
-    from {
-      transform: translateX(-100%);
-    }
-    to {
-      transform: translateX(250%);
-    }
-  }
+  --dur-instant: 80ms;      /* hover, press */
+  --dur-fast: 140ms;        /* toggles, segments, pill state */
+  --dur-base: 220ms;        /* popover, inspector */
+  --dur-slow: 300ms;        /* sheet, dialog */
+}
+@media (max-width: 1399px) {
+  :root { --sidebar-w: 200px; --page-pad-x: 24px; }
+}
+@media (max-height: 899px) {
+  :root { --sidebar-w: 200px; --page-pad-x: 24px; }
 }
 
 /* ------------------------------------------------------------------ */
 /* Base                                                               */
 /* ------------------------------------------------------------------ */
-
 @layer base {
-  :root {
-    color-scheme: dark;
-  }
-
-  html,
-  body,
-  #root {
-    height: 100%;
-  }
-
+  :root { color-scheme: light; }
+  html, body, #root { height: 100%; }
+  html { background: var(--color-canvas); }
   body {
     margin: 0;
     font-family: var(--font-sans);
     font-size: 13px;
-    line-height: 1.45;
+    line-height: 20px;
+    letter-spacing: -0.003em;
     color: var(--color-ink);
-    background-color: var(--color-canvas-0);
-    background-image:
-      radial-gradient(1100px 620px at 12% -8%, rgba(45, 212, 191, 0.1), transparent 62%),
-      radial-gradient(900px 600px at 105% 0%, rgba(212, 163, 89, 0.07), transparent 60%),
-      radial-gradient(1400px 900px at 50% 125%, rgba(147, 51, 234, 0.05), transparent 60%),
-      radial-gradient(ellipse 120% 90% at 50% 0%, var(--color-canvas-1) 0%, var(--color-canvas-0) 72%);
-    background-attachment: fixed;
+    background: var(--color-canvas);
     -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-    text-rendering: optimizeLegibility;
-    font-feature-settings: "cv11", "ss01";
+    font-feature-settings: "cv05";
     overflow: hidden;
   }
+  ::selection { background: rgba(30, 79, 194, 0.18); color: inherit; }
 
-  /* Faint engineering grid */
-  body::before {
-    content: "";
-    position: fixed;
-    inset: 0;
-    pointer-events: none;
-    z-index: 0;
-    background-image:
-      linear-gradient(rgba(45, 212, 191, 0.045) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(45, 212, 191, 0.045) 1px, transparent 1px);
-    background-size: 44px 44px;
-    -webkit-mask-image: radial-gradient(ellipse 85% 70% at 50% 30%, #000 20%, transparent 80%);
-    mask-image: radial-gradient(ellipse 85% 70% at 50% 30%, #000 20%, transparent 80%);
-  }
+  /* Desktop app: the arrow cursor everywhere, as in native Windows and macOS controls. */
+  button:not(:disabled), [role="button"]:not([aria-disabled="true"]), [role="switch"]:not([aria-disabled="true"]), [role="radio"]:not([aria-disabled="true"]) { cursor: default; }
+  button:disabled { cursor: default; }
 
-  /* CRT scanlines, kept beneath content so text stays crisp */
-  body::after {
-    content: "";
-    position: fixed;
-    inset: 0;
-    pointer-events: none;
-    z-index: 0;
-    background: repeating-linear-gradient(
-      180deg,
-      rgba(255, 255, 255, 0.016) 0px,
-      rgba(255, 255, 255, 0.016) 1px,
-      transparent 1px,
-      transparent 3px
-    );
-  }
+  /* Graphite focus ring: 2 px with a 1 px gap, never crimson (SPEC §24). Drawn as an outline, not a
+     box-shadow, so a component's own shadow-* class cannot erase it and it survives Windows high
+     contrast (forced-colors removes box-shadows). Inside rows and list items add .focus-inset. */
+  :focus-visible { outline: 2px solid var(--color-control-on); outline-offset: 1px; }
+  :focus:not(:focus-visible) { outline: none; }
 
-  #root {
-    position: relative;
-    z-index: 1;
-    isolation: isolate;
-  }
-
-  ::selection {
-    background: rgba(45, 212, 191, 0.28);
-    color: #fff;
-  }
-
-  /* Tailwind v4 preflight sets cursor: default on buttons; restore app affordance. */
-  button:not(:disabled),
-  [role="button"]:not([aria-disabled="true"]),
-  [role="switch"]:not([aria-disabled="true"]),
-  [role="radio"]:not([aria-disabled="true"]) {
-    cursor: pointer;
-  }
-
-  button:disabled {
-    cursor: not-allowed;
-  }
-
-  :focus-visible {
-    outline: 2px solid var(--color-teal);
-    outline-offset: 2px;
-  }
-
-  :focus:not(:focus-visible) {
-    outline: none;
-  }
-
-  /* Thin HUD scrollbars (WebView2 / Chromium) */
-  ::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
-  }
-  ::-webkit-scrollbar-track {
-    background: transparent;
-  }
-  ::-webkit-scrollbar-thumb {
-    background-color: rgba(148, 163, 184, 0.16);
-    border: 2px solid transparent;
-    border-radius: 999px;
-    background-clip: padding-box;
-  }
-  ::-webkit-scrollbar-thumb:hover {
-    background-color: rgba(45, 212, 191, 0.42);
-  }
-  ::-webkit-scrollbar-corner {
-    background: transparent;
-  }
-
-  @supports not selector(::-webkit-scrollbar) {
-    * {
-      scrollbar-width: thin;
-      scrollbar-color: rgba(148, 163, 184, 0.22) transparent;
-    }
-  }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background-color: rgba(0, 0, 0, 0.22); border: 3px solid transparent; border-radius: 999px; background-clip: padding-box; }
+  ::-webkit-scrollbar-thumb:hover { background-color: rgba(0, 0, 0, 0.38); }
+  ::-webkit-scrollbar-corner { background: transparent; }
 }
 
 /* ------------------------------------------------------------------ */
-/* Components: plain classes in the components layer, so any Tailwind utility  */
-/* placed on the same element (hidden, rounded-*, border-*, text-*) wins.       */
+/* Components: legacy class names restyled for the light theme, plus   */
+/* the few shared helpers of the new system. Plain classes in the      */
+/* components layer, so any Tailwind utility on the same element wins. */
 /* ------------------------------------------------------------------ */
-
 @layer components {
+  /* Numbers: Inter with tabular figures (no monospace numerals any more) */
+  .num { font-family: var(--font-sans); font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1, "cv05" 1; letter-spacing: 0; }
+  .tnum { font-variant-numeric: tabular-nums; }
 
-/* Translucent glass card surface */
-.glass {
-  background: linear-gradient(180deg, rgba(20, 33, 38, 0.78) 0%, rgba(12, 21, 25, 0.72) 100%);
-  border: 1px solid var(--color-line);
-  border-radius: 14px;
-  -webkit-backdrop-filter: blur(14px) saturate(135%);
-  backdrop-filter: blur(14px) saturate(135%);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.045),
-    inset 0 0 0 1px rgba(45, 212, 191, 0.02),
-    0 18px 40px -24px rgba(0, 0, 0, 0.85);
-}
+  .kbd, .kbd-sm { display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: 4px; background: var(--kbd-bg, var(--color-kbd)); font-family: var(--font-sans); font-weight: 500; line-height: 1; color: var(--kbd-color, var(--color-ink-2)); font-variant-numeric: tabular-nums; }
+  .kbd { min-width: 22px; height: 18px; padding: 0 5px; font-size: 10.5px; }
+  .kbd-sm { height: 16px; padding: 0 4px; font-size: 10px; }
 
-/* Denser glass for overlays (modals, popovers) */
-.glass-strong {
-  background: linear-gradient(180deg, rgba(17, 29, 34, 0.94) 0%, rgba(9, 16, 19, 0.94) 100%);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 16px;
-  -webkit-backdrop-filter: blur(20px) saturate(140%);
-  backdrop-filter: blur(20px) saturate(140%);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.06),
-    0 0 0 1px rgba(45, 212, 191, 0.05),
-    0 30px 80px -20px rgba(0, 0, 0, 0.9),
-    0 0 60px -30px rgba(45, 212, 191, 0.35);
-}
+  .scroll-fade { overflow-y: auto; scrollbar-width: thin; scrollbar-color: rgba(0, 0, 0, 0.25) transparent; }
+  .scroll-fade[data-fade="true"] { -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 24px), transparent); mask-image: linear-gradient(to bottom, #000 calc(100% - 24px), transparent); }
 
-/* Crisp monospace numerals */
-.num {
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums slashed-zero;
-  font-feature-settings: "zero" 1, "tnum" 1;
-  letter-spacing: -0.015em;
+  /* Shared pieces of the new system (docs/design/SPEC.md) */
+  .zebra > :nth-child(even) { background: var(--color-row-alt); }
+  .link-ink { color: var(--color-ink); font-weight: 500; display: inline-flex; align-items: center; gap: 1px; }
+  .link-ink:hover { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  .link-ink > svg:last-child { color: var(--color-ink-3); width: 13px; height: 13px; }
+  /* Focus ring for rows, list items and anything clipped by its container (SPEC §24). */
+  .focus-inset:focus-visible { outline-offset: -2px; }
+  /* Focus ring on the crimson selected sidebar row: graphite ring with a white line inside it. */
+  .focus-inset-on-brand:focus-visible { outline-offset: -2px; box-shadow: inset 0 0 0 3px #ffffff; }
 }
-
-/* Small uppercase BIOS label. Recolour / resize with [--label-color:…] / [--label-size:…]. */
-.label-caps {
-  font-size: var(--label-size, 10.5px);
-  font-weight: 600;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: var(--label-color, var(--color-muted));
-}
-
-/* Keycap. Recolour with [--kbd-color:…] / [--kbd-border:…] instead of overriding. */
-.kbd {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 22px;
-  height: 18px;
-  padding: 0 5px;
-  border-radius: 4px;
-  border: 1px solid var(--kbd-border, rgba(255, 255, 255, 0.13));
-  border-bottom-width: 2px;
-  background: rgba(255, 255, 255, 0.04);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 600;
-  line-height: 1;
-  color: var(--kbd-color, #cbd5e1);
-}
-
-/* Compact keycap for inline hints */
-.kbd-sm {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  height: 16px;
-  padding: 0 4px;
-  border-radius: 3px;
-  border: 1px solid var(--kbd-border, rgba(255, 255, 255, 0.12));
-  border-bottom-width: 2px;
-  background: rgba(255, 255, 255, 0.03);
-  font-family: var(--font-mono);
-  font-size: 9px;
-  font-weight: 600;
-  line-height: 1;
-  color: var(--kbd-color, #64748b);
-}
-
-/* Dotted leader fill (use on a flex-1 spacer) */
-.leader {
-  height: 2px;
-  background-image: radial-gradient(circle, rgba(148, 163, 184, 0.38) 0.75px, transparent 1.15px);
-  background-size: 5px 2px;
-  background-repeat: repeat-x;
-  background-position: left center;
-}
-
-/* LED glows: lit segment / dot with bloom */
-.led-teal {
-  background-color: var(--color-teal);
-  box-shadow: 0 0 6px rgba(45, 212, 191, 0.7), 0 0 1px rgba(45, 212, 191, 1);
-}
-.led-gold {
-  background-color: var(--color-gold);
-  box-shadow: 0 0 6px rgba(212, 163, 89, 0.7), 0 0 1px rgba(212, 163, 89, 1);
-}
-.led-purple {
-  background-color: #a855f7;
-  box-shadow: 0 0 6px rgba(168, 85, 247, 0.75), 0 0 1px rgba(168, 85, 247, 1);
-}
-.led-rose {
-  background-color: var(--color-rose);
-  box-shadow: 0 0 7px rgba(225, 29, 72, 0.8), 0 0 1px rgba(225, 29, 72, 1);
-}
-.led-cyan {
-  background-color: var(--color-cyan);
-  box-shadow: 0 0 6px rgba(34, 211, 238, 0.7), 0 0 1px rgba(34, 211, 238, 1);
-}
-.led-silver {
-  background-color: var(--color-silver);
-  box-shadow: 0 0 5px rgba(203, 213, 225, 0.55), 0 0 1px rgba(203, 213, 225, 1);
-}
-
-/* Status LEDs (semantic tokens) */
-.led-ok {
-  background-color: var(--color-ok);
-  box-shadow: 0 0 6px rgba(45, 212, 191, 0.7), 0 0 1px rgba(45, 212, 191, 1);
-}
-.led-warn {
-  background-color: var(--color-warn);
-  box-shadow: 0 0 6px rgba(245, 158, 11, 0.7), 0 0 1px rgba(245, 158, 11, 1);
-}
-.led-crit {
-  background-color: var(--color-crit);
-  box-shadow: 0 0 7px rgba(225, 29, 72, 0.8), 0 0 1px rgba(225, 29, 72, 1);
-}
-.led-unknown {
-  background-color: var(--color-unknown);
-}
-
-/* Independently scrolling column: thin visible scrollbar + bottom fade while more content is below */
-.scroll-fade {
-  overflow-y: auto;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
-}
-.scroll-fade::-webkit-scrollbar {
-  width: 6px;
-}
-.scroll-fade::-webkit-scrollbar-thumb {
-  background-color: rgba(148, 163, 184, 0.32);
-}
-.scroll-fade[data-fade="true"] {
-  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent);
-  mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent);
-}
-
-/* Soft outer glow for containers */
-.glow-teal {
-  box-shadow: 0 0 0 1px rgba(45, 212, 191, 0.22), 0 0 24px -6px rgba(45, 212, 191, 0.5);
-}
-.glow-gold {
-  box-shadow: 0 0 0 1px rgba(212, 163, 89, 0.22), 0 0 24px -6px rgba(212, 163, 89, 0.5);
-}
-.glow-rose {
-  box-shadow: 0 0 0 1px rgba(225, 29, 72, 0.25), 0 0 24px -6px rgba(225, 29, 72, 0.55);
-}
-
-/* Text glows for big readouts */
-.text-glow-teal {
-  text-shadow: 0 0 14px rgba(45, 212, 191, 0.45);
-}
-.text-glow-gold {
-  text-shadow: 0 0 14px rgba(212, 163, 89, 0.45);
-}
-.text-glow-purple {
-  text-shadow: 0 0 14px rgba(168, 85, 247, 0.5);
-}
-.text-glow-rose {
-  text-shadow: 0 0 14px rgba(225, 29, 72, 0.55);
-}
-.text-glow-cyan {
-  text-shadow: 0 0 14px rgba(34, 211, 238, 0.45);
-}
-.text-glow-silver {
-  text-shadow: 0 0 12px rgba(203, 213, 225, 0.3);
-}
-
-}
-
-/* ------------------------------------------------------------------ */
-/* Accessibility: honour reduced-motion                               */
-/* ------------------------------------------------------------------ */
 
 @media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-    scroll-behavior: auto !important;
-  }
+  :root { --dur-instant: 0ms; --dur-fast: 0ms; --dur-base: 0ms; --dur-slow: 0ms; }
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
 }

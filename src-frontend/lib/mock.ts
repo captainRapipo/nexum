@@ -12,13 +12,23 @@
 //   ?pawnio=missing  elevated, PawnIO not installed (pawnIoMissing); ?pawnio=outdated → 2.0.1 (pawnIoOutdated)
 //   ?failsafe=interrupted|agentLost|previousBoot   fan fail-safe banner states (§1.5, §2.4)
 //   ?mock=limited,hot,noagent,failing,usb
-//     limited  = admin=0 · hot = CPU + GPU near their limits · noagent = sidecar never starts
+//     limited  = admin=0 · hot = CPU + GPU near their limits · noagent = same as ?sensors=failed (startFailed)
 //     failing  = second NVMe reports a critical warning · usb = adds a USB stick without S.M.A.R.T.
 //   [NEW 1.1]
 //   ?fps=on          frame capture starts enabled (with ?rig=owner a game "Game.exe" is running)
 //   ?fps=error       frame capture fails its PresentMon signature check (session error)
 //   ?alerts=hot      Rust alert engine also reports a cpu-temp crit and a gpu-temp:0 warn
 //   ?gpu=nvidia      owner rig without an AMD GPU for the tuning panel (supported:false, noAmdGpu)
+//   [NEW 1.2]
+//   ?sensors=failed  sensor reading could not be brought back (phase "failed", failReason "crashed"): the one
+//                    "Nexum can't read sensors right now." banner, "—" everywhere. Alias: ?sensors=down
+//   ?sensors=blocked the same with failReason "blocked" (Windows security)
+//   ?sensors=starting  stays in phase "starting": no banner, pill "Checking", "—" everywhere
+//                    "Try again" goes starting → back to failed after 1.5 s while one of these is set.
+//   ?update=ask      Settings.updateCheck starts at "ask": the first-run update question is shown
+//   ?update=available  an update (1.3.0, sample notes) is on offer; Install walks downloading → ready → installing
+//   ?update=downloading | error | disabled   the dialog / Settings states of CONTRACT §2.15.7
+//   (default: updateCheck "manual", build channel "preview", state idle, so screenshots show no question)
 
 import type {
   AgentAck,
@@ -61,9 +71,11 @@ import type {
   ReportFormat,
   SelfUsage,
   SensorDriverStatus,
+  SensorFailReason,
   SensorKind,
   SensorLogStatus,
   SensorMeta,
+  SensorServicePhase,
   SensorTree,
   SensorUnit,
   SensorValues,
@@ -78,6 +90,9 @@ import type {
   TrashScan,
   TuningProbeSummary,
   TuningState,
+  UpdateChannel,
+  UpdateErrorCode,
+  UpdateState,
   Volume,
 } from "../types";
 import {
@@ -94,9 +109,12 @@ import {
   GPU_EDGE_WARN_C,
   GPU_HOTSPOT_CRIT_DEFAULT_C,
   GPU_MEM_JUNCTION_CRIT_DEFAULT_C,
+  INITIAL_UPDATE_STATE,
   RECYCLE_AGE_OPTIONS,
   SENSOR_LOG_INTERVALS_MS,
   TRASH_DETAILS_LIMIT,
+  UPDATE_ERROR_TEXT,
+  UPDATE_NOTES_MAX_CHARS,
 } from "../types";
 import { driveDisplayName, joinDisks, normSerial } from "./disks";
 import { fmtBytes } from "./format";
@@ -140,7 +158,24 @@ const PAWNIO_STATE: "ok" | "missing" | "outdated" =
 /** No ring-0 access: CPU MSR/SMU sensors, Super I/O and SPD are unavailable. */
 const NO_RING0 = ADMIN0 || PAWNIO_STATE !== "ok";
 const HOT = SCENARIO.has("hot");
-const NO_AGENT = SCENARIO.has("noagent");
+/**
+ * [NEW 1.2] ?sensors=failed|down|blocked|starting (and the older ?mock=noagent): the sensor service never
+ * comes up in this session. `phase` is what Rust reports once its automatic restarts are over (§2.3.1).
+ */
+const SENSORS_PARAM = (readParam("sensors") ?? "").toLowerCase();
+const SENSORS_DOWN: { phase: "failed" | "starting"; reason: SensorFailReason | null } | null =
+  SENSORS_PARAM === "failed" || SENSORS_PARAM === "down"
+    ? { phase: "failed", reason: "crashed" }
+    : SENSORS_PARAM === "blocked"
+      ? { phase: "failed", reason: "blocked" }
+      : SENSORS_PARAM === "starting"
+        ? { phase: "starting", reason: null }
+        : SCENARIO.has("noagent")
+          ? { phase: "failed", reason: "startFailed" }
+          : null;
+const NO_AGENT = SENSORS_DOWN != null;
+/** [NEW 1.2] ?update=ask|available|downloading|error|disabled (CONTRACT §2.15.7). */
+const UPDATE_PARAM = (readParam("update") ?? "").toLowerCase();
 const DRIVE_FAIL = SCENARIO.has("failing");
 const WITH_USB = SCENARIO.has("usb");
 const GENERIC_LABELS = (readParam("labels") ?? "").toLowerCase() === "generic";
@@ -315,6 +350,12 @@ function sanitizeSettings(input: Partial<Settings>): Settings {
     sensorLogIntervalMs: logMs,
     alerts: sanitizeAlertSettings(input.alerts),
     recycleMinAgeDays: recycle,
+    // [NEW 1.2] CONTRACT §2.2: unknown updateCheck → "ask", unknown channel → "default". (save_settings keeps
+    // the stored lastUpdateCheckTs; mockBackend.saveSettings does the same after this.)
+    updateCheck: input.updateCheck === "auto" || input.updateCheck === "manual" ? input.updateCheck : "ask",
+    lastUpdateCheckTs:
+      typeof input.lastUpdateCheckTs === "number" && Number.isFinite(input.lastUpdateCheckTs) ? input.lastUpdateCheckTs : null,
+    updateChannel: input.updateChannel === "stable" || input.updateChannel === "preview" ? input.updateChannel : "default",
   };
 }
 
@@ -351,15 +392,24 @@ function sanitizeAlertSettings(raw: unknown): AlertSettings {
   };
 }
 
+/**
+ * [NEW 1.2] The preview never starts at updateCheck "ask" unless ?update=ask asks for it, so screenshots
+ * never show the first-run update question (CONTRACT §2.15.7). The real default is "ask".
+ */
+function previewUpdateCheck(s: Settings): Settings {
+  if (UPDATE_PARAM === "ask") return { ...s, updateCheck: "ask" };
+  return s.updateCheck === "ask" ? { ...s, updateCheck: "manual" } : s;
+}
+
 function loadSettings(): Settings {
   try {
     const raw = window.localStorage.getItem(SETTINGS_KEY);
     // Old preview files may still carry flushStandbyOnPurge; sanitisation drops it.
-    if (raw) return sanitizeSettings(JSON.parse(raw) as Partial<Settings>);
+    if (raw) return previewUpdateCheck(sanitizeSettings(JSON.parse(raw) as Partial<Settings>));
   } catch {
     // Storage unavailable or corrupt; fall back to defaults.
   }
-  return { ...DEFAULT_SETTINGS };
+  return previewUpdateCheck({ ...DEFAULT_SETTINGS });
 }
 
 function persistSettings(s: Settings): void {
@@ -1704,7 +1754,7 @@ function missingFeatures(reasons: LimitedReason[]): string[] {
 const FAILSAFE_MESSAGES: Record<FanFailsafeKind, string> = {
   interrupted: "Fan control was interrupted. Fans are at 100% for safety. Restart the PC to return them to BIOS control.",
   agentLost:
-    "Fan control was interrupted and the hardware agent is not running. Fans may be stuck at their last manual speed. Restart the PC to return them to BIOS control.",
+    "Fan control was interrupted and Nexum is no longer controlling the fans. Fans may be stuck at their last manual speed. Restart the PC to return them to BIOS control.",
   previousBoot:
     "Nexum's fan control was interrupted before the last restart. If the fans behave unusually, shut down fully and power the PC on again.",
 };
@@ -1753,26 +1803,43 @@ let lateTimer: ReturnType<typeof setTimeout> | null = null;
 let lastTick = 0;
 const AGENT_PID = 4812;
 
+/** "Try again" was pressed while the sensor service cannot come up (?sensors=…): phase "starting" for 1.5 s. */
+let retrying = false;
+
+/** Life-cycle phase as Rust reports it (CONTRACT §2.3.1). */
+function sensorPhase(): SensorServicePhase {
+  if (restarting) return "starting"; // restart_agent: "starting" until the new process says hello
+  if (agentRunning) return "running";
+  if (SENSORS_DOWN) return retrying ? "starting" : SENSORS_DOWN.phase;
+  return "restarting"; // it stopped by itself (?failsafe=agentLost) and Rust is bringing it back
+}
+
 function agentStatus(): AgentStatus {
-  const running = agentRunning && !restarting;
-  let message: string;
-  if (restarting) message = "Restarting hardware agent…";
-  else if (!agentRunning)
-    message =
-      FAILSAFE_PARAM === "agentLost" && !NO_AGENT
-        ? "Hardware agent exited unexpectedly (simulated). Restarting…"
-        : "nexum-agent.exe could not be started (simulated failure)";
-  else message = `Hardware agent v1.1.0 online (pid ${AGENT_PID})`;
-  const reasons = running ? limitedReasons() : [];
+  const phase = sensorPhase();
+  /** Hello received: only then are the driver state and the limited-mode reasons known. */
+  const up = phase === "running";
+  // Diagnostic text only: never rendered by the UI (CONTRACT §2.3).
+  const message =
+    phase === "running"
+      ? `Sensor service v1.1.0 running (simulated, pid ${AGENT_PID})`
+      : phase === "failed"
+        ? "Sensor service could not be started (simulated failure)"
+        : phase === "restarting"
+          ? "Sensor service stopped unexpectedly (simulated); restarting"
+          : "Sensor service starting (simulated)";
+  const reasons = up ? limitedReasons() : [];
   return {
-    running,
+    // §2.3.1: a spawned process counts as running before its hello ("starting").
+    running: phase === "running" || phase === "starting",
     isAdmin: !ADMIN0,
     message,
     lastPacketTs,
-    sensorDriver: running ? sensorDriver() : null,
+    sensorDriver: up ? sensorDriver() : null,
     limitedReasons: reasons,
-    missingFeatures: running ? missingFeatures(reasons) : [],
-    protocol: running ? AGENT_PROTOCOL : null,
+    missingFeatures: up ? missingFeatures(reasons) : [],
+    protocol: up ? AGENT_PROTOCOL : null,
+    phase,
+    failReason: phase === "failed" ? (SENSORS_DOWN?.reason ?? "crashed") : null,
   };
 }
 
@@ -2642,13 +2709,17 @@ function diskLinks(): DiskLink[] {
       ];
 }
 
+/** Rust's texts for a command that needs sensor reading while it is down (CONTRACT §4.8.1). */
+const ERR_NOT_RUNNING = "Not available right now. Try again in a moment.";
+const SPEC_ERR_NOT_RUNNING = "Hardware details are not available right now.";
+
 function systemSpec(): SystemSpec {
   const os = { ...OS_INFO, bootTs: bootedAt };
   delete (os as Partial<OsInfo>).version;
   const security = { secureBoot: true, tpm: { present: true, version: "2.0" }, biosMode: "UEFI" as const };
   const base = { capturedTs: Date.now(), os: os as SystemSpec["os"], security };
   if (!agentRunning || restarting) {
-    return { ...base, cpu: null, board: null, memory: null, gpus: [], diskLinks: [], errors: ["Hardware agent is not running"] };
+    return { ...base, cpu: null, board: null, memory: null, gpus: [], diskLinks: [], errors: [SPEC_ERR_NOT_RUNNING] };
   }
   const gpus: GpuSpec[] = OWNER
     ? [
@@ -3774,6 +3845,162 @@ function agentDownV11(): void {
 let traySensors: string[] = [];
 
 /* ------------------------------------------------------------------ */
+/* [NEW 1.2] In-app updates (CONTRACT §2.15): what updater.rs does,    */
+/* without any network. Nothing is ever downloaded or run here.        */
+/* ------------------------------------------------------------------ */
+
+/** Channel compiled into the build; none = the updater is disabled for the whole session (?update=disabled). */
+const BUILD_CHANNEL: UpdateChannel | null = UPDATE_PARAM === "disabled" ? null : "preview";
+const UPDATE_ERR_ASK = "Choose how Nexum checks for updates first.";
+const UPDATE_ERR_DISABLED = "This build does not update from inside the app.";
+/** Size of the pretend installer. */
+const UPDATE_BYTES = 48_312_320;
+
+/** The version "GitHub" has on offer in this session; null = the running version is the newest. */
+const UPDATE_OFFER: { version: string; notes: string; publishedAt: string } | null =
+  UPDATE_PARAM === "available" || UPDATE_PARAM === "downloading"
+    ? {
+        version: "1.3.0",
+        notes: [
+          "What changed in 1.3.0",
+          "",
+          "• Sensors: a Limit column for more boards, and a faster start of the sensor list.",
+          "• Storage: the wear forecast now also uses the data written per day.",
+          "• Gaming: the frame time chart keeps its scale when you switch the window.",
+          "• Fixes: the window position is kept across restarts; less memory is used while in the tray.",
+        ]
+          .join("\n")
+          .slice(0, UPDATE_NOTES_MAX_CHARS),
+        publishedAt: new Date(Date.now() - 2 * DAY_MS).toISOString(),
+      }
+    : null;
+
+function effectiveUpdateChannel(): UpdateChannel | null {
+  if (!BUILD_CHANNEL) return null;
+  return settings.updateChannel === "default" ? BUILD_CHANNEL : settings.updateChannel;
+}
+
+function updateError(code: UpdateErrorCode): Pick<UpdateState, "state" | "error" | "errorCode"> {
+  return { state: "error", error: UPDATE_ERROR_TEXT[code], errorCode: code };
+}
+
+function initialUpdateState(): UpdateState {
+  const base: UpdateState = {
+    ...INITIAL_UPDATE_STATE,
+    currentVersion: __NEXUM_VERSION__,
+    channel: effectiveUpdateChannel(),
+    buildChannel: BUILD_CHANNEL,
+    lastCheckTs: settings.lastUpdateCheckTs,
+  };
+  if (!BUILD_CHANNEL) return { ...base, state: "disabled" };
+  const offer = UPDATE_OFFER
+    ? { latestVersion: UPDATE_OFFER.version, notes: UPDATE_OFFER.notes, publishedAt: UPDATE_OFFER.publishedAt }
+    : {};
+  // The states below imply an answered check earlier in this (pretend) session.
+  const checked = settings.lastUpdateCheckTs ?? Date.now() - 3 * 3_600_000;
+  if (UPDATE_PARAM === "available") return { ...base, ...offer, state: "available", lastCheckTs: checked };
+  if (UPDATE_PARAM === "downloading") {
+    return {
+      ...base,
+      ...offer,
+      state: "downloading",
+      progress: 42,
+      downloadedBytes: Math.round(UPDATE_BYTES * 0.42),
+      totalBytes: UPDATE_BYTES,
+      lastCheckTs: checked,
+    };
+  }
+  if (UPDATE_PARAM === "error") return { ...base, ...updateError("offline") };
+  return base;
+}
+
+let upd: UpdateState = initialUpdateState();
+
+const updateStateNow = (): UpdateState["state"] => upd.state;
+
+function setUpdate(next: UpdateState): void {
+  upd = next;
+  emit(EVENTS.updateState, { ...upd });
+}
+
+/** §2.15.4. `automatic` failures are silent: the state returns to what it was. */
+async function checkForUpdateMock(kind: "user" | "automatic"): Promise<UpdateState> {
+  if (!BUILD_CHANNEL) return { ...upd };
+  if (settings.updateCheck === "ask") throw new Error(UPDATE_ERR_ASK);
+  if (upd.state === "checking" || upd.state === "downloading" || upd.state === "ready" || upd.state === "installing") return { ...upd };
+  const before = upd;
+  setUpdate({ ...upd, state: "checking", error: null, errorCode: null });
+  await sleep(1200);
+  // Re-read through a function: the state may have changed during the wait (a channel change resets it).
+  if (updateStateNow() !== "checking") return { ...upd };
+  if (UPDATE_PARAM === "error") {
+    if (kind === "automatic") setUpdate(before.state === "available" ? before : { ...before, state: "idle", error: null, errorCode: null });
+    else setUpdate({ ...upd, ...updateError("offline") });
+    return { ...upd };
+  }
+  const now = Date.now();
+  settings = { ...settings, lastUpdateCheckTs: now };
+  persistSettings(settings);
+  const cleared = { ...upd, error: null, errorCode: null, progress: null, downloadedBytes: null, totalBytes: null, lastCheckTs: now };
+  setUpdate(
+    UPDATE_OFFER
+      ? { ...cleared, state: "available", latestVersion: UPDATE_OFFER.version, notes: UPDATE_OFFER.notes, publishedAt: UPDATE_OFFER.publishedAt }
+      : { ...cleared, state: "idle", latestVersion: null, notes: null, publishedAt: null },
+  );
+  return { ...upd };
+}
+
+let installTimer: ReturnType<typeof setInterval> | null = null;
+
+/** §2.15.5 as a slide show: downloading 0 → 100 % in about 4 s, then ready, then installing (and it stays there). */
+function runInstallMock(): void {
+  if (installTimer) clearInterval(installTimer);
+  let step = 0;
+  const steps = 16;
+  setUpdate({ ...upd, state: "downloading", error: null, errorCode: null, progress: 0, downloadedBytes: 0, totalBytes: UPDATE_BYTES });
+  installTimer = setInterval(() => {
+    step++;
+    const pct = Math.min(100, Math.round((step / steps) * 100));
+    setUpdate({ ...upd, state: "downloading", progress: pct, downloadedBytes: Math.round((UPDATE_BYTES * pct) / 100) });
+    if (step < steps) return;
+    if (installTimer) clearInterval(installTimer);
+    installTimer = null;
+    setTimeout(() => {
+      setUpdate({ ...upd, state: "ready" });
+      setTimeout(() => setUpdate({ ...upd, state: "installing" }), 1100);
+    }, 300);
+  }, 250);
+}
+
+/** save_settings side of §2.15.4: a channel change drops the offer; switching to "auto" checks when due. */
+function updateSettingsChanged(prev: Settings): void {
+  if (!BUILD_CHANNEL) return;
+  const busy = upd.state === "downloading" || upd.state === "ready" || upd.state === "installing";
+  const channelChanged = settings.updateChannel !== prev.updateChannel;
+  if (channelChanged) {
+    settings = { ...settings, lastUpdateCheckTs: null };
+    if (!busy) {
+      setUpdate({
+        ...upd,
+        state: "idle",
+        latestVersion: null,
+        notes: null,
+        publishedAt: null,
+        error: null,
+        errorCode: null,
+        channel: effectiveUpdateChannel(),
+        lastCheckTs: null,
+      });
+    }
+  }
+  const becameAuto = settings.updateCheck === "auto" && prev.updateCheck !== "auto";
+  const due = settings.lastUpdateCheckTs == null || Date.now() - settings.lastUpdateCheckTs >= DAY_MS;
+  if (settings.updateCheck === "auto" && due && (becameAuto || channelChanged)) {
+    setTimeout(() => void checkForUpdateMock("automatic").catch(() => undefined), 600);
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Public mock backend (mirrors `api` in ./api.ts)                     */
 /* ------------------------------------------------------------------ */
 
@@ -3928,7 +4155,7 @@ export const mockBackend = {
 
   async setFanPreset(preset: FanPreset): Promise<void> {
     await sleep(40);
-    if (!agentRunning) throw new Error("Hardware agent is not running");
+    if (!agentRunning) throw new Error(ERR_NOT_RUNNING);
     if (fanCommandBlocked("fanPreset")) return;
     const n = FANS.filter((f) => f.controllable).length;
     if (preset === "auto") {
@@ -3952,7 +4179,7 @@ export const mockBackend = {
 
   async setFanControl(id: string, pct: number): Promise<void> {
     await sleep(30);
-    if (!agentRunning) throw new Error("Hardware agent is not running");
+    if (!agentRunning) throw new Error(ERR_NOT_RUNNING);
     if (fanCommandBlocked("fanSet")) return;
     const idx = FANS.findIndex((f) => fanSensorId(f) === id);
     if (idx < 0) {
@@ -3983,7 +4210,9 @@ export const mockBackend = {
   async saveSettings(next: Settings): Promise<Settings> {
     await sleep(rand(120, 260));
     const prev = settings;
-    settings = sanitizeSettings(next);
+    // [NEW 1.2] lastUpdateCheckTs is written by Rust only: the incoming value is ignored (§2.2).
+    settings = { ...sanitizeSettings(next), lastUpdateCheckTs: prev.lastUpdateCheckTs };
+    updateSettingsChanged(prev);
     persistSettings(settings);
     if (settings.pollIntervalMs !== sim.intervalMs) applyPollInterval(settings.pollIntervalMs);
     // [NEW 1.1] Same effect as the dedicated commands (§2.13), and alerts re-evaluate at once (§2.10).
@@ -4001,18 +4230,24 @@ export const mockBackend = {
     return agentStatus();
   },
 
+  /** [CHANGED 1.2] §2.3.1 item 8: phase "starting" at once, then "running" — or back to "failed" with ?sensors=…. */
   async restartAgent(): Promise<void> {
-    if (NO_AGENT) {
-      await sleep(600);
+    if (SENSORS_DOWN) {
+      if (retrying || SENSORS_DOWN.phase === "starting") return;
+      retrying = true;
       emitStatus();
-      throw new Error("nexum-agent.exe could not be started (simulated failure)");
+      setTimeout(() => {
+        retrying = false;
+        emitStatus();
+      }, 1500);
+      return;
     }
     if (restarting) return;
     restarting = true;
     stopTimer();
     agentDownV11();
     emitStatus();
-    await sleep(400);
+    await sleep(100);
     setTimeout(() => {
       restarting = false;
       agentRunning = true;
@@ -4051,7 +4286,7 @@ export const mockBackend = {
 
   async resetSensorStats(ids: string[] | null): Promise<void> {
     await sleep(60);
-    if (!agentRunning || restarting) throw new Error("Hardware agent is not running");
+    if (!agentRunning || restarting) throw new Error(ERR_NOT_RUNNING);
     const n = resetSensors(ids);
     if (ids == null) emitTree(); // same rev, new sessionStartTs
     ack("sensorReset", true, `Reset ${n} sensors`, 0);
@@ -4134,7 +4369,7 @@ export const mockBackend = {
 
   async setFrameTarget(pid: number | null): Promise<void> {
     await sleep(rand(40, 120));
-    if (!agentRunning || restarting) throw new Error("Hardware agent is not running");
+    if (!agentRunning || restarting) throw new Error(ERR_NOT_RUNNING);
     if (pid == null) {
       frames.manualPid = null;
       evaluateFrameTarget(performance.now());
@@ -4178,7 +4413,7 @@ export const mockBackend = {
 
   async listPresentingProcesses(): Promise<PresentingProcess[]> {
     await sleep(rand(80, 200));
-    if (!agentRunning || restarting) throw new Error("Hardware agent is not running");
+    if (!agentRunning || restarting) throw new Error(ERR_NOT_RUNNING);
     return presentingList();
   },
 
@@ -4250,7 +4485,7 @@ export const mockBackend = {
   async runTuningProbe(write: boolean): Promise<TuningProbeSummary> {
     if (write) throw new Error("The write probe is not available in this version.");
     await sleep(rand(900, 1500));
-    if (!agentRunning || restarting) throw new Error("Hardware agent is not running");
+    if (!agentRunning || restarting) throw new Error(ERR_NOT_RUNNING);
     const s = tuningState();
     emit(EVENTS.tuningState, s);
     return {
@@ -4260,6 +4495,26 @@ export const mockBackend = {
       message: s.supported ? "Read-only probe finished." : s.message,
       path: `C:\\Users\\User\\AppData\\Local\\Nexum\\tuning-probe-${fileStamp()}.json`,
     };
+  },
+
+  /* ── [NEW 1.2] In-app updates (§2.15) ── */
+
+  async getUpdateState(): Promise<UpdateState> {
+    await sleep(30);
+    return { ...upd };
+  },
+
+  async checkForUpdate(): Promise<UpdateState> {
+    return checkForUpdateMock("user");
+  },
+
+  async installUpdate(): Promise<void> {
+    await sleep(60);
+    if (!BUILD_CHANNEL) throw new Error(UPDATE_ERR_DISABLED);
+    if (settings.updateCheck === "ask") throw new Error(UPDATE_ERR_ASK);
+    if (upd.state === "downloading" || upd.state === "ready" || upd.state === "installing") throw new Error(UPDATE_ERROR_TEXT.busy);
+    if (!upd.latestVersion) throw new Error("Check for updates first.");
+    runInstallMock();
   },
 };
 

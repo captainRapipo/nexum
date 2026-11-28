@@ -29,12 +29,13 @@ export function TrendArrow({
   const up = d > 0;
   const good = flat ? null : up !== invert;
   const Icon = flat ? Minus : up ? ArrowUpRight : ArrowDownRight;
-  const color = good == null ? "text-muted" : good ? "text-teal" : "text-rose-400";
+  // Direction is information, not a verdict: the arrow and the sign carry it, the colour stays neutral (no red / green).
+  const color = good == null ? "text-ink-3" : "text-ink-2";
   const label = flat ? "steady" : `${up ? "up" : "down"} ${Math.abs(d).toFixed(precision)}${unit}`;
 
   return (
-    <span className={cn("num inline-flex items-center gap-0.5 text-[11px] font-medium", color, className)} aria-label={label} title={label}>
-      <Icon size={13} strokeWidth={2.2} aria-hidden="true" />
+    <span className={cn("tnum inline-flex items-center gap-0.5 whitespace-nowrap text-[11px] font-medium", color, className)} aria-label={label} title={label}>
+      <Icon size={13} strokeWidth={2} aria-hidden="true" />
       {showValue && !flat && (
         <span>
           {up ? "+" : "−"}

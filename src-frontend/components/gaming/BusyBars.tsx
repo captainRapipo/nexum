@@ -1,95 +1,82 @@
-import { Gauge } from "lucide-react";
 import type { FrameStats } from "../../types";
 import { boundByLabel, fmtFrametime } from "../../lib/frames";
-import { SERIES_HEX, StatusPill } from "../ui";
+import { Tag } from "../ui";
 import { BOUND_BY_RULE, HAGS_NOTE } from "./gamingText";
 
-/** Why the badge shows "—" (CONTRACT §1.6.5: boundBy is null without both busy times or below 30 frames). */
+/** Why the tag shows "—" (CONTRACT §1.6.5: boundBy is null without both busy times or below 30 frames). */
 const BOUND_NULL_REASON = "Not enough data: needs CPU and GPU busy times and at least 30 frames in the window.";
 
 export interface BusyBarsProps {
   stats: FrameStats | null;
 }
 
+/**
+ * Which side limits the frame rate, as a neutral tag (it is a fact about the frame, not a health
+ * state). The hover shows the rule that produced it and the HAGS note (CONTRACT §4.8, §4.10.1).
+ */
+export function BoundByTag({ stats, className }: BusyBarsProps & { className?: string }) {
+  const bound = stats?.boundBy ?? null;
+  return (
+    <Tag className={className} title={`${bound == null ? `${BOUND_NULL_REASON}\n\n` : ""}${BOUND_BY_RULE}\n\n${HAGS_NOTE}`}>
+      {boundByLabel(bound)}
+    </Tag>
+  );
+}
+
+/** `of 7.14 ms per frame`: what the two bars are measured against. */
+export function busyScaleText(stats: FrameStats | null): string | null {
+  const t = stats?.frametimeAvgMs ?? null;
+  return t == null ? null : `of ${fmtFrametime(t)} per frame`;
+}
+
 interface BarProps {
   label: string;
   ms: number | null;
-  scale: number;
-  color: string;
+  /** Average frame time (ms): the full width of the track. */
+  frameMs: number | null;
   missingTitle: string;
-  /** Average frame time as % of the track, drawn as a tick. */
-  framePct: number | null;
 }
 
-function Bar({ label, ms, scale, color, missingTitle, framePct }: BarProps) {
-  const pct = ms == null || scale <= 0 ? 0 : Math.min(100, (ms / scale) * 100);
+function Bar({ label, ms, frameMs, missingTitle }: BarProps) {
+  const pct = ms == null || frameMs == null || frameMs <= 0 ? 0 : Math.min(100, (ms / frameMs) * 100);
   return (
-    <div className="min-w-0">
-      <div className="flex items-baseline justify-between gap-2 text-[12px]">
-        <span className="flex items-center gap-1.5 text-slate-300">
-          <span aria-hidden="true" className="inline-block size-2 rounded-[2px]" style={{ background: color }} />
-          {label}
-        </span>
+    <div className="mt-2.5 min-w-0">
+      <div className="flex items-baseline justify-between gap-2 text-callout">
+        <span className="text-ink-2">{label}</span>
         {ms == null ? (
-          <span className="num text-slate-500" title={missingTitle}>
+          <span className="text-ink-3" title={missingTitle} aria-label={`Not available: ${missingTitle}`}>
             —
           </span>
         ) : (
-          <span className="num text-ink">{fmtFrametime(ms)}</span>
+          <span className="tnum font-semibold text-ink">{fmtFrametime(ms)}</span>
         )}
       </div>
       <div
-        className="relative mt-1.5 h-2 w-full overflow-hidden rounded-full bg-white/[0.05]"
+        className="mb-0.5 mt-1.5 h-2 w-full overflow-hidden rounded-xs bg-meter-track"
         role="meter"
-        aria-label={label}
+        aria-label={`${label}, share of the average frame time`}
         aria-valuemin={0}
-        aria-valuemax={Math.round(scale * 100) / 100}
-        aria-valuenow={ms ?? undefined}
+        aria-valuemax={100}
+        aria-valuenow={ms == null ? undefined : Math.round(pct)}
+        aria-valuetext={ms == null ? undefined : fmtFrametime(ms)}
       >
-        <div className="h-full rounded-full transition-[width] duration-300" style={{ width: `${pct}%`, background: color }} />
-        {framePct != null && (
-          <span
-            aria-hidden="true"
-            className="absolute inset-y-0 w-[2px] bg-slate-200/80"
-            style={{ left: `calc(${Math.min(100, framePct)}% - 2px)` }}
-          />
-        )}
+        <div className="h-full rounded-xs bg-series-single" style={{ width: `${pct}%` }} />
       </div>
     </div>
   );
 }
 
-/** CPU busy vs GPU busy against the average frame time, plus the boundBy badge (CONTRACT §1.6.5, §4.10.1). */
+/**
+ * CPU busy vs GPU busy as shares of the average frame time (CONTRACT §1.6.5, §4.10.1). The busier
+ * side limits the frame rate; the bound-by tag sits in the hero (`BoundByTag`).
+ */
 export default function BusyBars({ stats }: BusyBarsProps) {
   const t = stats?.frametimeAvgMs ?? null;
-  const c = stats?.cpuBusyMs ?? null;
-  const g = stats?.gpuBusyMs ?? null;
-  const scale = Math.max(t ?? 0, c ?? 0, g ?? 0);
-  const framePct = t != null && scale > 0 ? (t / scale) * 100 : null;
-  const bound = stats?.boundBy ?? null;
   const missing = stats ? "PresentMon did not report this value for this app." : "Waiting for frames.";
-
   return (
-    <div className="flex flex-col gap-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-[12px] text-muted">
-          Average frame time <span className="num text-slate-200">{t == null ? "—" : fmtFrametime(t)}</span>
-        </span>
-        <StatusPill
-          tone={bound == null ? "unknown" : "info"}
-          icon={Gauge}
-          title={`${bound == null ? `${BOUND_NULL_REASON}\n\n` : ""}${BOUND_BY_RULE}\n\n${HAGS_NOTE}`}
-        >
-          {boundByLabel(bound)}
-        </StatusPill>
-      </div>
-      <div className="flex flex-col gap-3">
-        <Bar label="CPU busy" ms={c} scale={scale} color={SERIES_HEX.cpu} missingTitle={missing} framePct={framePct} />
-        <Bar label="GPU busy" ms={g} scale={scale} color={SERIES_HEX.gpu} missingTitle={missing} framePct={framePct} />
-      </div>
-      <p className="text-[11px] leading-snug text-slate-500">
-        The white tick marks the average frame time. The busier side limits the frame rate. {HAGS_NOTE}
-      </p>
+    <div className="flex flex-col" title={`The busier side limits the frame rate. ${HAGS_NOTE}`}>
+      <Bar label="CPU busy" ms={stats?.cpuBusyMs ?? null} frameMs={t} missingTitle={missing} />
+      <Bar label="GPU busy" ms={stats?.gpuBusyMs ?? null} frameMs={t} missingTitle={missing} />
     </div>
   );
 }

@@ -1,3 +1,4 @@
+// App shell (CONTRACT §4.6, §4.6.1): Sidebar | Toolbar + app banners + the active view.
 import {
   Component,
   lazy,
@@ -11,9 +12,10 @@ import {
   type ErrorInfo,
   type ReactNode,
 } from "react";
-import { AlertTriangle, RotateCcw } from "lucide-react";
-import { FKEY_MAP, VIEW_LABELS, VIEW_ORDER, type NavRequest, type NavTarget, type ViewId } from "./types";
-import { isTauri, subscribe } from "./lib/api";
+import { RotateCcw } from "lucide-react";
+import { FKEY_MAP, PAGE_KIND, VIEW_ORDER, VIEW_TITLES, type NavRequest, type NavTarget, type ViewId } from "./types";
+import { api, isTauri, subscribe } from "./lib/api";
+import { cn } from "./lib/format";
 import { isViewId, NAV_EVENT, parseNavPayload, RESCAN_EVENT, setPendingFocus } from "./lib/nav";
 import { SettingsProvider, useSettings } from "./hooks/useSettings";
 import { SystemInfoProvider, useSystemInfo } from "./hooks/useSystemInfo";
@@ -23,17 +25,19 @@ import { SensorsProvider, useSensorsActions } from "./hooks/useSensors";
 import { SystemSpecProvider, useSystemSpecRefresh } from "./hooks/useSystemSpec";
 import { HealthProvider } from "./hooks/useHealth";
 import { FramesProvider } from "./hooks/useFrames";
+import { UpdaterProvider } from "./hooks/useUpdater";
 import { TraySensorSync } from "./hooks/useTraySensorSync";
-import { TopBar } from "./components/layout/TopBar";
-import { HeaderStrip } from "./components/layout/HeaderStrip";
-import { StatusFooter } from "./components/layout/StatusFooter";
+import { Sidebar } from "./components/layout/Sidebar";
+import { focusToolbarFilter, Toolbar } from "./components/layout/Toolbar";
+import { AppBanners } from "./components/layout/AppBanners";
+import { PageChromeProvider } from "./components/layout/PageChrome";
 import { SettingsModal } from "./components/layout/SettingsModal";
-import { Button } from "./components/ui/Button";
+import { UpdateDialog } from "./components/layout/UpdateDialog";
+import { UpdatePrompt } from "./components/layout/UpdatePrompt";
+import { Button, ProgressBar, StatusIcon } from "./components/ui";
 import { isModalOpen } from "./components/ui/Modal";
 import { ToastHost } from "./components/feedback/Toast";
-import { FanFailsafeBanner, LimitedModeBanner } from "./components/feedback/AppBanners";
 import { PawnIoConsent } from "./components/feedback/PawnIoConsent";
-import { api } from "./lib/api";
 
 /* ------------------------------------------------------------------ */
 /* Lazy modules                                                        */
@@ -115,18 +119,18 @@ class ModuleErrorBoundary extends Component<BoundaryProps, { error: Error | null
     if (this.props.silent) return null;
     return (
       <div className="flex min-h-[320px] flex-1 items-center justify-center p-6">
-        <div className="glass glow-rose w-full max-w-[520px] p-6">
-          <div className="flex items-center gap-2.5 text-rose-400">
-            <AlertTriangle size={18} aria-hidden="true" />
-            <h2 className="label-caps [--label-color:currentColor]">Module fault · {this.props.label}</h2>
+        <div className="w-full max-w-[520px] rounded-card bg-card px-(--card-pad-x) py-(--card-pad-y) shadow-card" role="alert">
+          <div className="flex items-center gap-2">
+            <StatusIcon tone="warn" size={18} />
+            <h2 className="text-title-2 text-ink">{this.props.label} stopped working</h2>
           </div>
-          <p className="mt-3 text-[13px] text-slate-300">This panel stopped responding. Telemetry and the rest of Nexum keep running.</p>
-          <pre className="mt-3 max-h-40 overflow-auto rounded-lg border border-line bg-black/30 p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-slate-400 select-text">
+          <p className="mt-2 text-body text-ink-2">This page ran into a problem. Sensor readings and the rest of Nexum keep running.</p>
+          <pre className="mt-3 max-h-40 overflow-auto rounded-lg bg-inset p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-ink-2 select-text">
             {error.message || String(error)}
           </pre>
           <div className="mt-4 flex justify-end">
-            <Button variant="teal" size="sm" icon={RotateCcw} onClick={this.reset}>
-              Reload panel
+            <Button size="sm" icon={RotateCcw} onClick={this.reset}>
+              Reload page
             </Button>
           </div>
         </div>
@@ -142,10 +146,8 @@ class ModuleErrorBoundary extends Component<BoundaryProps, { error: Error | null
 function ViewLoader({ label }: { label: string }) {
   return (
     <div className="flex min-h-[320px] flex-1 flex-col items-center justify-center gap-3" role="status" aria-live="polite">
-      <div className="relative h-[3px] w-48 overflow-hidden rounded-full bg-white/[0.06]">
-        <span className="absolute inset-x-0 left-0 w-1/3 animate-sweep rounded-full bg-teal shadow-[0_0_12px_rgba(45,212,191,0.8)]" />
-      </div>
-      <span className="label-caps">Loading module · {label}</span>
+      <ProgressBar value={null} indeterminate label={`Loading ${label}`} className="w-48" />
+      <span className="text-callout text-ink-3">Loading {label}…</span>
     </div>
   );
 }
@@ -185,6 +187,7 @@ function Shell() {
   const [initial] = useState(readInitialRoute);
   const [view, setView] = useState<ViewId>(initial.view);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [updateOpen, setUpdateOpen] = useState(false);
   const [clean, setClean] = useState<CleanState>({ open: initial.clean, autoStart: false });
   const [cleanMounted, setCleanMounted] = useState(initial.clean);
 
@@ -232,6 +235,12 @@ function Shell() {
   const closeClean = useCallback(() => setClean((p) => ({ ...p, open: false })), []);
   const openSettings = useCallback(() => setSettingsOpen(true), []);
   const closeSettings = useCallback(() => setSettingsOpen(false), []);
+  /** The toolbar indicator, or "View update" in Settings (which closes first: one dialog at a time). */
+  const openUpdate = useCallback(() => {
+    setSettingsOpen(false);
+    setUpdateOpen(true);
+  }, []);
+  const closeUpdate = useCallback(() => setUpdateOpen(false), []);
 
   const handleNav = useCallback(
     (target: NavTarget | NavRequest | null) => {
@@ -269,6 +278,13 @@ function Shell() {
       }
       // Caret-browsing prompt in WebView2.
       if (key === "F7") e.preventDefault();
+
+      // [NEW 1.2] Ctrl+K focuses the toolbar filter field when the page has one; no effect otherwise.
+      if (e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && (key === "k" || key === "K")) {
+        e.preventDefault();
+        if (!typing && !e.repeat && !isModalOpen()) focusToolbarFilter();
+        return;
+      }
 
       if (typing) {
         // Keep WebView2 defaults (help, find bar, …) off our F-keys; the text field keeps every other key.
@@ -349,34 +365,56 @@ function Shell() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- once, after settings load
   }, []);
 
+  // A new view starts at its top.
+  const mainRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (mainRef.current) mainRef.current.scrollTop = 0;
+  }, [view]);
+
   const ActiveView = VIEWS[view];
-  const label = VIEW_LABELS[view];
+  const label = VIEW_TITLES[view];
+  const listPage = PAGE_KIND[view] === "list";
 
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden">
-      <TopBar
-        view={view}
-        onNavigate={navigate}
-        onCleanCaches={() => openClean(false)}
-        onRefresh={rescanAll}
-        onSettings={openSettings}
-        refreshing={systemLoading || scanLoading}
-      />
-      <HeaderStrip />
-      <FanFailsafeBanner />
-      <LimitedModeBanner />
+    <div className="grid h-full min-h-0 grid-cols-[var(--sidebar-w)_minmax(0,1fr)] overflow-hidden">
+      <Sidebar view={view} onNavigate={navigate} />
 
-      <main id="nexum-main" className="relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto">
-        <ModuleErrorBoundary label={label}>
-          <Suspense fallback={<ViewLoader label={label} />}>
-            <div key={view} className="flex min-h-full flex-1 flex-col animate-view-in p-4">
-              <ActiveView />
-            </div>
-          </Suspense>
-        </ModuleErrorBoundary>
-      </main>
+      <PageChromeProvider>
+        <div className="flex min-h-0 min-w-0 flex-col">
+          <Toolbar
+            view={view}
+            onRefresh={rescanAll}
+            onSettings={openSettings}
+            onOpenUpdate={openUpdate}
+            refreshing={systemLoading || scanLoading}
+          />
+          <AppBanners />
 
-      <StatusFooter view={view} onNavigate={navigate} onRescan={() => void rescanAll()} onQuickClean={() => openClean(false)} />
+          {/* Grouped pages sit on the canvas and scroll here; list pages are full-bleed white and scroll their own table. */}
+          <main
+            id="nexum-main"
+            ref={mainRef}
+            className={cn(
+              "relative flex min-h-0 flex-1 flex-col",
+              listPage ? "overflow-hidden bg-content" : "overflow-x-hidden overflow-y-auto bg-canvas",
+            )}
+          >
+            <ModuleErrorBoundary label={label}>
+              <Suspense fallback={<ViewLoader label={label} />}>
+                <div
+                  key={view}
+                  className={cn(
+                    "flex animate-fade-in flex-col",
+                    listPage ? "min-h-0 flex-1" : "min-h-full flex-1 px-(--page-pad-x) py-(--page-pad-y)",
+                  )}
+                >
+                  <ActiveView />
+                </div>
+              </Suspense>
+            </ModuleErrorBoundary>
+          </main>
+        </div>
+      </PageChromeProvider>
 
       {cleanMounted && (
         <ModuleErrorBoundary label="Cache cleanup" silent>
@@ -386,8 +424,10 @@ function Shell() {
         </ModuleErrorBoundary>
       )}
 
-      <SettingsModal open={settingsOpen} onClose={closeSettings} />
+      <SettingsModal open={settingsOpen} onClose={closeSettings} onViewUpdate={openUpdate} />
+      <UpdateDialog open={updateOpen} onClose={closeUpdate} />
       <PawnIoConsent />
+      <UpdatePrompt blocked={settingsOpen || clean.open || updateOpen} />
       <ToastHost />
       <TraySensorSync />
     </div>
@@ -397,21 +437,23 @@ function Shell() {
 export default function App() {
   return (
     <SettingsProvider>
-      <SystemInfoProvider>
-        <DriverScanProvider>
-          <TelemetryProvider>
-            <SensorsProvider>
-              <SystemSpecProvider>
-                <HealthProvider>
-                  <FramesProvider>
-                    <Shell />
-                  </FramesProvider>
-                </HealthProvider>
-              </SystemSpecProvider>
-            </SensorsProvider>
-          </TelemetryProvider>
-        </DriverScanProvider>
-      </SystemInfoProvider>
+      <UpdaterProvider>
+        <SystemInfoProvider>
+          <DriverScanProvider>
+            <TelemetryProvider>
+              <SensorsProvider>
+                <SystemSpecProvider>
+                  <HealthProvider>
+                    <FramesProvider>
+                      <Shell />
+                    </FramesProvider>
+                  </HealthProvider>
+                </SystemSpecProvider>
+              </SensorsProvider>
+            </TelemetryProvider>
+          </DriverScanProvider>
+        </SystemInfoProvider>
+      </UpdaterProvider>
     </SettingsProvider>
   );
 }

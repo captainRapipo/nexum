@@ -1,6 +1,18 @@
 import { createContext, createElement, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, errorMessage, subscribe } from "../lib/api";
-import type { AgentAck, AgentStatus, DiskTelemetry, DriveHealth, FanSafety, FanTelemetry, GpuTelemetry, TelemetryPacket } from "../types";
+import {
+  EVENTS,
+  type AgentAck,
+  type AgentStatus,
+  type DiskTelemetry,
+  type DriveHealth,
+  type FanSafety,
+  type FanTelemetry,
+  type GpuTelemetry,
+  type SensorFailReason,
+  type SensorServicePhase,
+  type TelemetryPacket,
+} from "../types";
 
 /** Number of packets kept in the ring buffer (≈2 minutes at 1 Hz). */
 export const TELEMETRY_HISTORY = 120;
@@ -25,10 +37,23 @@ const NO_FAN_SAFETY: FanSafety = {
   releaseC: 75,
 };
 
-/** Fill AgentStatus fields an older core may omit (protocol 1 / pre-gate builds). */
+const PHASES: readonly SensorServicePhase[] = ["starting", "running", "restarting", "failed", "stopped"];
+const FAIL_REASONS: readonly SensorFailReason[] = ["blocked", "missing", "crashed", "notResponding", "startFailed"];
+
+/**
+ * Fill AgentStatus fields an older core may omit (protocol 1 / pre-gate builds). [NEW 1.2] `phase`:
+ * a core that predates 1.2 sends none, so it is `running ? "running" : "starting"` — never "failed",
+ * because only Rust's restart policy may declare that (CONTRACT §2.3.1). `failReason` is kept only
+ * while the phase is "failed".
+ */
 export function normalizeAgentStatus(raw: unknown): AgentStatus | null {
   if (!raw || typeof raw !== "object") return null;
   const s = raw as Partial<AgentStatus>;
+  const phase: SensorServicePhase = PHASES.includes(s.phase as SensorServicePhase)
+    ? (s.phase as SensorServicePhase)
+    : s.running
+      ? "running"
+      : "starting";
   return {
     running: !!s.running,
     isAdmin: !!s.isAdmin,
@@ -38,6 +63,8 @@ export function normalizeAgentStatus(raw: unknown): AgentStatus | null {
     limitedReasons: Array.isArray(s.limitedReasons) ? s.limitedReasons : [],
     missingFeatures: Array.isArray(s.missingFeatures) ? s.missingFeatures : [],
     protocol: typeof s.protocol === "number" ? s.protocol : null,
+    phase,
+    failReason: phase === "failed" && FAIL_REASONS.includes(s.failReason as SensorFailReason) ? (s.failReason as SensorFailReason) : null,
   };
 }
 
@@ -128,7 +155,7 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let disposed = false;
 
-    const offTelemetry = subscribe<unknown>("telemetry", (raw) => {
+    const offTelemetry = subscribe<unknown>(EVENTS.telemetry, (raw) => {
       const pkt = normalizePacket(raw);
       if (!pkt) return;
       const buf = buffer.current;
@@ -141,14 +168,14 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
       setStream({ latest: pkt, history: next });
     });
 
-    const offStatus = subscribe<unknown>("agent-status", (raw) => {
+    const offStatus = subscribe<unknown>(EVENTS.agentStatus, (raw) => {
       const s = normalizeAgentStatus(raw);
       if (!s) return;
       gotStatusEvent.current = true;
       setAgent(s);
     });
 
-    const offAck = subscribe<AgentAck>("agent-ack", (a) => {
+    const offAck = subscribe<AgentAck>(EVENTS.agentAck, (a) => {
       if (!a || typeof a !== "object") return;
       setLastAck({ ...a });
     });
@@ -170,6 +197,8 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
           limitedReasons: [],
           missingFeatures: [],
           protocol: null,
+          phase: "starting",
+          failReason: null,
         });
       });
 

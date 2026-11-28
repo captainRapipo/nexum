@@ -1,36 +1,44 @@
 import { useEffect, useState } from "react";
-import { Activity, Cpu, Crosshair, Gamepad2, ListX } from "lucide-react";
+import { Gamepad2, Info } from "lucide-react";
 import { FPS_WINDOW_OPTIONS } from "../types";
 import { useFrames } from "../hooks/useFrames";
 import { useSettings } from "../hooks/useSettings";
 import { useTelemetry } from "../hooks/useTelemetryStream";
 import { errorMessage } from "../lib/api";
+import { fmtFps } from "../lib/frames";
 import { onRescanRequest } from "../lib/nav";
 import GlassCard from "../components/layout/GlassCard";
-import { Segmented } from "../components/ui";
+import { PageHeader, usePageChrome } from "../components/layout/PageChrome";
+import { EmptyState, Segmented } from "../components/ui";
 import { toast } from "../components/feedback/Toast";
 import FrameCaptureOptIn, { AntiCheatNote } from "../components/gaming/FrameCaptureOptIn";
 import FrameSessionBar from "../components/gaming/FrameSessionBar";
 import FpsHero from "../components/gaming/FpsHero";
 import FrametimeChart, { FRAMETIME_CHART_MAX_POINTS } from "../components/gaming/FrametimeChart";
-import BusyBars from "../components/gaming/BusyBars";
+import BusyBars, { busyScaleText } from "../components/gaming/BusyBars";
 import PresentInfo from "../components/gaming/PresentInfo";
 import TargetPicker from "../components/gaming/TargetPicker";
 import ExcludesEditor from "../components/gaming/ExcludesEditor";
-import { KNOWN_LIMITS, NO_TARGET_TEXT } from "../components/gaming/gamingText";
+import WhilePlaying, { whilePlayingMeta } from "../components/gaming/WhilePlaying";
+import { KNOWN_LIMITS, NO_TARGET_TEXT, OPT_IN_TITLE, PAGE_DESCRIPTION } from "../components/gaming/gamingText";
 
 const WINDOW_OPTIONS = FPS_WINDOW_OPTIONS.map((n) => ({ value: n, label: `${n} s`, title: `Statistics over the last ${n} seconds` }));
 
+/** `No game detected.` + `Start a game, or pick an app below.`: the two sentences of NO_TARGET_TEXT. */
+const NO_TARGET_SPLIT = NO_TARGET_TEXT.indexOf(". ") + 1;
+const NO_TARGET_TITLE = NO_TARGET_TEXT.slice(0, NO_TARGET_SPLIT - 1);
+const NO_TARGET_BODY = NO_TARGET_TEXT.slice(NO_TARGET_SPLIT + 1);
+
 /**
- * Gaming (F8): frame rate and frame times of the running game, measured by the agent with Intel's
- * signed PresentMon over ETW (CONTRACT §1.6, §4.10.1). Opt-in; all data comes through useFrames().
+ * Gaming (F8): frame rate and frame times of the running game, measured with Intel's signed
+ * PresentMon over ETW (CONTRACT §1.6, §4.10.1, §4.10.3). Opt-in; all data comes through useFrames().
  */
 export default function GamingView() {
   const frames = useFrames();
   const { enabled, session, target, stats, statsFresh, frametimes, setEnabled, setTarget, setWindow, setExcludes, listPresenting } =
     frames;
   const { settings } = useSettings();
-  const { agent } = useTelemetry();
+  const { agent, history } = useTelemetry();
   const [refreshSignal, setRefreshSignal] = useState(0);
   const [windowBusy, setWindowBusy] = useState(false);
 
@@ -40,7 +48,18 @@ export default function GamingView() {
   const running = session?.state === "running";
   const hasTarget = target != null && target.reason !== "none" && target.pid != null;
   const liveStats = hasTarget && statsFresh && stats != null && stats.pid === target.pid ? stats : null;
-  const waitingText = hasTarget ? `Waiting for frames from ${target.process ?? `PID ${target.pid}`}…` : "Waiting for frames…";
+  const processName = hasTarget ? (target.process ?? `PID ${target.pid}`) : null;
+  const waitingText = processName ? `Waiting for frames from ${processName}…` : "Waiting for frames…";
+
+  usePageChrome({
+    subtitle: !enabled
+      ? OPT_IN_TITLE
+      : processName
+        ? liveStats?.fpsAvg != null
+          ? `${processName} · ${fmtFps(liveStats.fpsAvg)} fps`
+          : processName
+        : "No game detected",
+  });
 
   const changeWindow = async (sec: number) => {
     if (windowBusy || sec === settings.fpsWindowSec) return;
@@ -54,130 +73,133 @@ export default function GamingView() {
     }
   };
 
-  const header = (
-    <div className="flex flex-wrap items-end justify-between gap-4">
-      <div>
-        <h1 className="text-[22px] font-semibold tracking-tight text-ink">Gaming</h1>
-        <p className="mt-0.5 text-[12.5px] text-muted">
-          Frame rate and frame times of the running game, read from Windows performance events by Intel PresentMon.
-        </p>
-      </div>
-      {enabled && (
-        <div className="flex items-center gap-2">
-          <span className="label-caps">Window</span>
-          <Segmented
-            size="sm"
-            ariaLabel="Statistics window"
-            value={settings.fpsWindowSec}
-            options={WINDOW_OPTIONS}
-            onChange={(v) => void changeWindow(v)}
-            disabled={windowBusy}
-          />
-        </div>
-      )}
-    </div>
-  );
-
   if (!enabled) {
     return (
-      <div className="flex flex-col gap-5">
-        {header}
+      <div className="flex min-h-0 flex-1 flex-col">
+        <PageHeader view="gaming" description={PAGE_DESCRIPTION} />
         <FrameCaptureOptIn setEnabled={setEnabled} />
       </div>
     );
   }
 
-  const picker = (
-    <TargetPicker
-      target={target}
-      listPresenting={listPresenting}
-      setTarget={setTarget}
-      refreshSignal={refreshSignal}
-      running={running}
-    />
+  const windowControl = (
+    <>
+      <span id="nx-fps-window-label">Window</span>
+      <Segmented
+        size="sm"
+        ariaLabel="Statistics window"
+        value={settings.fpsWindowSec}
+        options={WINDOW_OPTIONS}
+        onChange={(v) => void changeWindow(v)}
+        disabled={windowBusy}
+      />
+    </>
   );
 
-  const excludesCard = (
-    <GlassCard title="Ignored apps" icon={ListX}>
-      <ExcludesEditor excludes={settings.fpsExcludes} setExcludes={setExcludes} />
+  const targetCard = (className?: string) => (
+    <GlassCard
+      title="Target"
+      className={className}
+      actions={
+        <button
+          type="button"
+          onClick={() => setRefreshSignal((n) => n + 1)}
+          disabled={!running}
+          title="Read the list of apps again"
+          className="rounded-xs text-callout text-ink-2 hover:underline disabled:text-ink-disabled disabled:no-underline"
+        >
+          Refreshes with F5
+        </button>
+      }
+    >
+      <TargetPicker target={target} listPresenting={listPresenting} setTarget={setTarget} refreshSignal={refreshSignal} running={running} />
+      <ExcludesEditor
+        excludes={settings.fpsExcludes}
+        setExcludes={setExcludes}
+        className="mt-3 border-t border-divider pt-3 tight:mt-2 tight:pt-2"
+      />
     </GlassCard>
   );
 
-  const targetLabel = hasTarget
-    ? `${target.process ?? `PID ${target.pid}`}${target.windowTitle ? ` · ${target.windowTitle}` : ""}`
-    : null;
   const chartFrames = Math.min(frametimes.length, FRAMETIME_CHART_MAX_POINTS);
 
   return (
-    <div className="flex flex-col gap-4">
-      {header}
-      <FrameSessionBar session={session} setEnabled={setEnabled} agentRunning={!!agent?.running} />
+    <div className="flex min-h-0 flex-1 flex-col">
+      <PageHeader view="gaming" description={PAGE_DESCRIPTION} />
+      <div className="flex min-h-0 flex-1 flex-col gap-(--grid-gap)">
+        <FrameSessionBar session={session} setEnabled={setEnabled} agentRunning={!!agent?.running} trailing={windowControl} />
 
-      {hasTarget ? (
-        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
-          <div className="flex min-w-0 flex-col gap-4">
-            <GlassCard
-              title="Frame rate"
-              icon={Gamepad2}
-              accent="teal"
-              actions={
-                <span className="num max-w-[360px] truncate text-[11.5px] text-slate-400" title={targetLabel ?? undefined}>
-                  {targetLabel}
-                </span>
-              }
-            >
-              <FpsHero stats={liveStats} waitingText={waitingText} />
-            </GlassCard>
-            <GlassCard
-              title="Frame times"
-              icon={Activity}
-              actions={
-                <span className="num text-[11px] text-slate-500">
-                  {chartFrames > 0 ? `${chartFrames.toLocaleString("en-US")} frames` : ""}
-                </span>
-              }
-            >
-              <FrametimeChart frametimes={frametimes} className="h-[300px]" />
-              <p className="mt-1 text-[11px] text-slate-500">
-                Lower is smoother. Spikes above a dashed line are frames slower than that refresh rate.
-              </p>
-            </GlassCard>
-          </div>
-
-          <div className="flex min-w-0 flex-col gap-4">
-            <GlassCard title="Target" icon={Crosshair}>
-              <div className="flex flex-col gap-4">
-                {picker}
-                <PresentInfo target={target} stats={liveStats} />
-              </div>
-            </GlassCard>
-            <GlassCard title="CPU busy vs GPU busy" icon={Cpu}>
-              <BusyBars stats={liveStats} />
-            </GlassCard>
-            {excludesCard}
-          </div>
-        </div>
-      ) : (
-        <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
-          <GlassCard title="Target" icon={Crosshair} accent="teal">
-            <div className="flex max-w-[560px] flex-col gap-4 py-2">
-              <div className="flex items-start gap-3">
-                <Gamepad2 size={22} className="mt-0.5 shrink-0 text-slate-500" aria-hidden="true" />
-                <p className="text-[13px] leading-relaxed text-slate-300">
-                  {running || session?.state === "starting" ? NO_TARGET_TEXT : "Frame capture is not running yet."}
-                </p>
-              </div>
-              {picker}
+        {hasTarget ? (
+          <>
+            <div className="grid shrink-0 grid-cols-12 gap-(--grid-gap)">
+              <GlassCard className="col-span-8" bodyClassName="flex flex-col">
+                <FpsHero target={target} stats={liveStats} waitingText={waitingText} frametimes={frametimes} windowSec={settings.fpsWindowSec} />
+              </GlassCard>
+              {targetCard("col-span-4")}
             </div>
-          </GlassCard>
-          <div className="flex min-w-0 flex-col gap-4">
-            {excludesCard}
-            <AntiCheatNote />
-          </div>
-        </div>
-      )}
 
-      <p className="text-[11px] text-slate-500">{KNOWN_LIMITS}</p>
+            <div className="grid min-h-[300px] flex-1 grid-cols-12 gap-(--grid-gap)">
+              <GlassCard
+                className="col-span-8"
+                bodyClassName="flex flex-col"
+                title={
+                  <span className="flex items-center gap-1.5">
+                    Frame times
+                    <span role="img" tabIndex={0} aria-label={KNOWN_LIMITS} title={KNOWN_LIMITS} className="hidden rounded-xs text-ink-3 tight:inline-flex">
+                      <Info size={13} aria-hidden="true" />
+                    </span>
+                  </span>
+                }
+                subtitle={
+                  chartFrames > 0
+                    ? `Last ${chartFrames.toLocaleString("en-US")} frames · lower and flatter is smoother`
+                    : "Lower and flatter is smoother"
+                }
+                actions={<PresentInfo target={target} stats={liveStats} />}
+              >
+                <FrametimeChart frametimes={frametimes} className="min-h-[180px] flex-1" />
+              </GlassCard>
+
+              <div className="col-span-4 flex min-h-0 min-w-0 flex-col gap-(--grid-gap)">
+                <GlassCard title="CPU vs GPU busy" actions={<span className="tnum">{busyScaleText(liveStats)}</span>}>
+                  <BusyBars stats={liveStats} />
+                </GlassCard>
+                <GlassCard className="flex-1" title="While playing" actions={<span className="tnum">{whilePlayingMeta(settings.fpsWindowSec)}</span>}>
+                  <WhilePlaying history={history} windowSec={settings.fpsWindowSec} tempUnit={settings.tempUnit} />
+                </GlassCard>
+              </div>
+            </div>
+
+            <p className="flex shrink-0 items-center gap-1.5 text-callout text-ink-3 tight:hidden">
+              <Info size={13} className="shrink-0" aria-hidden="true" />
+              {KNOWN_LIMITS}
+            </p>
+          </>
+        ) : (
+          <div className="flex min-h-0 flex-1 flex-col items-center justify-center">
+            <EmptyState
+              icon={<Gamepad2 size={34} strokeWidth={1.75} className="text-icon-2" aria-hidden="true" />}
+              title={
+                running || session?.state === "starting"
+                  ? NO_TARGET_TITLE
+                  : session?.state === "error"
+                    ? "Frame capture stopped"
+                    : "Frame capture is not running yet"
+              }
+              body={
+                running || session?.state === "starting"
+                  ? NO_TARGET_BODY
+                  : session?.state === "error"
+                    ? "Use Try again above, or turn frame capture off."
+                    : undefined
+              }
+            >
+              {targetCard("text-left")}
+              <AntiCheatNote className="mt-4" />
+            </EmptyState>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

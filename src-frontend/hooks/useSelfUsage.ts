@@ -33,10 +33,17 @@ export function useSelfUsage(): SelfUsage | null {
   return useSyncExternalStore(subscribeStore, getSnapshot, getSnapshot);
 }
 
-/** Status-bar copy (CONTRACT §2.5): `Nexum 0.6% CPU · 142 MB`, `—` until the first event. */
+/** Sidebar footer copy (CONTRACT §2.5, §4.6.1): `Nexum 0.6% CPU · 142 MB`, `—` until the first event. */
 export function fmtSelfUsage(u: SelfUsage | null): string {
   if (!u) return "—";
   return `Nexum ${u.cpuPct.toFixed(1)}% CPU · ${Math.round(u.workingSetMb).toLocaleString("en-US")} MB`;
+}
+
+/** [NEW 1.2] Hover text of that line (CONTRACT §4.6.1, §4.8.1). */
+export function selfUsageTitle(u: SelfUsage | null): string {
+  if (!u) return "Nexum's own CPU and memory use appears a few seconds after start.";
+  const n = u.processCount;
+  return `Nexum's own use of this PC: ${n} ${n === 1 ? "process" : "processes"}. CPU is a share of the whole PC.`;
 }
 
 export default useSelfUsage;

@@ -1,235 +1,188 @@
-import { useMemo, type ReactNode } from "react";
-import { ArrowDownToLine, ArrowUpFromLine, HardDrive, ListTree, Thermometer } from "lucide-react";
-import type { AgentStatus, DiskTelemetry, DriveHealth, PhysicalDisk, TelemetryPacket } from "../../types";
-import { STATUS_CLASS, StatusPill, Unavailable } from "../ui";
+import { ChevronRight, HardDrive, Server } from "lucide-react";
+import type { AgentStatus, DiskTelemetry, DriveHealth, PhysicalDisk } from "../../types";
+import { Meter, StatusPill, Unavailable } from "../ui";
 import { driveHealthView, resolveUnavailable } from "../../lib/status";
-import { cn, fmtBytes, fmtCount, fmtTemp, maskSerial } from "../../lib/format";
-import ThroughputChart, { fmtRate } from "./ThroughputChart";
-import { mediaChips, type MediaChip } from "./diskMatch";
-import { DiskWearLine } from "./WearHistory";
+import { cn, fmtBytes, fmtCount, fmtTemp } from "../../lib/format";
+import { isHdd, mediaLabels } from "./diskMatch";
+import { healthWord, lifeMeterTone, lifePct } from "./driveHealth";
 
-const CHIP_STYLE: Record<MediaChip["tone"], string> = {
-  teal: "border-teal/40 bg-teal/10 text-teal",
-  purple: "border-purple/45 bg-purple/15 text-[#c084fc]",
-  cyan: "border-cyan/40 bg-cyan/10 text-cyan",
-  silver: "border-white/15 bg-white/5 text-silver",
-};
-
-function fmtTb(tb: number | null | undefined): string {
-  if (tb == null || !Number.isFinite(tb)) return "—";
-  return tb >= 100 ? tb.toFixed(0) : tb.toFixed(1);
-}
-
-export interface PhysicalDiskCardProps {
+export interface DriveEntry {
+  key: string;
   /** Windows physical disk; null for a sensor-only drive that matched no PhysicalDisk. */
-  physical: PhysicalDisk | null;
-  telemetry: DiskTelemetry | null;
+  disk: PhysicalDisk | null;
+  tele: DiskTelemetry | null;
   /** Classifier result (DiskTelemetry.health, or the unmatched "unknown" health). */
   health: DriveHealth;
-  history: TelemetryPacket[];
-  tempUnit: "C" | "F";
-  agent: AgentStatus | null;
-  onDetails?: () => void;
 }
 
+export interface DriveTableProps {
+  entries: readonly DriveEntry[];
+  /** Volume label per drive letter ("F:" → "Games"), for the line under the model. */
+  volumeLabels: ReadonlyMap<string, string>;
+  tempUnit: "C" | "F";
+  agent: AgentStatus | null;
+  /** DiskTelemetry.id of the drive whose details are open (neutral selected row). */
+  selectedId: string | null;
+  onOpen: (teleId: string) => void;
+  /** Tight mode: the Power-on and Written columns are hidden and the life meter is shorter. */
+  tight?: boolean;
+}
+
+function fmtTb(tb: number | null | undefined): string | null {
+  if (tb == null || !Number.isFinite(tb)) return null;
+  return `${tb >= 100 ? tb.toFixed(0) : tb.toFixed(1)} TB`;
+}
+
+const TH = "h-7 whitespace-nowrap border-b border-hairline px-2.5 text-left text-[11px] font-semibold text-ink-2 first:pl-3 last:pr-3";
+const TD = "whitespace-nowrap border-b border-divider px-2.5 first:pl-3 last:pr-3 group-last:border-b-0";
+
 /**
- * One physical drive (MF-1). The health chip, its colour and the life bar all come from the sidecar
- * classifier (`DiskTelemetry.health`) through `driveHealthView`; Windows' own status is display-only.
+ * The "Physical drives" table (CONTRACT §4.10.3, SPEC §7): one row per drive so wear compares down
+ * one column. The health chip, its tone and the meter tone all come from the drive classifier
+ * (`DiskTelemetry.health`) through `driveHealthView`; Windows' own status is shown only in the
+ * details. A row opens the S.M.A.R.T. details of its drive.
  */
-export default function PhysicalDiskCard({
-  physical,
-  telemetry,
-  health,
-  history,
-  tempUnit,
-  agent,
-  onDetails,
-}: PhysicalDiskCardProps) {
-  const name = physical?.model || telemetry?.name || "Unknown drive";
-  const chips = mediaChips(physical, telemetry?.name);
-  const view = driveHealthView(health);
-  const toneCls = STATUS_CLASS[view.tone];
-  const life = telemetry?.healthPct ?? null;
-  const tempC = telemetry?.tempC ?? null;
+export default function DriveTable({ entries, volumeLabels, tempUnit, agent, selectedId, onOpen, tight = false }: DriveTableProps) {
   const smartReason = resolveUnavailable(agent, "admin");
-
-  const series = useMemo(() => {
-    const ts: number[] = [];
-    const read: (number | null)[] = [];
-    const write: (number | null)[] = [];
-    if (!telemetry) return { ts, read, write };
-    for (const p of history) {
-      const d = p.disks?.find((x) => x.id === telemetry.id);
-      ts.push(p.ts);
-      read.push(d?.readMBps ?? null);
-      write.push(d?.writeMBps ?? null);
-    }
-    return { ts, read, write };
-  }, [history, telemetry?.id]);
-
-  const readNow = telemetry?.readMBps ?? null;
-  const writeNow = telemetry?.writeMBps ?? null;
-  const ioKnown = readNow !== null || writeNow !== null;
-  const volumes = physical?.volumes ?? [];
-
   return (
-    <div className="relative overflow-hidden rounded-xl border border-line bg-white/[0.02] p-4 transition hover:border-white/15">
-      {/* Header */}
-      <div className="flex items-start gap-3">
-        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-line bg-white/[0.03] text-silver">
-          <HardDrive size={18} />
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-[14px] font-semibold text-ink" title={name}>
-            {name}
-          </div>
-          <div className="mt-1 flex flex-wrap items-center gap-1.5">
-            {chips.map((c) => (
-              <span
-                key={c.label}
-                className={cn("rounded-md border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider", CHIP_STYLE[c.tone])}
-              >
-                {c.label}
-              </span>
-            ))}
-            {physical && <span className="font-mono text-[11.5px] text-silver">{fmtBytes(physical.sizeBytes, 0)}</span>}
-            {volumes.length > 0 && (
-              <span className="font-mono text-[11.5px] text-ink" title="Drive letters on this disk">
-                {volumes.join(" ")}
-              </span>
-            )}
-            {physical?.isSystemDisk && (
-              <span className="rounded border border-line bg-white/[0.04] px-1.5 py-px text-[9.5px] font-semibold uppercase tracking-wider text-silver">
-                System
-              </span>
-            )}
-            {physical?.serial && (
-              <span className="truncate font-mono text-[10.5px] text-muted" title="Serial number (masked)">
-                SN {maskSerial(physical.serial)}
-              </span>
-            )}
-          </div>
-        </div>
-        <StatusPill tone={view.tone} icon={view.icon} title={`${view.label}. ${health.reason}`}>
-          {health.state === "unknown" ? "Unknown" : view.label}
-        </StatusPill>
-      </div>
-
-      {/* Classifier explanation, always visible (not colour alone) */}
-      <p className={cn("mt-2.5 text-[11.5px] leading-snug", health.state === "good" ? "text-muted" : toneCls.text)}>
-        {health.state === "unknown" ? health.label : health.reason || view.label}
-      </p>
-
-      {/* S.M.A.R.T. readouts */}
-      <div className="mt-3 grid grid-cols-4 gap-2">
-        <Readout
-          label="Temp"
-          icon={<Thermometer size={11} />}
-          value={tempC == null ? <Unavailable compact reason={smartReason} /> : fmtTemp(tempC, tempUnit)}
-        />
-        <Readout
-          label="Life"
-          value={life == null ? <Unavailable compact reason={smartReason} /> : `${Math.round(life)}%`}
-          valueClass={life == null ? undefined : toneCls.text}
-          title={`Remaining rated life. State: ${view.label}`}
-        />
-        <Readout
-          label="Written"
-          value={telemetry?.tbw != null ? fmtTb(telemetry.tbw) : <Unavailable compact reason={smartReason} />}
-          unit={telemetry?.tbw != null ? "TB" : undefined}
-        />
-        <Readout
-          label="Power-on"
-          value={
-            telemetry?.powerOnHours != null ? (
-              fmtCount(telemetry.powerOnHours)
-            ) : (
-              <Unavailable compact reason={smartReason} />
-            )
-          }
-          unit={telemetry?.powerOnHours != null ? "h" : undefined}
-        />
-      </div>
-
-      {life != null && (
-        <div className="mt-3 h-1 w-full overflow-hidden rounded-full bg-white/[0.06]" aria-hidden="true">
-          <div
-            className={cn("h-full rounded-full transition-[width] duration-500", toneCls.bg)}
-            style={{ width: `${Math.max(0, Math.min(100, life))}%` }}
+    <table className="tnum w-full border-collapse text-[13px] leading-none">
+      <caption className="sr-only">Physical drives with remaining life, temperature and health</caption>
+      <thead>
+        <tr>
+          <th scope="col" className={TH}>Drive</th>
+          <th scope="col" className={TH}>Life left</th>
+          <th scope="col" className={cn(TH, "text-right")}>Temp</th>
+          {!tight && <th scope="col" className={cn(TH, "text-right")}>Power-on</th>}
+          {!tight && <th scope="col" className={cn(TH, "text-right")}>Written</th>}
+          <th scope="col" className={TH}>Health</th>
+          <th scope="col" className={cn(TH, "w-9")}>
+            <span className="sr-only">Details</span>
+          </th>
+        </tr>
+      </thead>
+      <tbody>
+        {entries.map((e) => (
+          <DriveRow
+            key={e.key}
+            entry={e}
+            volumeLabels={volumeLabels}
+            tempUnit={tempUnit}
+            smartReason={smartReason}
+            selected={e.tele != null && e.tele.id === selectedId}
+            onOpen={onOpen}
+            tight={tight}
           />
-        </div>
-      )}
-
-      {telemetry?.serial && <DiskWearLine serial={telemetry.serial} onDetails={onDetails} />}
-
-      {/* Live throughput */}
-      <div className="mt-4 rounded-lg border border-line bg-canvas-0/50 px-3 pb-1 pt-2.5">
-        <div className="flex items-center justify-between text-[11px]">
-          <span className="uppercase tracking-[0.16em] text-muted">Live I/O</span>
-          {ioKnown && (
-            <div className="flex items-center gap-3 font-mono">
-              <span className="flex items-center gap-1 text-teal">
-                <ArrowDownToLine size={11} />R {readNow == null ? "—" : fmtRate(readNow)}
-              </span>
-              <span className="flex items-center gap-1 text-cyan">
-                <ArrowUpFromLine size={11} />W {writeNow == null ? "—" : fmtRate(writeNow)}
-              </span>
-            </div>
-          )}
-        </div>
-        {telemetry && ioKnown ? (
-          <ThroughputChart ts={series.ts} read={series.read} write={series.write} height={64} />
-        ) : (
-          <div className="flex h-[64px] items-center justify-center text-[11px] text-muted">
-            {telemetry ? <Unavailable reason="unsupported" /> : "No live sensor matched this drive"}
-          </div>
-        )}
-      </div>
-
-      <div className="mt-3 flex items-center justify-between gap-2 text-[11px] text-muted">
-        <span className="truncate" title="Windows' own drive status, shown for information. Nexum's health state comes from the drive's S.M.A.R.T. data.">
-          Windows reports: {physical?.healthStatus ?? "—"}
-        </span>
-        <button
-          type="button"
-          onClick={onDetails}
-          disabled={!telemetry || !onDetails}
-          title={telemetry ? "Open the S.M.A.R.T. details" : "No S.M.A.R.T. data for this drive"}
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-line bg-white/[0.03] px-2.5 py-1 text-[11.5px] font-medium text-silver transition hover:border-white/25 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
-        >
-          <ListTree size={13} />
-          S.M.A.R.T. details
-        </button>
-      </div>
-    </div>
+        ))}
+      </tbody>
+    </table>
   );
 }
 
-function Readout({
-  label,
-  value,
-  unit,
-  icon,
-  valueClass,
-  title,
+function DriveRow({
+  entry,
+  volumeLabels,
+  tempUnit,
+  smartReason,
+  selected,
+  onOpen,
+  tight,
 }: {
-  label: string;
-  value: ReactNode;
-  unit?: string;
-  icon?: ReactNode;
-  valueClass?: string;
-  title?: string;
+  entry: DriveEntry;
+  volumeLabels: ReadonlyMap<string, string>;
+  tempUnit: "C" | "F";
+  smartReason: ReturnType<typeof resolveUnavailable>;
+  selected: boolean;
+  onOpen: (teleId: string) => void;
+  tight: boolean;
 }) {
+  const { disk, tele, health } = entry;
+  const name = disk?.model?.trim() || tele?.name || "Unknown drive";
+  const view = driveHealthView(health);
+  const life = lifePct(tele);
+  const letters = disk?.volumes ?? [];
+  const role = disk?.isSystemDisk
+    ? "System"
+    : letters.map((l) => volumeLabels.get(l.trim().toUpperCase()) ?? "").filter(Boolean).join(", ");
+  const meta = [
+    ...mediaLabels(disk, tele?.name),
+    disk ? fmtBytes(disk.sizeBytes, 0) : null,
+    letters.length > 0 ? letters.join(" ") : null,
+    role || null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const Icon = isHdd(disk, tele?.id) ? Server : HardDrive;
+  const open = tele ? () => onOpen(tele.id) : undefined;
+  const written = fmtTb(tele?.tbw);
+  const cell = cn(TD, tight ? "h-12" : "h-[52px]", selected && "bg-selected first:rounded-l-lg last:rounded-r-lg");
+
   return (
-    <div className="min-w-0 rounded-lg border border-line bg-canvas-0/40 px-2.5 py-2" title={title}>
-      <div className="flex items-center gap-1 text-[9.5px] uppercase tracking-[0.16em] text-muted">
-        {icon}
-        {label}
-      </div>
-      <div className="mt-1 flex items-baseline gap-1">
-        <span className={cn("truncate font-mono text-[15px] font-semibold", valueClass ?? "text-ink")}>{value}</span>
-        {unit && <span className="font-mono text-[10px] text-muted">{unit}</span>}
-      </div>
-    </div>
+    <tr
+      className={cn("group", open && "hover:[&>td]:bg-hover", selected && "hover:[&>td]:bg-selected")}
+      onClick={open}
+    >
+      <td className={cell}>
+        <div className="flex min-w-0 items-center gap-[11px]">
+          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-inset text-icon-2 shadow-[inset_0_0_0_0.5px_var(--color-hairline)]">
+            <Icon size={16} aria-hidden="true" />
+          </span>
+          <div className="min-w-0">
+            <b className="block truncate font-medium leading-[18px] text-ink" title={name}>
+              {name}
+            </b>
+            <span className="block truncate text-callout text-ink-2">{meta || "No details reported"}</span>
+          </div>
+        </div>
+      </td>
+      <td className={cell}>
+        {life != null ? (
+          <div className="flex items-center gap-2.5" title={`Remaining rated life. ${view.label}: ${health.reason}`}>
+            <div className={cn("shrink-0", tight ? "w-16" : "w-[110px]")}>
+              <Meter value={life} tone={lifeMeterTone(view.tone)} height={5} label={`${name} life left`} />
+            </div>
+            <b className="min-w-[34px] text-right font-semibold text-ink">{life}%</b>
+          </div>
+        ) : !tele || health.source === "none" ? (
+          <Unavailable compact reason={smartReason} />
+        ) : (
+          <span className="text-ink-2" title="This drive does not report a wear counter.">
+            No wear counter
+          </span>
+        )}
+      </td>
+      <td className={cn(cell, "text-right text-ink")}>
+        {tele?.tempC != null ? fmtTemp(tele.tempC, tempUnit).replace("°", " °") : <Unavailable compact reason={smartReason} />}
+      </td>
+      {!tight && (
+        <td className={cn(cell, "text-right text-ink")}>
+          {tele?.powerOnHours != null ? `${fmtCount(tele.powerOnHours)} h` : <Unavailable compact reason={smartReason} />}
+        </td>
+      )}
+      {!tight && (
+        <td className={cn(cell, "text-right text-ink")}>
+          {written ?? (tele && health.source !== "none" ? <span className="text-ink-3">—</span> : <Unavailable compact reason={smartReason} />)}
+        </td>
+      )}
+      <td className={cell}>
+        <StatusPill tone={view.tone} title={`${view.label}. ${health.reason}`}>
+          {healthWord(health)}
+        </StatusPill>
+      </td>
+      <td className={cn(cell, "w-9 text-right")}>
+        <button
+          type="button"
+          disabled={!open}
+          onClick={(ev) => {
+            ev.stopPropagation();
+            open?.();
+          }}
+          title={open ? "S.M.A.R.T. details" : "No S.M.A.R.T. data for this drive"}
+          aria-label={open ? `S.M.A.R.T. details for ${name}` : `No S.M.A.R.T. data for ${name}`}
+          className="inline-flex h-6 w-6 items-center justify-center rounded-sm text-ink-3 hover:bg-hover disabled:opacity-40"
+        >
+          <ChevronRight size={14} aria-hidden="true" />
+        </button>
+      </td>
+    </tr>
   );
 }

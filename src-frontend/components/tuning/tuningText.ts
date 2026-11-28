@@ -3,9 +3,11 @@
 
 import type { TuningRange, TuningState, TuningUnsupportedReason, UnavailableReason } from "../../types";
 
-export const PANEL_HEADER =
-  "Read-only. Nexum shows the GPU's tuning ranges and current values but does not change them in this version.";
-export const NO_CHANGE_NOTE = "Nexum does not change GPU settings in this version.";
+/** The header sentence (CONTRACT §4.10.1), split so the first two words can be set in semibold. */
+export const PANEL_HEADER_LEAD = "Read-only.";
+export const PANEL_HEADER_BODY = "Nexum shows the GPU's tuning ranges and current values but does not change them in this version.";
+export const PANEL_HEADER = `${PANEL_HEADER_LEAD} ${PANEL_HEADER_BODY}`;
+export const CHANGE_ELSEWHERE_NOTE = "Change them in AMD Software.";
 export const PROBE_BUTTON = "Run read-only probe";
 export const PROBE_EXPLAIN =
   "Reads every Overdrive value the AMD driver reports and saves the raw tables to a JSON file you can share for troubleshooting. Nothing is changed.";
@@ -31,10 +33,10 @@ export function fmtRange(r: TuningRange | null, unit: string, signed = false): s
   return `${fmtValue(r.min, unit, signed, false)} … ${fmtValue(r.max, unit, signed)}`;
 }
 
-/** `+10 %`, `3100 MHz`, `-50 mV` */
+/** `+10 %`, `3,100 MHz`, `−50 mV` */
 export function fmtValue(v: number | null, unit: string, signed = false, withUnit = true): string {
   if (v == null || !Number.isFinite(v)) return "—";
-  const n = Number.isInteger(v) ? String(Math.abs(v)) : Math.abs(v).toFixed(1);
+  const n = Number.isInteger(v) ? Math.abs(v).toLocaleString("en-US") : Math.abs(v).toFixed(1);
   const sign = v < 0 ? "−" : signed && v > 0 ? "+" : "";
   return `${sign}${n}${withUnit && unit ? ` ${unit}` : ""}`;
 }

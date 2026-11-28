@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { FileText, Folder, FolderOpen, Layers, Loader2, RefreshCw } from "lucide-react";
+import { FileText, Folder, Layers, Loader2, RefreshCw } from "lucide-react";
 import { TRASH_DETAILS_LIMIT, type TrashCategoryId, type TrashDetailItem } from "../../types";
 import { api, errorMessage } from "../../lib/api";
 import { cn } from "../../lib/format";
+import { Button, InkLink, Tag } from "../ui";
 import { toast } from "../feedback/Toast";
 import { dirnameOf, fmtIn, pickUnit, type ByteUnit } from "./cleanerCopy";
 
@@ -94,24 +95,19 @@ export default function CategoryDetails({ categoryId, recycleMinAgeDays, scanSta
 
   if (state.phase === "loading") {
     return (
-      <div className="flex items-center gap-2 py-3 text-[11.5px] text-muted">
-        <Loader2 size={12} className="animate-spin text-teal" aria-hidden="true" />
+      <div className="flex items-center gap-2 py-2 text-callout text-ink-2" role="status">
+        <Loader2 size={13} className="animate-spin text-ink-3" aria-hidden="true" />
         Listing files…
       </div>
     );
   }
   if (state.phase === "error") {
     return (
-      <div className="flex items-center justify-between gap-3 py-2 text-[11.5px] text-slate-400">
+      <div className="flex items-center justify-between gap-3 py-1.5 text-callout text-ink-2" role="alert">
         <span className="min-w-0">Could not list the files: {state.message}</span>
-        <button
-          type="button"
-          onClick={() => void load()}
-          className="inline-flex shrink-0 items-center gap-1 rounded-md border border-line px-2 py-0.5 text-[11px] text-silver hover:text-ink"
-        >
-          <RefreshCw size={11} aria-hidden="true" />
+        <Button size="sm" icon={RefreshCw} onClick={() => void load()}>
           Try again
-        </button>
+        </Button>
       </div>
     );
   }
@@ -119,7 +115,7 @@ export default function CategoryDetails({ categoryId, recycleMinAgeDays, scanSta
   const items = state.items;
   if (items.length === 0) {
     return (
-      <p className="py-2.5 text-[11.5px] text-muted">
+      <p className="py-2 text-callout text-ink-2">
         {isRecycle && recycleMinAgeDays != null
           ? `Nothing in the Recycle Bin is older than ${recycleMinAgeDays} ${recycleMinAgeDays === 1 ? "day" : "days"}.`
           : "Nothing in this category would be deleted right now."}
@@ -128,58 +124,40 @@ export default function CategoryDetails({ categoryId, recycleMinAgeDays, scanSta
   }
 
   const unit = pickUnit(...items.map((i) => i.bytes));
+  const cols = "grid grid-cols-[minmax(0,1fr)_76px_104px_96px] items-center gap-x-3 px-2.5";
   return (
-    <div className="pt-1">
-      <div className="grid grid-cols-[minmax(0,1fr)_76px_104px_88px] items-center gap-x-3 border-b border-line pb-1 text-[9.5px] font-semibold uppercase tracking-[0.14em] text-muted">
+    <div className="overflow-hidden rounded-lg bg-content shadow-[inset_0_0_0_0.5px_var(--color-subtle)]">
+      <div className={cn(cols, "h-7 border-b border-hairline text-[11px] font-semibold text-ink-2")}>
         <span>{isRecycle ? "Original location" : "Path"}</span>
         <span className="text-right">Size</span>
         <span title={isRecycle ? "When the item was deleted" : "Last modified"}>{isRecycle ? "Deleted" : "Modified"}</span>
         <span className="sr-only">Actions</span>
       </div>
-      <ul className="nx-scroll max-h-[280px] overflow-y-auto pr-1" aria-label={`Largest items, up to ${TRASH_DETAILS_LIMIT}`}>
+      <ul className="zebra max-h-[264px] overflow-y-auto" aria-label={`Largest items, up to ${TRASH_DETAILS_LIMIT}`}>
         {items.map((it, i) => {
           const Icon = it.kind === "group" ? Layers : it.kind === "folder" ? Folder : FileText;
+          const folder = it.kind === "group" ? it.path : dirnameOf(it.path);
           return (
-            <li
-              key={`${it.path}-${i}`}
-              className="grid grid-cols-[minmax(0,1fr)_76px_104px_88px] items-center gap-x-3 border-b border-white/[0.04] py-1 text-[11.5px] last:border-b-0"
-            >
+            <li key={`${it.path}-${i}`} className={cn(cols, "tnum h-6 text-callout")}>
               <span className="flex min-w-0 items-center gap-1.5" title={it.path}>
-                <Icon size={11} className="shrink-0 text-slate-500" aria-hidden="true" />
-                <span className="truncate font-mono text-[11px] text-slate-300">{middleTruncate(it.path)}</span>
-                {it.kind === "group" && (
-                  <span
-                    className="shrink-0 rounded border border-line px-1 text-[9px] font-semibold uppercase tracking-wider text-slate-400"
-                    title="Cleared by Windows' own Delivery Optimization command, not file by file"
-                  >
-                    Windows
-                  </span>
-                )}
+                <Icon size={13} className="shrink-0 text-ink-3" aria-hidden="true" />
+                <span className="truncate font-mono text-[11.5px] text-ink">{middleTruncate(it.path)}</span>
+                {it.kind === "group" && <Tag title="Cleared by Windows' own Delivery Optimization command, not file by file">Windows</Tag>}
               </span>
-              <span className="text-right font-mono text-[11px] text-ink">{fmtSize(it.bytes, unit)}</span>
-              <span className="truncate text-[11px] text-slate-400">{fmtAge(it.modifiedTs, state.at)}</span>
+              <span className="text-right font-medium text-ink">{fmtSize(it.bytes, unit)}</span>
+              <span className="truncate text-ink-2">{fmtAge(it.modifiedTs, state.at)}</span>
               <span className="flex justify-end">
-                {!isRecycle && isLocalDrivePath(it.kind === "group" ? it.path : dirnameOf(it.path)) && (
-                  <button
-                    type="button"
-                    onClick={() => openFolder(it)}
-                    title={`Open ${it.kind === "group" ? it.path : dirnameOf(it.path)}`}
-                    aria-label={`Open the folder of ${it.path}`}
-                    className={cn(
-                      "inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10.5px] text-silver transition",
-                      "hover:bg-white/[0.06] hover:text-ink",
-                    )}
-                  >
-                    <FolderOpen size={11} aria-hidden="true" />
+                {!isRecycle && isLocalDrivePath(folder) && (
+                  <InkLink onClick={() => openFolder(it)} title={`Open ${folder}`} aria-label={`Open the folder of ${it.path}`} chevron={false}>
                     Open folder
-                  </button>
+                  </InkLink>
                 )}
               </span>
             </li>
           );
         })}
       </ul>
-      <p className="pt-1.5 text-[10.5px] text-muted">
+      <p className="border-t border-hairline px-2.5 py-1.5 text-callout text-ink-3">
         {items.length >= TRASH_DETAILS_LIMIT
           ? `The ${TRASH_DETAILS_LIMIT} largest items. `
           : `${items.length} ${items.length === 1 ? "item" : "items"}. `}

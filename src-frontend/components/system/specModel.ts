@@ -1,25 +1,26 @@
 // Row model of the System view (CONTRACT §1.4, §2.6, §4.10). The spec sheet and "Copy as text"
 // render from the same rows, so the two never disagree.
 
-import type {
-  BoardSpec,
-  CpuCacheSpec,
-  CpuSpec,
-  DimmSpec,
-  DiskLink,
-  GpuSpec,
-  GpuVendor,
-  MemorySpec,
-  MemoryTimings,
-  OsSpec,
-  PcieLink,
-  PhysicalDisk,
-  SecuritySpec,
-  SpdInfo,
-  SpdTimingKey,
-  SystemSpec,
-  TimingsSource,
-  UnavailableReason,
+import {
+  NOT_AVAILABLE_TEXT,
+  type BoardSpec,
+  type CpuCacheSpec,
+  type CpuSpec,
+  type DimmSpec,
+  type DiskLink,
+  type GpuSpec,
+  type GpuVendor,
+  type MemorySpec,
+  type MemoryTimings,
+  type OsSpec,
+  type PcieLink,
+  type PhysicalDisk,
+  type SecuritySpec,
+  type SpdInfo,
+  type SpdTimingKey,
+  type SystemSpec,
+  type TimingsSource,
+  type UnavailableReason,
 } from "../../types";
 import { fmtBiosVendor, fmtBoardName, fmtCount, fmtDate, fmtTemp, fmtUptime } from "../../lib/format";
 
@@ -40,11 +41,12 @@ const UNAVAILABLE_COPY: Record<UnavailableReason, string> = {
   pawnIoMissing: "Needs PawnIO driver",
   pawnIoOutdated: "PawnIO update needed",
   unsupported: "Not reported by this hardware",
-  agentOffline: "Hardware agent offline",
+  agentOffline: NOT_AVAILABLE_TEXT,
 };
 
 export type SpecValue =
-  | { kind: "text"; text: string; mono?: boolean }
+  /** `mono` marks a numeric value (tabular figures); `ident` an identifier, set in JetBrains Mono (CONTRACT §4.9 fonts). */
+  | { kind: "text"; text: string; mono?: boolean; ident?: boolean }
   | { kind: "unavailable"; reason: UnavailableReason }
   /** A value that does not exist for this source (e.g. command rate in SPD data): em dash + short reason. */
   | { kind: "muted"; text: string; hint: string };
@@ -56,6 +58,8 @@ export interface SpecRow {
 
 export const txt = (text: string, mono = false): SpecValue => ({ kind: "text", text, mono });
 export const na = (reason: UnavailableReason): SpecValue => ({ kind: "unavailable", reason });
+/** An identifier (part number, hex id): the only values shown in the monospace face. */
+export const ident = (text: string): SpecValue => ({ kind: "text", text, mono: true, ident: true });
 
 /** Text, or <Unavailable> when the source is null / empty. */
 function orNa(v: string | null | undefined, reason: UnavailableReason, mono = false): SpecValue {
@@ -392,7 +396,7 @@ export function dimmRows(d: DimmSpec, ctx: RowCtx): SpecRow[] {
     { label: "Size", value: txt(fmtSizeGb(d.sizeGb), true) },
     { label: "Ranks", value: d.ranks != null ? txt(d.ranks === 1 ? "Single (1)" : d.ranks === 2 ? "Dual (2)" : String(d.ranks)) : na(ctx.missing) },
     { label: "Manufacturer", value: orNa(d.manufacturer, ctx.missing) },
-    { label: "Part number", value: orNa(d.partNumber, ctx.missing, true) },
+    { label: "Part number", value: d.partNumber.trim() ? ident(d.partNumber.trim()) : na(ctx.missing) },
     { label: "Rated speed", value: d.speedMts != null && d.speedMts > 0 ? txt(fmtMts(d.speedMts), true) : na(ctx.missing) },
     {
       label: "Configured speed",

@@ -1,5 +1,5 @@
-import { useMemo, type KeyboardEvent, type ReactNode } from "react";
-import { SERIES_HEX, TONE_HEX, Unavailable, UNAVAILABLE_TEXT } from "../ui";
+import { useMemo, useRef, type KeyboardEvent, type ReactNode } from "react";
+import { Card, SERIES_CLASS, SERIES_HEX, Sparkline, Tag, Unavailable, type SeriesKey } from "../ui";
 import { useTelemetry } from "../../hooks/useTelemetryStream";
 import { useSettings } from "../../hooks/useSettings";
 import { useSensorLabels } from "../../hooks/useSensorLabels";
@@ -7,41 +7,9 @@ import { useFrames } from "../../hooks/useFrames";
 import { fmtFps, fpsKpi } from "../../lib/frames";
 import { requestNavigate } from "../../lib/nav";
 import { resolveUnavailable } from "../../lib/status";
-import { clamp, cn, fmtGhz, fmtTemp } from "../../lib/format";
-import type { AgentStatus, FanPreset, TelemetryPacket } from "../../types";
-import { finite, isZeroRpmIdle, pickCpuFan } from "./sensorHelpers";
-
-/** Short sub-label for the CPU fan tile at 1280–1439 px (the tooltip keeps the full cause). */
-const FAN_REASON_SHORT: Record<ReturnType<typeof resolveUnavailable>, string> = {
-  notElevated: "Needs admin",
-  pawnIoMissing: "Needs PawnIO",
-  pawnIoOutdated: "Update PawnIO",
-  unsupported: "Not reported",
-  agentOffline: "Agent offline",
-};
-
-interface Kpi {
-  key: string;
-  label: string;
-  /** Series colour (decoration only, never state). */
-  color: string;
-  value: ReactNode;
-  unit: string | null;
-  /** Sub-label at ≥ 1440 px. */
-  sub: ReactNode;
-  /** Shorter sub-label at 1280–1439 px (MF-10). */
-  subShort?: ReactNode;
-  /** Hover text for the sub-label. */
-  subTitle?: string;
-  /** 0-100 fill for the thin baseline meter; null hides it. */
-  meter: number | null;
-  /** Small neutral badge on the value row (e.g. "Zero-RPM idle"). */
-  badge?: ReactNode;
-  /** Makes the whole card a button (the FPS card opens the Gaming view). */
-  onClick?: () => void;
-  /** Accessible name / tooltip of a clickable card. */
-  clickTitle?: string;
-}
+import { cn, fmtGhz } from "../../lib/format";
+import { NOT_AVAILABLE_TEXT, type AgentStatus, type FanPreset, type TelemetryPacket } from "../../types";
+import { countText, finite, isZeroRpmIdle, pickCpuFan, tempText } from "./sensorHelpers";
 
 const PRESET_LABEL: Record<FanPreset, string> = {
   auto: "BIOS auto",
@@ -51,15 +19,49 @@ const PRESET_LABEL: Record<FanPreset, string> = {
   custom: "Custom",
 };
 
-/** Bar scale floor so a quiet 600 RPM fan doesn't look pegged. */
-const RPM_SCALE_FLOOR = 2000;
+/** Sparkline window: the telemetry history the provider keeps (last 120 packets). */
+const FPS_POINTS = 60;
 
-function Dash() {
-  return <span className="text-muted">—</span>;
+interface Kpi {
+  key: string;
+  label: string;
+  /** Series identity (dot and sparkline colour). Decoration only, never state. */
+  series: SeriesKey;
+  /** Number shown at display size, or null when the value cannot be read. */
+  value: string | null;
+  unit: string | null;
+  /** One line under the value. */
+  meta: ReactNode;
+  /** Hover text of the meta line (what the figures are). */
+  metaTitle?: string;
+  /** Neutral tag after the label ("Zero-RPM idle"). */
+  tag?: ReactNode;
+  spark: readonly (number | null)[];
+  sparkMin?: number;
+  sparkMax?: number;
+  /** Makes the whole cell a button (Frame rate → Gaming). */
+  onClick?: () => void;
+  clickTitle?: string;
+}
+
+/** Scale for a sparkline whose absolute level matters less than its movement (rpm, fps). */
+function fitRange(values: readonly (number | null)[], minSpan: number): { min: number; max: number } | null {
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const v of values) {
+    if (v == null) continue;
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  if (lo === Infinity) return null;
+  const span = Math.max(hi - lo, minSpan);
+  const mid = (hi + lo) / 2;
+  return { min: Math.max(0, mid - span * 0.75), max: mid + span * 0.75 };
 }
 
 function buildKpis(
   latest: TelemetryPacket | null,
+  history: readonly TelemetryPacket[],
   agent: AgentStatus | null,
   tempUnit: "C" | "F",
   labelOf: (id: string, defaultName: string) => string,
@@ -67,168 +69,159 @@ function buildKpis(
   const cpu = latest?.cpu ?? null;
   const gpu = latest?.gpu ?? null;
   const ram = latest?.ram ?? null;
+  // Nothing is read right now: the large dash already says so (hover: "Not available right now"), so the
+  // meta line stays empty instead of showing a second dash under it.
+  const missingReason = resolveUnavailable(agent, "none");
+  const missing = !latest && missingReason === "agentOffline" ? null : <Unavailable reason={missingReason} />;
 
-  /* ---- CPU ---- */
+  /* ---- CPU: load, package temperature, effective clock ---- */
   const cpuLoad = cpu?.loadTotal;
+  const cpuTemp = cpu?.packageTempC;
   const cpuClock = cpu?.clockMhz;
-  const coresText = cpu && cpu.cores > 0 ? `${cpu.cores}C/${cpu.threads}T` : null;
-  const clockNode: ReactNode = finite(cpuClock) ? (
-    <span>{fmtGhz(cpuClock)} eff.</span>
-  ) : latest ? (
-    <Unavailable reason={resolveUnavailable(agent, "pawnio")} compact />
+  const cpuKnown = [finite(cpuTemp) ? tempText(cpuTemp, tempUnit, 1) : null, finite(cpuClock) ? fmtGhz(cpuClock) : null].filter(Boolean);
+  const cpuMissing = [finite(cpuTemp) ? null : "temp", finite(cpuClock) ? null : "clock"].filter(Boolean);
+  const cpuMeta: ReactNode = !latest ? (
+    missing
+  ) : cpuMissing.length === 0 ? (
+    cpuKnown.join(" · ")
   ) : (
-    <Dash />
+    <span className="inline-flex min-w-0 items-center gap-1.5">
+      <Unavailable reason={resolveUnavailable(agent, "pawnio")} compact />
+      <span className="truncate">{[cpuMissing.join(" · "), ...cpuKnown].join(" · ")}</span>
+    </span>
   );
+  const coresText = cpu && cpu.cores > 0 ? `${cpu.cores} cores, ${cpu.threads} threads` : null;
   const cpuKpi: Kpi = {
     key: "cpu",
-    label: "CPU load",
-    color: SERIES_HEX.cpu,
-    value: finite(cpuLoad) ? cpuLoad.toFixed(0) : latest ? <Unavailable reason={resolveUnavailable(agent, "none")} compact /> : "—",
-    unit: finite(cpuLoad) ? "%" : null,
-    sub: (
-      <>
-        {clockNode}
-        {coresText ? <span> · {coresText}</span> : null}
-      </>
-    ),
-    subShort: finite(cpuClock) ? <span>{fmtGhz(cpuClock, 1)} eff.</span> : clockNode,
-    subTitle: finite(cpuClock)
-      ? "Average effective clock across all cores (LHM \"Cores (Average Effective)\")"
-      : "CPU clock is not available",
-    meter: finite(cpuLoad) ? cpuLoad : null,
+    label: "CPU",
+    series: "cpu",
+    value: finite(cpuLoad) ? cpuLoad.toFixed(0) : null,
+    unit: "%",
+    meta: cpuMeta,
+    metaTitle: ["Package temperature and average effective clock across all cores", coresText].filter(Boolean).join(" · "),
+    spark: history.map((p) => (finite(p.cpu?.loadTotal) ? p.cpu.loadTotal : null)),
+    sparkMin: 0,
+    sparkMax: 100,
   };
 
-  /* ---- GPU ---- */
+  /* ---- GPU: load, edge temperature, power ---- */
   const gpuLoad = gpu?.load;
   const edge = gpu?.tempC;
-  const zeroRpm = isZeroRpmIdle(gpu);
-  const badge = zeroRpm ? (
-    <span
-      className="whitespace-nowrap rounded border border-line bg-white/[0.04] px-1 py-px font-sans text-[9px] font-semibold uppercase tracking-wider text-silver"
-      title="Zero-RPM idle: the GPU fan is stopped because the card is cool enough"
-    >
-      <span className="max-[1439px]:hidden">Zero-RPM idle</span>
-      <span className="hidden max-[1439px]:inline">Zero-RPM</span>
-    </span>
-  ) : null;
+  const gpuParts = [finite(edge) ? `${tempText(edge, tempUnit)} edge` : null, finite(gpu?.powerW) ? `${gpu!.powerW!.toFixed(0)} W` : null].filter(Boolean);
   const gpuKpi: Kpi = {
     key: "gpu",
-    label: "GPU load",
-    color: SERIES_HEX.gpu,
-    value: finite(gpuLoad) ? gpuLoad.toFixed(0) : gpu ? <Unavailable reason={resolveUnavailable(agent, "none")} compact /> : "—",
-    unit: finite(gpuLoad) ? "%" : null,
-    sub: gpu ? (
-      <span>Edge temp {finite(edge) ? fmtTemp(edge, tempUnit) : "—"}</span>
-    ) : latest ? (
-      <span>No GPU sensor</span>
-    ) : (
-      <Dash />
-    ),
-    subShort: gpu ? <span>Edge {finite(edge) ? fmtTemp(edge, tempUnit) : "—"}</span> : undefined,
-    badge,
-    subTitle: "Edge temperature (LHM \"GPU Core\"). The hot spot reading is on the Sensors and Cooling pages.",
-    meter: finite(gpuLoad) ? gpuLoad : null,
+    label: "GPU",
+    series: "gpu",
+    value: finite(gpuLoad) ? gpuLoad.toFixed(0) : null,
+    unit: "%",
+    meta: !latest ? missing : !gpu ? "No graphics sensor" : gpuParts.length > 0 ? gpuParts.join(" · ") : missing,
+    metaTitle: "Edge temperature and board power. The hot spot reading is on the Sensors and Cooling pages.",
+    tag: isZeroRpmIdle(gpu) ? (
+      <Tag title="Zero-RPM idle: the graphics card's fan is stopped because the card is cool enough">Zero-RPM idle</Tag>
+    ) : undefined,
+    spark: history.map((p) => (finite(p.gpu?.load) ? p.gpu!.load : null)),
+    sparkMin: 0,
+    sparkMax: 100,
   };
 
-  /* ---- VRAM ---- */
+  /* ---- Memory ---- */
+  const ramUsed = ram?.usedGb;
+  const ramTotal = ram?.totalGb;
+  const ramParts = [finite(ramTotal) ? `of ${ramTotal.toFixed(0)} GB` : null, finite(ram?.speedMts) ? `${ram!.speedMts} MT/s` : null].filter(Boolean);
+  const dimms = finite(ram?.slotsUsed) && finite(ram?.slotsTotal) ? `${ram!.slotsUsed} of ${ram!.slotsTotal} DIMMs` : null;
+  const ramKpi: Kpi = {
+    key: "ram",
+    label: "Memory",
+    series: "ram",
+    value: finite(ramUsed) ? ramUsed.toFixed(1) : null,
+    unit: "GB",
+    meta: !latest ? missing : ramParts.length > 0 ? ramParts.join(" · ") : missing,
+    metaTitle: ["Memory in use", dimms].filter(Boolean).join(" · "),
+    spark: history.map((p) => (finite(p.ram?.usedGb) ? p.ram.usedGb : null)),
+    sparkMin: 0,
+    sparkMax: finite(ramTotal) && ramTotal > 0 ? ramTotal : undefined,
+  };
+
+  /* ---- Video memory ---- */
   const vramUsed = gpu?.vramUsedGb;
   const vramTotal = gpu?.vramTotalGb;
   const vramKpi: Kpi = {
     key: "vram",
-    label: "VRAM used",
-    color: SERIES_HEX.vram,
-    value: finite(vramUsed) ? vramUsed.toFixed(1) : gpu ? <Unavailable reason={resolveUnavailable(agent, "none")} compact /> : "—",
-    unit: finite(vramUsed) ? "GB" : null,
-    sub: finite(vramTotal) ? `of ${vramTotal.toFixed(vramTotal >= 100 ? 0 : 1)} GB` : <Dash />,
-    meter: finite(vramUsed) && finite(vramTotal) && vramTotal > 0 ? (vramUsed / vramTotal) * 100 : null,
+    label: "Video memory",
+    series: "vram",
+    value: finite(vramUsed) ? vramUsed.toFixed(1) : null,
+    unit: "GB",
+    meta: !latest ? missing : !gpu ? "No graphics sensor" : finite(vramTotal) ? `of ${vramTotal.toFixed(vramTotal >= 100 ? 0 : 1).replace(/\.0$/, "")} GB` : missing,
+    metaTitle: "Graphics memory in use",
+    spark: history.map((p) => (finite(p.gpu?.vramUsedGb) ? p.gpu!.vramUsedGb : null)),
+    sparkMin: 0,
+    sparkMax: finite(vramTotal) && vramTotal > 0 ? vramTotal : undefined,
   };
 
-  /* ---- RAM ---- */
-  const ramUsed = ram?.usedGb;
-  const ramTotal = ram?.totalGb;
-  const ramSub = [
-    finite(ramTotal) ? `of ${ramTotal.toFixed(0)} GB` : null,
-    finite(ram?.speedMts) ? `${ram!.speedMts} MT/s` : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
-  const ramKpi: Kpi = {
-    key: "ram",
-    label: "RAM used",
-    color: SERIES_HEX.ram,
-    value: finite(ramUsed) ? ramUsed.toFixed(1) : "—",
-    unit: finite(ramUsed) ? "GB" : null,
-    sub: ramSub || <Dash />,
-    subShort: finite(ramTotal) ? `of ${ramTotal.toFixed(0)} GB` : undefined,
-    subTitle: ramSub || undefined,
-    meter: finite(ram?.loadPct) ? ram!.loadPct : null,
-  };
-
-  /* ---- CPU fan (never averaged, never substituted) ---- */
+  /* ---- CPU fan: the CPU header only, never averaged, never substituted (CONTRACT §4.8) ---- */
   const fan = latest ? pickCpuFan(latest.fans) : null;
   const fanReason = resolveUnavailable(agent, "pawnio");
   const rpm = fan && finite(fan.rpm) ? fan.rpm : null;
-  const preset = latest?.fanPreset ? PRESET_LABEL[latest.fanPreset] ?? latest.fanPreset : null;
+  const preset = latest?.fanPreset ? (PRESET_LABEL[latest.fanPreset] ?? latest.fanPreset) : null;
   const held = !!latest?.fanSafety?.overrideActive;
   const fanName = fan ? labelOf(fan.id, fan.name) : null;
-  const fanSubText = held
-    ? "Held at 100% for safety"
-    : [preset ? `Preset: ${preset}` : null, fanName && fanName !== fan?.name ? fanName : null].filter(Boolean).join(" · ");
+  const duty = fan && finite(fan.controlPct) ? `${fan.controlPct.toFixed(0)}%` : null;
+  const fanSeries = history.map((p) => {
+    const f = pickCpuFan(p.fans);
+    return f && finite(f.rpm) ? f.rpm : null;
+  });
+  const fanFit = fitRange(fanSeries, 400);
   const fanKpi: Kpi = {
     key: "fan",
     label: "CPU fan",
-    color: "#22D3EE",
-    value: rpm !== null ? Math.round(rpm).toLocaleString("en-US") : latest && !fan ? <Unavailable reason={fanReason} compact /> : "—",
-    unit: rpm !== null ? "RPM" : null,
-    sub: !latest ? (
-      <Dash />
-    ) : fan ? (
-      fanSubText || <Dash />
-    ) : (
-      <span className="font-sans">{UNAVAILABLE_TEXT[fanReason]}</span>
-    ),
-    // The 1280 px tile cannot fit "Needs administrator"; the full cause stays in the tooltip.
-    subShort: fan && preset && !held ? preset : latest && !fan ? <span className="font-sans">{FAN_REASON_SHORT[fanReason]}</span> : undefined,
-    subTitle: fan
-      ? `${fanName ?? fan.name} · ${fan.hardware}. Shows the CPU fan header only, never an average or another fan.`
-      : `${latest ? `${UNAVAILABLE_TEXT[fanReason]}. ` : ""}Shows the motherboard's CPU fan header only, never another fan.`,
-    meter: rpm !== null ? clamp((rpm / Math.max(RPM_SCALE_FLOOR, fan?.rpmMax ?? 0)) * 100, 0, 100) : null,
+    series: "neutral",
+    value: rpm !== null ? countText(rpm) : null,
+    unit: "rpm",
+    meta: !latest ? missing : !fan ? <Unavailable reason={fanReason} /> : held ? "Held at 100% for safety" : [preset, duty].filter(Boolean).join(" · ") || "—",
+    metaTitle: fan
+      ? `${fanName ?? fan.name} · ${fan.hardware}. Fan preset and duty. Shows the CPU fan header only, never an average or another fan.`
+      : "Shows the motherboard's CPU fan header only, never another fan.",
+    spark: fanSeries,
+    sparkMin: fanFit?.min,
+    sparkMax: fanFit?.max,
   };
 
-  return [cpuKpi, gpuKpi, vramKpi, ramKpi, fanKpi];
+  return [cpuKpi, gpuKpi, ramKpi, vramKpi, fanKpi];
 }
 
-/** 6th KPI (CONTRACT §4.10.2): shown only while fpsKpi(useFrames()).visible. */
-function buildFpsKpi(fps: number | null, low1: number | null, process: string | null): Kpi {
-  const low = `P1 ${fmtFps(low1)}`;
+/** 6th cell (CONTRACT §4.10.2): shown only while fpsKpi(useFrames()).visible. */
+function buildFpsKpi(fps: number | null, low1: number | null, process: string | null, spark: readonly number[]): Kpi {
+  const fit = fitRange(spark, 20);
   return {
     key: "fps",
-    label: "FPS",
-    color: TONE_HEX.purple,
-    value: fmtFps(fps),
-    unit: null,
-    sub: (
-      <>
-        <span>{low}</span>
-        {process ? <span className="min-w-0 truncate"> · {process}</span> : null}
-      </>
-    ),
-    subShort: <span>{low}</span>,
-    subTitle: `Rendered frames per second of ${process ?? "the game"}, measured with Intel PresentMon. P1 = 1000 / 99th-percentile frame time.`,
-    meter: null,
+    label: "Frame rate",
+    series: "neutral",
+    value: fps == null ? null : fmtFps(fps),
+    unit: "fps",
+    meta: [`P1 ${fmtFps(low1)}`, process].filter(Boolean).join(" · "),
+    metaTitle: `Rendered frames per second of ${process ?? "the game"}, measured with Intel PresentMon. P1 = 1000 / 99th-percentile frame time.`,
+    spark,
+    sparkMin: fit?.min,
+    sparkMax: fit?.max,
     onClick: () => requestNavigate("gaming"),
-    clickTitle: "Open the Gaming view (F8)",
+    clickTitle: "Open Gaming (F8)",
   };
 }
 
+/**
+ * KPI strip (CONTRACT §4.10.3, SPEC §5): ONE card whose cells are divided by hairlines. 5 cells, 6
+ * while a game is being measured. Each cell: series dot + label, the value at display size with its
+ * unit, one meta line and a sparkline of the last two minutes in the series colour.
+ */
 export default function KpiStrip() {
-  const { latest, agent } = useTelemetry();
+  const { latest, history, agent } = useTelemetry();
   const { settings } = useSettings();
   const { labelOf } = useSensorLabels();
   const frames = useFrames();
   const tempUnit = settings?.tempUnit ?? "C";
 
-  const kpis = useMemo(() => buildKpis(latest, agent, tempUnit, labelOf), [latest, agent, tempUnit, labelOf]);
+  const kpis = useMemo(() => buildKpis(latest, history, agent, tempUnit, labelOf), [latest, history, agent, tempUnit, labelOf]);
+
   const fpsView = fpsKpi({
     enabled: frames.enabled,
     session: frames.session,
@@ -236,33 +229,41 @@ export default function KpiStrip() {
     stats: frames.stats,
     statsFresh: frames.statsFresh,
   });
-  const all = fpsView.visible ? [...kpis, buildFpsKpi(fpsView.fps, fpsView.low1, fpsView.process)] : kpis;
-  // Six cards are tighter at 1280 px: smaller numbers so values never clip.
-  const dense = all.length > 5;
+  // The frame-rate sparkline has no backing history, so the last minute of readings is kept here
+  // (one point per statistics packet; cleared when the cell goes away).
+  const fpsHist = useRef<{ ts: number | null; pid: number | null; points: number[] }>({ ts: null, pid: null, points: [] });
+  const statsTs = frames.stats?.ts ?? null;
+  const statsPid = frames.stats?.pid ?? null;
+  if (!fpsView.visible) {
+    if (fpsHist.current.points.length > 0) fpsHist.current = { ts: null, pid: null, points: [] };
+  } else if (statsTs !== fpsHist.current.ts && fpsView.fps != null) {
+    const keep = statsPid === fpsHist.current.pid ? fpsHist.current.points.slice(-(FPS_POINTS - 1)) : [];
+    fpsHist.current = { ts: statsTs, pid: statsPid, points: [...keep, fpsView.fps] };
+  }
+
+  const all = fpsView.visible ? [...kpis, buildFpsKpi(fpsView.fps, fpsView.low1, fpsView.process, fpsHist.current.points)] : kpis;
 
   return (
-    <div
-      className="grid gap-3 max-[1439px]:gap-2"
-      // auto-fit re-flows 5 → 6 cards on one row without wrapping (CONTRACT §4.10.2).
-      style={{ gridTemplateColumns: "repeat(auto-fit, minmax(92px, 1fr))" }}
-    >
-      {all.map((k) => (
-        <KpiCard key={k.key} kpi={k} dense={dense} />
-      ))}
-    </div>
+    <Card padded={false} aria-label="Key figures" className="shrink-0 overflow-hidden">
+      {/* auto-fit re-flows 5 → 6 cells on one row without a layout jump (CONTRACT §4.10.2). */}
+      <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))" }}>
+        {all.map((k) => (
+          <KpiCell key={k.key} kpi={k} />
+        ))}
+      </div>
+    </Card>
   );
 }
 
-function KpiCard({ kpi, dense }: { kpi: Kpi; dense: boolean }) {
-  const color = kpi.color;
-  const meter = kpi.meter === null ? null : clamp(kpi.meter, 0, 100);
+function KpiCell({ kpi }: { kpi: Kpi }) {
   const clickable = !!kpi.onClick;
+  const color = SERIES_HEX[kpi.series];
   const interactive = clickable
     ? {
         role: "button" as const,
         tabIndex: 0,
         title: kpi.clickTitle,
-        "aria-label": `${kpi.label} ${typeof kpi.value === "string" ? kpi.value : ""}. ${kpi.clickTitle ?? ""}`.trim(),
+        "aria-label": `${kpi.label} ${kpi.value ?? "not available"} ${kpi.value ? (kpi.unit ?? "") : ""}. ${kpi.clickTitle ?? ""}`.replace(/\s+/g, " ").trim(),
         onClick: kpi.onClick,
         onKeyDown: (e: KeyboardEvent<HTMLDivElement>) => {
           if (e.key === "Enter" || e.key === " ") {
@@ -276,57 +277,33 @@ function KpiCard({ kpi, dense }: { kpi: Kpi; dense: boolean }) {
     <div
       {...interactive}
       className={cn(
-        "glass relative min-w-0 overflow-hidden py-3 pl-4 pr-3",
-        dense ? "max-[1439px]:py-2.5 max-[1439px]:pl-3 max-[1439px]:pr-1.5" : "max-[1439px]:py-2.5 max-[1439px]:pl-3.5 max-[1439px]:pr-2",
-        clickable &&
-          "cursor-pointer transition hover:bg-white/[0.03] focus-visible:outline focus-visible:outline-2 focus-visible:outline-teal/60",
+        "min-w-0 border-l border-divider px-[18px] pb-3 pt-3.5 first:border-l-0 tight:px-3.5 tight:pb-2.5 tight:pt-3",
+        clickable && "focus-inset transition-colors duration-[80ms] hover:bg-hover active:bg-pressed",
       )}
     >
-      {/* Vertical series line (decoration, not state) */}
-      <span
-        aria-hidden
-        className="absolute left-0 top-3 bottom-3 w-[3px] rounded-r-full"
-        style={{ background: color, boxShadow: `0 0 10px ${color}, 0 0 2px ${color}` }}
-      />
-      <span
-        aria-hidden
-        className="pointer-events-none absolute -left-8 -top-8 h-20 w-20 rounded-full opacity-[0.12] blur-2xl"
-        style={{ background: color }}
-      />
-      <div className="truncate text-[10px] font-medium uppercase tracking-[0.2em] text-muted">{kpi.label}</div>
-      <div className="mt-1.5 flex items-baseline gap-1">
-        <span
-          className={cn(
-            "font-mono font-semibold leading-none tabular-nums text-ink",
-            dense ? "text-[25px] max-[1439px]:text-[18px]" : "text-[28px] max-[1439px]:text-[22px]",
-          )}
-        >
-          {kpi.value}
-        </span>
-        {kpi.unit && (
-          <span className="font-mono text-[11px] font-medium" style={{ color }}>
-            {kpi.unit}
-          </span>
-        )}
-        {kpi.badge && <span className="ml-auto self-center">{kpi.badge}</span>}
+      {/* Fixed height: an 18 px tag in one cell must not push that cell's figures below its neighbours'. */}
+      <div className="flex h-[17px] min-w-0 items-center gap-[7px] text-[12.5px] font-medium leading-[17px] text-ink-2">
+        <span aria-hidden="true" className={cn("size-2 shrink-0 rounded-full", SERIES_CLASS[kpi.series].bg)} />
+        <span className="truncate">{kpi.label}</span>
+        {kpi.tag && <span className="ml-auto flex shrink-0 items-center">{kpi.tag}</span>}
       </div>
-      <div className="mt-1.5 flex min-w-0 items-center truncate font-mono text-[10.5px] text-muted" title={kpi.subTitle}>
-        {kpi.subShort !== undefined ? (
+      <div className="mt-1.5 whitespace-nowrap text-display tnum tight:text-display-tight">
+        {kpi.value != null ? (
           <>
-            <span className="flex min-w-0 items-center truncate max-[1439px]:hidden">{kpi.sub}</span>
-            <span className="hidden min-w-0 items-center truncate max-[1439px]:flex">{kpi.subShort}</span>
+            <span className="text-ink">{kpi.value}</span>
+            {kpi.unit && <span className="ml-[3px] text-[16px] font-medium leading-none tracking-normal text-ink-2 tight:text-[14px]">{kpi.unit}</span>}
           </>
         ) : (
-          <span className="flex min-w-0 items-center truncate">{kpi.sub}</span>
+          <span className="text-ink-3" role="img" aria-label={NOT_AVAILABLE_TEXT} title={NOT_AVAILABLE_TEXT}>
+            —
+          </span>
         )}
       </div>
-      <div className="mt-2 h-[2px] w-full overflow-hidden rounded-full bg-white/[0.06]">
-        {meter !== null && (
-          <div
-            className="h-full rounded-full transition-[width] duration-500 ease-out"
-            style={{ width: `${meter}%`, background: color, boxShadow: `0 0 6px ${color}` }}
-          />
-        )}
+      <div className="mb-2 mt-px flex h-[17px] min-w-0 items-center truncate text-callout text-ink-2 tnum tight:mb-1.5" title={kpi.metaTitle}>
+        {typeof kpi.meta === "string" ? <span className="truncate">{kpi.meta}</span> : kpi.meta}
+      </div>
+      <div className="h-[22px]">
+        <Sparkline data={kpi.spark} color={color} height={22} fill min={kpi.sparkMin} max={kpi.sparkMax} strokeWidth={1.5} />
       </div>
     </div>
   );

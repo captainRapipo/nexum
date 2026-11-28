@@ -1,23 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef } from "react";
-import { use as useEcharts } from "echarts/core";
-import { MarkLineComponent } from "echarts/components";
 import type { EChartsOption } from "echarts";
 import type { EChartsType } from "echarts/core";
 import { FRAMETIME_BANDS_MS } from "../../types";
-import { EChart } from "../ui";
+import { CHART_FONT, EChart, FRAMETIME_MARKLINE, SERIES_HEX } from "../ui";
 import { cn } from "../../lib/format";
-
-// The shared EChart primitive registers no markLine; registration is global and idempotent.
-useEcharts([MarkLineComponent]);
 
 /** Points kept for drawing (newest). The hook's rolling buffer can reach 120 s × 1000 frames. */
 export const FRAMETIME_CHART_MAX_POINTS = 12_000;
 /** The y axis never shows less than this (ms), so a steady 7 ms line does not fill the plot. */
 const Y_FLOOR_MS = 20;
 
-const LINE = "#2DD4BF";
-const REF = "rgba(203,213,225,0.42)";
-const MONO = '"JetBrains Mono", Consolas, monospace';
+/** Single-series chart: ink graphite, never a status or brand colour (CONTRACT §4.9 rule 4). */
+const LINE = SERIES_HEX.single;
 
 export interface FrametimeChartProps {
   /** Rolling frametimes (ms), oldest first — `useFrames().frametimes`. */
@@ -25,18 +19,30 @@ export interface FrametimeChartProps {
   className?: string;
 }
 
+/** Axis top: 20 ms at least, then the next round step above the slowest frame (so every tick is a round number). */
 function yMax(v: { max: number }): number {
-  const m = Number.isFinite(v.max) ? v.max : 0;
-  return Math.max(Y_FLOOR_MS, Math.ceil((m * 1.08) / 5) * 5);
+  const m = (Number.isFinite(v.max) ? v.max : 0) * 1.05;
+  if (m <= Y_FLOOR_MS) return Y_FLOOR_MS;
+  const step = m <= 100 ? 10 : m <= 500 ? 50 : 100;
+  return Math.ceil(m / step) * step;
 }
 
-/** Builds the [index, ms] pairs of the newest ≤ FRAMETIME_CHART_MAX_POINTS frames. */
+/**
+ * Builds the [frames ago, ms] pairs of the newest ≤ FRAMETIME_CHART_MAX_POINTS frames:
+ * x runs from −(n − 1) at the oldest frame to 0 ("Now") at the newest.
+ */
 function toPairs(ft: readonly number[]): [number, number][] {
   const start = Math.max(0, ft.length - FRAMETIME_CHART_MAX_POINTS);
   const n = ft.length - start;
   const out = new Array<[number, number]>(n);
-  for (let i = 0; i < n; i++) out[i] = [i, ft[start + i]];
+  for (let i = 0; i < n; i++) out[i] = [i - (n - 1), ft[start + i]];
   return out;
+}
+
+/** `Now` at the right edge, `−600` (true minus sign, grouped) further back. */
+function xLabel(v: number): string {
+  const n = Math.round(v);
+  return n >= 0 ? "Now" : `−${Math.abs(n).toLocaleString("en-US")}`;
 }
 
 /**
@@ -55,7 +61,7 @@ export default function FrametimeChart({ frametimes, className }: FrametimeChart
   const option = useMemo<EChartsOption>(
     () => ({
       animation: false,
-      grid: { left: 44, right: 64, top: 14, bottom: 26 },
+      grid: { left: 44, right: 92, top: 8, bottom: 24 },
       tooltip: {
         trigger: "axis",
         axisPointer: { type: "line" },
@@ -65,17 +71,18 @@ export default function FrametimeChart({ frametimes, className }: FrametimeChart
           if (!v) return "";
           const ms = v[1];
           const fps = ms > 0 ? 1000 / ms : 0;
-          return `Frame ${v[0] + 1}<br/><b>${ms.toFixed(2)} ms</b> · ${fps >= 100 ? fps.toFixed(0) : fps.toFixed(1)} fps`;
+          const ago = Math.abs(Math.round(v[0]));
+          const when = ago === 0 ? "Newest frame" : `${ago.toLocaleString("en-US")} ${ago === 1 ? "frame" : "frames"} ago`;
+          return `${when}<br/><b>${ms.toFixed(2)} ms</b> · ${fps >= 100 ? fps.toFixed(0) : fps.toFixed(1)} fps`;
         },
       },
       xAxis: {
         type: "value",
-        min: 0,
-        max: "dataMax",
-        name: "Frames, oldest → newest",
-        nameLocation: "middle",
-        nameGap: 8,
-        axisLabel: { show: false },
+        min: "dataMin",
+        max: 0,
+        axisLine: { show: true },
+        // Three labels, set with the data in flush(): the oldest frame, the middle and "Now".
+        axisLabel: { formatter: xLabel, customValues: [0], showMinLabel: true, showMaxLabel: true, alignMinLabel: "left", alignMaxLabel: "right" },
         splitLine: { show: false },
       },
       yAxis: {
@@ -92,22 +99,22 @@ export default function FrametimeChart({ frametimes, className }: FrametimeChart
           showSymbol: false,
           smooth: false,
           sampling: "lttb",
-          lineStyle: { width: 1.4, color: LINE },
+          lineStyle: { width: 1.25, color: LINE },
           itemStyle: { color: LINE },
-          areaStyle: { color: "rgba(45,212,191,0.07)" },
+          areaStyle: { color: LINE, opacity: 0.05 },
+          emphasis: { disabled: true },
+          // Refresh-rate guides: dashed, labelled at the right edge ("60 Hz · 16.7").
           markLine: {
-            silent: true,
-            symbol: "none",
+            ...FRAMETIME_MARKLINE,
             animation: false,
-            lineStyle: { color: REF, type: "dashed", width: 1 },
             label: {
-              position: "end",
-              color: "#94A3B8",
-              fontFamily: MONO,
-              fontSize: 10,
+              ...FRAMETIME_MARKLINE.label,
+              fontFamily: CHART_FONT,
+              fontWeight: 500,
+              distance: 8,
               formatter: (p: unknown) => {
                 const d = p as { value?: number; name?: string };
-                return `${d.name ?? ""} ${typeof d.value === "number" ? d.value.toFixed(1) : ""}`;
+                return `${d.name ?? ""} · ${typeof d.value === "number" ? d.value.toFixed(1) : ""}`;
               },
             },
             // 8.3 and 6.9 ms sit close together: nudge their labels apart so they never overlap.
@@ -129,7 +136,10 @@ export default function FrametimeChart({ frametimes, className }: FrametimeChart
     if (!c || c.isDisposed() || !dirty.current) return;
     if (typeof document !== "undefined" && document.hidden) return; // drawn again on visibilitychange
     dirty.current = false;
-    c.setOption({ series: [{ data: toPairs(latest.current) }] }, { lazyUpdate: true, silent: true });
+    const pairs = toPairs(latest.current);
+    const oldest = pairs.length > 0 ? pairs[0][0] : 0;
+    const ticks = oldest <= -4 ? [oldest, Math.round(oldest / 2), 0] : [0];
+    c.setOption({ xAxis: { axisLabel: { customValues: ticks } }, series: [{ data: pairs }] }, { lazyUpdate: true, silent: true });
   }, []);
 
   const schedule = useCallback(() => {
@@ -167,7 +177,7 @@ export default function FrametimeChart({ frametimes, className }: FrametimeChart
     <div className={cn("relative w-full", className ?? "h-[260px]")}>
       <EChart option={option} onInit={onInit} className="absolute inset-0" />
       {shown === 0 && (
-        <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-[12px] text-muted">
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-callout text-ink-3">
           Waiting for frames…
         </div>
       )}

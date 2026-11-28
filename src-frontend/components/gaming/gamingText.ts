@@ -31,6 +31,25 @@ export const OPT_IN_JAVELIN =
   "Start Nexum before launching games that use EA Javelin anti-cheat: frame capture must already be running when they start.";
 export const OPT_IN_BUTTON = "Turn on frame capture";
 
+/** PageHeader description (CONTRACT §4.6.1 table). */
+export const PAGE_DESCRIPTION =
+  "Frame rate and frame times measured by Intel PresentMon from Windows performance events (ETW). Nothing is injected into games.";
+
+/** What the page shows once capture is on (the three tiles under the opt-in). */
+export const OPT_IN_TILES: readonly { title: string; body: string }[] = [
+  { title: "Rendered FPS, P1 and P0.1", body: "Over a 10 to 120 s window" },
+  { title: "Frame-time graph", body: "With 60, 120 and 144 Hz guides" },
+  { title: "CPU vs GPU busy", body: "Which side limits the frame rate" },
+];
+
+/** Session line while nothing is running yet (CONTRACT §4.8.1). */
+export const SESSION_STARTING = "Starting frame capture…";
+export const SESSION_PAUSED = "Frame capture is paused. It starts again by itself.";
+export const SESSION_FAILED = "Frame capture is not running.";
+
+export const EXCLUDES_HINT =
+  "Frames from these apps are ignored and they are never chosen as the target, for example a recorder or a launcher.";
+
 export const NO_TARGET_TEXT = "No game detected. Start a game, or pick an app below.";
 
 export const HERO_LABEL = "Rendered FPS (game)";

@@ -1,11 +1,10 @@
 import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ChevronDown, FileDown, FileText, Globe } from "lucide-react";
+import { ChevronDown, Download, FileText, Globe } from "lucide-react";
 import type { ReportFormat } from "../../types";
 import { api, errorMessage } from "../../lib/api";
-import { cn } from "../../lib/format";
-import { Button } from "../ui/Button";
+import { Button } from "../ui";
 import { toast } from "../feedback/Toast";
-import { dirnameOf } from "../cleaner/cleanerCopy";
+import { dirnameOf } from "./clipboard";
 
 const ITEMS: ReadonlyArray<{ format: ReportFormat; label: string; icon: typeof FileText; hint: string }> = [
   { format: "txt", label: "Text (.txt)", icon: FileText, hint: "Plain text, easy to paste into a forum post" },
@@ -13,7 +12,7 @@ const ITEMS: ReadonlyArray<{ format: ReportFormat; label: string; icon: typeof F
 ];
 
 /**
- * "Save report" menu of the System view (CONTRACT §2.12, §4.10.2). Rust writes the file to
+ * "Save report" menu of the System view (CONTRACT §2.12, §4.10.2). Nexum writes the file to
  * Documents\Nexum\Reports (no hostname, user name or serial numbers); the toast shows the path and an
  * Open folder action.
  */
@@ -76,9 +75,7 @@ export function SaveReportMenu({ disabled }: { disabled?: boolean }) {
   return (
     <div ref={rootRef} className="relative">
       <Button
-        size="sm"
-        variant="ghost"
-        icon={FileDown}
+        icon={Download}
         iconRight={<ChevronDown size={13} aria-hidden="true" />}
         loading={saving !== null}
         disabled={disabled}
@@ -96,7 +93,7 @@ export function SaveReportMenu({ disabled }: { disabled?: boolean }) {
           role="menu"
           aria-label="Report format"
           onKeyDown={onMenuKey}
-          className="glass-strong absolute right-0 top-[calc(100%+6px)] z-40 w-[230px] border border-line p-1 shadow-[0_16px_40px_rgba(0,0,0,0.55)]"
+          className="absolute right-0 top-[calc(100%+6px)] z-40 w-[250px] rounded-[12px] bg-card p-1.5 shadow-popover animate-fade-in"
         >
           {ITEMS.map((it, i) => {
             const Icon = it.icon;
@@ -109,20 +106,17 @@ export function SaveReportMenu({ disabled }: { disabled?: boolean }) {
                 type="button"
                 role="menuitem"
                 onClick={() => void save(it.format)}
-                className={cn(
-                  "flex w-full items-start gap-2.5 rounded-md px-2.5 py-2 text-left outline-none transition",
-                  "hover:bg-white/[0.06] focus-visible:bg-white/[0.06]",
-                )}
+                className="focus-inset flex w-full items-start gap-2.5 rounded-md px-2.5 py-2 text-left hover:bg-hover active:bg-pressed"
               >
-                <Icon size={14} className="mt-[2px] shrink-0 text-silver" aria-hidden="true" />
+                <Icon size={15} className="mt-0.5 shrink-0 text-icon-2" aria-hidden="true" />
                 <span className="min-w-0">
-                  <span className="block text-[12.5px] font-semibold text-ink">{it.label}</span>
-                  <span className="block text-[11px] leading-snug text-muted">{it.hint}</span>
+                  <span className="block text-headline text-ink">{it.label}</span>
+                  <span className="block text-callout text-ink-2">{it.hint}</span>
                 </span>
               </button>
             );
           })}
-          <p className="border-t border-line px-2.5 pb-1 pt-1.5 text-[10.5px] leading-snug text-slate-500">
+          <p className="mt-1 border-t border-divider px-2.5 pb-1 pt-2 text-callout text-ink-3">
             Saved to Documents\Nexum\Reports. No PC name, user name or serial numbers.
           </p>
         </div>

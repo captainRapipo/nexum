@@ -1,9 +1,9 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, Loader2, RefreshCw } from "lucide-react";
-import type { SensorLabelMeta, SensorMeta, UnavailableReason } from "../types";
+import { Activity, RefreshCw, SearchX } from "lucide-react";
+import type { CpuLimitInfo, DiskTelemetry, SensorLabelMeta, SensorMeta, SensorTree, Settings, UnavailableReason } from "../types";
 import { errorMessage } from "../lib/api";
-import { cn, fmtClock } from "../lib/format";
-import { isUnused } from "../lib/sensors";
+import { fmtClock } from "../lib/format";
+import { CPU_TEMP_RULE, findSensor, isUnused } from "../lib/sensors";
 import { onFocusRequest, takePendingFocus } from "../lib/nav";
 import { resolveUnavailable } from "../lib/status";
 import { useSensors, useSensorStream } from "../hooks/useSensors";
@@ -11,15 +11,14 @@ import { useSensorLabels } from "../hooks/useSensorLabels";
 import { useSettings } from "../hooks/useSettings";
 import { useSystemInfo } from "../hooks/useSystemInfo";
 import { useTelemetry } from "../hooks/useTelemetryStream";
-import GlassCard from "../components/layout/GlassCard";
-import { Button } from "../components/ui/Button";
-import { Unavailable } from "../components/ui/Unavailable";
-import { isModalOpen } from "../components/ui/Modal";
+import { useHealthAlerts } from "../hooks/useHealthAlerts";
+import { usePageChrome } from "../components/layout/PageChrome";
+import { Button, EmptyState, InkLink, UNAVAILABLE_TEXT } from "../components/ui";
 import { toast } from "../components/feedback/Toast";
 import { SensorTable, type FocusRequest } from "../components/sensors/SensorTable";
-import { SensorToolbar } from "../components/sensors/SensorToolbar";
-import { SensorLogControls } from "../components/sensors/SensorLogControls";
-import type { SensorStats } from "../components/sensors/SensorRow";
+import { SensorToolbar, type SensorFilter } from "../components/sensors/SensorToolbar";
+import { SensorLogControls, SensorLogStatusLine } from "../components/sensors/SensorLogControls";
+import type { SensorLimit, SensorStats } from "../components/sensors/SensorRow";
 import {
   flattenTree,
   fmtElapsed,
@@ -51,13 +50,76 @@ function saveCollapsed(set: ReadonlySet<string>) {
   }
 }
 
-function Kbd({ children }: { children: string }) {
-  return <span className="kbd-sm">{children}</span>;
+function Hint({ keys, children }: { keys: string; children: string }) {
+  return (
+    <span className="flex items-center gap-1">
+      <kbd className="kbd-sm">{keys}</kbd>
+      {children}
+    </span>
+  );
+}
+
+const EMPTY_DISKS: DiskTelemetry[] = [];
+const GPU_HW: ReadonlySet<string> = new Set(["gpuAmd", "gpuNvidia", "gpuIntel"]);
+
+/**
+ * The Limit column (CONTRACT §4.10.3): the CPU limit on the CPU package temperature row, the GPU
+ * hot-spot and memory-junction critical limits on those rows, and a drive's own warning temperature
+ * on its temperature rows. Everything else has no limit. Uses only data the app already holds.
+ */
+function buildLimits(
+  tree: SensorTree | null,
+  cpuLimit: CpuLimitInfo,
+  alerts: Settings["alerts"] | undefined,
+  disks: readonly DiskTelemetry[],
+): ReadonlyMap<string, SensorLimit> {
+  const out = new Map<string, SensorLimit>();
+  if (!tree) return out;
+
+  const cpu = findSensor(tree, CPU_TEMP_RULE);
+  if (cpu) {
+    const src = cpuLimit.source === "table" ? "AMD specification" : cpuLimit.source === "user" ? "your setting" : "default";
+    out.set(cpu.id, {
+      shown: cpuLimit.limitC,
+      warnAt: cpuLimit.warnC,
+      critAt: cpuLimit.limitC,
+      title: `Limit for this CPU (${src}). Attention from 5 degrees below it.`,
+    });
+  }
+
+  const hotspot = alerts?.gpuHotspotC ?? 110;
+  const junction = alerts?.gpuMemJunctionC ?? 105;
+  for (const hw of tree.hardware) {
+    if (GPU_HW.has(hw.kind)) {
+      for (const m of hw.sensors) {
+        if (m.kind !== "temperature") continue;
+        if (m.name === "GPU Hot Spot") {
+          out.set(m.id, { shown: hotspot, warnAt: hotspot - 10, critAt: hotspot, title: "GPU hot-spot limit (Settings › Alerts). Attention from 10 degrees below it." });
+        } else if (m.name === "GPU Memory Junction" || m.name === "GPU Memory") {
+          out.set(m.id, { shown: junction, warnAt: junction - 10, critAt: junction, title: "GPU memory limit (Settings › Alerts). Attention from 10 degrees below it." });
+        }
+      }
+    } else if (hw.kind === "storage") {
+      const disk = disks.find((d) => d.id === hw.id);
+      const warn = disk?.warningTempC;
+      if (typeof warn !== "number" || !Number.isFinite(warn)) continue;
+      const crit = typeof disk?.criticalTempC === "number" && Number.isFinite(disk.criticalTempC) ? disk.criticalTempC : Infinity;
+      for (const m of hw.sensors) {
+        if (m.kind !== "temperature" || m.static) continue;
+        // The drive's own thresholds are listed as sensors too; they are limits, not readings.
+        if (/warning|critical|threshold|limit/i.test(m.name)) continue;
+        out.set(m.id, { shown: warn, warnAt: warn, critAt: crit, title: "The warning temperature this drive reports for itself." });
+      }
+    }
+  }
+  return out;
 }
 
 /**
- * Sensors (F2): HWMonitor-style tree of every LHM sensor with session Min / Max / Avg and a
- * 60 s sparkline (CONTRACT §1.3, §4.10). Streams values only while mounted.
+ * Sensors (F2), a list page (CONTRACT §4.10.3, SPEC §8): full-bleed white, no card. A 44 px filter
+ * bar, the tree-table of every sensor this PC reports (session Min / Max / Avg, a known limit, a
+ * 60 s sparkline) and a 30 px status bar. The text filter is published to the app toolbar.
+ * Streams values only while mounted.
  */
 export default function SensorsView() {
   useSensorStream(true);
@@ -65,10 +127,13 @@ export default function SensorsView() {
   const labels = useSensorLabels();
   const { settings, update } = useSettings();
   const { info } = useSystemInfo();
-  const { agent } = useTelemetry();
+  const { agent, latest } = useTelemetry();
+  const { snapshot } = useHealthAlerts();
 
   const agentUp = !!agent?.running;
-  const nullReason: UnavailableReason = agentUp ? "unsupported" : "agentOffline";
+  // A value that is missing because nothing has arrived yet (start-up, a restart) is a plain dash;
+  // once values are streaming, a null is a sensor this hardware does not report.
+  const nullReason: UnavailableReason = agentUp && values != null ? "unsupported" : "agentOffline";
 
   /* ---------------------------------------------- rAF-batched paint tick */
   const [paint, setPaint] = useState(0);
@@ -89,11 +154,11 @@ export default function SensorsView() {
   const [collapsed, setCollapsed] = useState<Set<string>>(loadCollapsed);
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
+  const [filter, setFilter] = useState<SensorFilter>("all");
   const [showHidden, setShowHidden] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [resetting, setResetting] = useState<"all" | "selected" | null>(null);
   const [focusRequest, setFocusRequest] = useState<FocusRequest | null>(null);
-  const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => saveCollapsed(collapsed), [collapsed]);
 
@@ -115,8 +180,21 @@ export default function SensorsView() {
   const maxOf = useCallback((meta: SensorMeta) => statsRef.current(meta.id)?.max ?? null, []);
   const rootName = info?.hostname?.trim() || "This PC";
 
-  // The unused rule depends on session max values, so re-filter on paint only while it applies.
-  const filterPaint = labels.hideUnused ? paint : 0;
+  // "Pinned" and "Changed" (a value that moved since the last reset: session max above session min).
+  const isPinned = labels.isPinned;
+  const only = useMemo<((meta: SensorMeta) => boolean) | undefined>(() => {
+    if (filter === "pinned") return (meta) => isPinned(meta.id);
+    if (filter === "changed")
+      return (meta) => {
+        if (meta.static) return false;
+        const st = statsRef.current(meta.id);
+        return st != null && st.min != null && st.max != null && st.max > st.min;
+      };
+    return undefined;
+  }, [filter, isPinned]);
+
+  // The unused rule and "Changed" depend on session values, so re-filter on paint only while they apply.
+  const filterPaint = labels.hideUnused || filter === "changed" ? paint : 0;
   const flat = useMemo(
     () =>
       tree
@@ -131,10 +209,11 @@ export default function SensorsView() {
             maxOf,
             isUnused: unusedRule,
             labelOf: labels.labelOf,
+            only,
           })
         : null,
     // eslint-disable-next-line
-    [tree, rootName, collapsed, deferredQuery, labels.hidden, showHidden, labels.hideUnused, labels.labelOf, unusedRule, maxOf, filterPaint],
+    [tree, rootName, collapsed, deferredQuery, labels.hidden, showHidden, labels.hideUnused, labels.labelOf, unusedRule, maxOf, only, filterPaint],
   );
 
   /* ---------------------------------------------- focus hand-off (NavRequest.focus = sensor id) */
@@ -173,22 +252,10 @@ export default function SensorsView() {
       return next;
     });
     setQuery("");
+    setFilter("all");
     if (labels.hidden.has(id)) setShowHidden(true);
     setFocusRequest({ key: sensorKey(id), nonce: Date.now() });
   }, [tree, paint, labels.hidden]);
-
-  /* ---------------------------------------------- Ctrl+F focuses search */
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === "f" || e.key === "F") && !isModalOpen()) {
-        e.preventDefault();
-        searchRef.current?.focus();
-        searchRef.current?.select();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
 
   /* ---------------------------------------------- session clock */
   const [now, setNow] = useState(() => Date.now());
@@ -271,75 +338,84 @@ export default function SensorsView() {
     if (flat) setCollapsed(new Set(flat.hwKeys));
   }, [flat]);
 
+  /* ---------------------------------------------- limits, page chrome */
+  // Telemetry brings a new disks array every second; the limits only change when a threshold does.
+  const disks = latest?.disks ?? EMPTY_DISKS;
+  const diskLimitsKey = disks.map((d) => `${d.id}:${d.warningTempC ?? ""}:${d.criticalTempC ?? ""}`).join("|");
+  const disksRef = useRef(disks);
+  disksRef.current = disks;
+  const limits = useMemo(
+    () => buildLimits(tree, snapshot.cpuLimit, settings.alerts, disksRef.current),
+    // eslint-disable-next-line
+    [tree, snapshot.cpuLimit, settings.alerts, diskLimitsKey],
+  );
+
+  usePageChrome({
+    subtitle: flat ? `${flat.total} sensor${flat.total === 1 ? "" : "s"} from ${flat.devices} device${flat.devices === 1 ? "" : "s"}` : null,
+    search: { value: query, onChange: setQuery, placeholder: "Filter sensors", ariaLabel: "Filter sensors by name or device" },
+  });
+
   /* ---------------------------------------------- render */
   const sessionStart = tree?.sessionStartTs ?? null;
   const limited = agentUp && (agent?.limitedReasons.length ?? 0) > 0;
+  const limitedReason: UnavailableReason | null = limited && agent ? resolveUnavailable(agent, "pawnio") : null;
+  const searching = deferredQuery.trim().length > 0;
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-4">
-      {/* Header */}
-      <div className="flex flex-wrap items-end justify-between gap-x-6 gap-y-2">
-        <div className="min-w-0">
-          <div className="text-[10.5px] uppercase tracking-[0.22em] text-gold/80">F2 · Hardware sensors</div>
-          <h1 className="mt-1 text-[22px] font-semibold tracking-tight text-ink">Sensors</h1>
-          <p className="mt-0.5 text-[12.5px] text-muted">
-            Every sensor the hardware agent reads, with session Min, Max and Avg. Log any of them to a CSV file.
-          </p>
-        </div>
-        <div className="flex flex-col items-end gap-1 text-right">
-          {sessionStart != null ? (
-            <div className="flex items-center gap-2 text-[12px] text-slate-400" title="Min, Max and Avg cover this period. Reset all starts a new one.">
-              <Activity size={13} className={cn(agentUp ? "text-teal" : "text-slate-600")} aria-hidden="true" />
-              <span>
-                Min / Max / Avg since{" "}
-                <span className="num text-slate-200">{fmtClock(sessionStart, false)}</span>{" "}
-                <span className="num text-slate-500">({fmtElapsed(now - sessionStart)})</span>
-              </span>
-            </div>
-          ) : null}
-          {!agentUp && tree && (
-            <div className="flex items-center gap-2 text-[11.5px]">
-              <Unavailable reason="agentOffline" />
-              <span className="text-slate-500">Showing the last values received.</span>
-            </div>
-          )}
-          {limited && agent && (
-            <div className="flex items-center gap-2 text-[11.5px] text-slate-500">
-              <span>Partial sensor list:</span>
-              <Unavailable reason={resolveUnavailable(agent, "pawnio")} />
-            </div>
-          )}
-        </div>
-      </div>
-
-      <GlassCard className="min-h-[420px] flex-1" bodyClassName="flex min-h-0 flex-col">
-        <SensorToolbar
-          ref={searchRef}
-          query={query}
-          onQuery={setQuery}
-          hideUnused={labels.hideUnused}
-          onHideUnused={labels.setHideUnused}
-          showHidden={showHidden}
-          onShowHidden={setShowHidden}
-          hiddenCount={labels.hidden.size}
-          selectedCount={selectedIds.length}
-          resetting={resetting}
-          onResetAll={() => void doReset(null)}
-          onResetSelected={() => void doReset(selectedIds)}
-          onExpandAll={expandAll}
-          onCollapseAll={collapseAll}
-          disabled={!tree}
-        />
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-content">
+      <SensorToolbar
+        filter={filter}
+        onFilter={setFilter}
+        hideUnused={labels.hideUnused}
+        onHideUnused={labels.setHideUnused}
+        showHidden={showHidden}
+        onShowHidden={setShowHidden}
+        hiddenCount={labels.hidden.size}
+        selectedCount={selectedIds.length}
+        resetting={resetting}
+        onResetAll={() => void doReset(null)}
+        onResetSelected={() => void doReset(selectedIds)}
+        onExpandAll={expandAll}
+        onCollapseAll={collapseAll}
+        disabled={!tree}
+      >
         <SensorLogControls selectedIds={selectedIds} disabled={!tree || !agentUp} />
+      </SensorToolbar>
 
-        {tree && flat ? (
-          <>
+      {tree && flat ? (
+        <>
+          {flat.shown === 0 ? (
+            <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto">
+              {searching ? (
+                <EmptyState
+                  icon={SearchX}
+                  title={`No sensor matches “${deferredQuery.trim()}”`}
+                  body="The filter looks at sensor names, your own names and device names."
+                />
+              ) : filter === "pinned" ? (
+                <EmptyState
+                  icon={Activity}
+                  title="No pinned sensors"
+                  body="Pin a sensor with P, or with the pin button on its row. Pinned sensors also appear on the Dashboard."
+                />
+              ) : filter === "changed" ? (
+                <EmptyState
+                  icon={Activity}
+                  title="Nothing has changed yet"
+                  body="Sensors appear here once their value moves after Min, Max and Avg were last reset."
+                />
+              ) : (
+                <EmptyState icon={Activity} title="No sensors to show" body="Every sensor is hidden by Hide unused or was hidden by you." />
+              )}
+            </div>
+          ) : (
             <SensorTable
               rows={flat.rows}
               paint={paint}
               tempUnit={settings.tempUnit}
               nullReason={nullReason}
               stale={!agentUp}
+              limits={limits}
               getStats={getStats}
               getHistory={getHistory}
               labelOf={labels.labelOf}
@@ -352,61 +428,70 @@ export default function SensorsView() {
               onSelectionChange={setSelectedIds}
               focusRequest={focusRequest}
             />
-            {flat.noMatches && (
-              <p className="py-6 text-center text-[12.5px] text-muted">
-                No sensor matches “{deferredQuery.trim()}”.
-              </p>
-            )}
-            <footer className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-line pt-2.5 text-[11px] text-slate-500">
-              <span className="num">
+          )}
+
+          {/* Status bar (SPEC §3): counts and the session on the left, key hints on the right. */}
+          <footer className="flex h-[30px] shrink-0 items-center gap-4 whitespace-nowrap border-t border-hairline bg-toolbar px-(--page-pad-x) text-callout text-ink-2">
+            <span className="flex min-w-0 items-center gap-1.5 tnum">
+              <span>
                 {flat.shown} of {flat.total} sensors
               </span>
               {flat.hiddenUnused > 0 && (
-                <button
-                  type="button"
-                  className="hover:text-slate-300"
-                  onClick={() => labels.setHideUnused(false)}
-                  title="Show sensors hidden by the Hide unused rule"
-                >
-                  {flat.hiddenUnused} unused hidden
-                </button>
+                <>
+                  <span aria-hidden="true">·</span>
+                  <InkLink chevron={false} className="font-normal text-ink-2" onClick={() => labels.setHideUnused(false)} title="Show sensors hidden by Hide unused">
+                    {flat.hiddenUnused} unused hidden
+                  </InkLink>
+                </>
               )}
               {flat.hiddenByUser > 0 && !showHidden && (
-                <button type="button" className="hover:text-slate-300" onClick={() => setShowHidden(true)}>
-                  {flat.hiddenByUser} hidden by you
-                </button>
+                <>
+                  <span aria-hidden="true">·</span>
+                  <InkLink chevron={false} className="font-normal text-ink-2" onClick={() => setShowHidden(true)} title="Show the sensors you hid">
+                    {flat.hiddenByUser} hidden by you
+                  </InkLink>
+                </>
               )}
-              <span className="ml-auto hidden items-center gap-1.5 xl:flex">
-                <Kbd>↑↓</Kbd> move <Kbd>←→</Kbd> collapse / expand <Kbd>F2</Kbd> rename <Kbd>H</Kbd> hide <Kbd>P</Kbd> pin
-                <Kbd>Ctrl+C</Kbd> copy
-              </span>
-            </footer>
-          </>
-        ) : (
-          <div className="flex flex-1 flex-col items-center justify-center gap-3 py-16 text-center">
-            {!agentUp ? (
-              <>
-                <Unavailable reason={agent ? resolveUnavailable(agent, "none") : "agentOffline"} className="text-[13px]" />
-                <p className="max-w-[420px] text-[12.5px] text-muted">
-                  The sensor list appears when the hardware agent is running. Use Restart agent in Settings if it stays offline.
-                </p>
-              </>
-            ) : waitedOut ? (
-              <>
-                <p className="text-[13px] text-slate-300">The hardware agent has not sent a sensor list yet.</p>
-                <Button size="sm" variant="ghost" icon={RefreshCw} loading={retrying} onClick={() => void retry()}>
-                  Try again
-                </Button>
-              </>
-            ) : (
-              <div className="flex items-center gap-2 text-[12.5px] text-muted">
-                <Loader2 size={14} className="animate-spin text-teal" aria-hidden="true" />
-                Reading the sensor list…
-              </div>
-            )}
-          </div>
-        )}
-      </GlassCard>
+              {sessionStart != null && (
+                <span className="truncate" title="Min, Max and Avg cover this period. Reset all starts a new one.">
+                  · Min, Max and Avg since {fmtClock(sessionStart, false)} ({fmtElapsed(now - sessionStart)})
+                </span>
+              )}
+              {!agentUp && <span className="truncate text-ink-3">· Showing the last values received</span>}
+              {limitedReason && (
+                <span className="truncate text-ink-3" title="Some sensors cannot be read in this mode.">
+                  · Partial list: {UNAVAILABLE_TEXT[limitedReason]}
+                </span>
+              )}
+            </span>
+            <SensorLogStatusLine />
+            <span className="ml-auto flex shrink-0 items-center gap-3.5">
+              <Hint keys="F2">Rename</Hint>
+              <Hint keys="P">Pin</Hint>
+              <Hint keys="H">Hide</Hint>
+              <Hint keys="Ctrl C">Copy value</Hint>
+            </span>
+          </footer>
+        </>
+      ) : (
+        <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto">
+          {!agentUp ? (
+            <EmptyState icon={Activity} title={UNAVAILABLE_TEXT.agentOffline} body="The sensor list appears as soon as Nexum can read the sensors." />
+          ) : (
+            <EmptyState
+              icon={Activity}
+              title="Reading the sensor list…"
+              action={
+                waitedOut ? (
+                  <Button size="lg" icon={RefreshCw} loading={retrying} onClick={() => void retry()}>
+                    Try again
+                  </Button>
+                ) : undefined
+              }
+            />
+          )}
+        </div>
+      )}
     </div>
   );
 }

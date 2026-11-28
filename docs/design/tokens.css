@@ -1,0 +1,237 @@
+/* ==========================================================================
+   Nexum design tokens, final ("Pro" direction + judge grafts).
+   White and Nexum Crimson, macOS-grade, light theme (default and only theme
+   shipped in this round). Every text pair is computed in contrast.txt.
+
+   The Tailwind v4 mapping is in tailwind-theme.css (same values, utility names).
+
+   FOUR RULES THE TOKENS CANNOT ENFORCE ON THEIR OWN
+   1. Crimson (--brand) is for navigation selection, the one primary button of a
+      dialog or page, and the logo. Nothing else. Never data, charts, values,
+      chips, links, toggles, focus rings or table rows.
+   2. Controls are GRAPHITE: toggles, checkboxes, segmented controls, sliders,
+      meters, focus ring and links use ink / graphite tokens (macOS "Graphite"
+      accent). Selection in content (rows, cards) is neutral grey.
+   3. Status is a grammar: icon + word + tint. Critical is vermilion (hue ~8 deg),
+      brand is crimson (hue ~350 deg); critical always carries the filled octagon
+      and the word "Critical". Colour is the third cue, never the only one.
+   4. Chart series never use red, amber or green (those belong to brand/status).
+   ========================================================================== */
+
+:root {
+  color-scheme: light;
+
+  /* ---------- Fonts -----------------------------------------------------
+     Inter (OFL, bundled via @fontsource) for all UI text AND all numbers, with
+     tabular figures wherever numbers line up. SF Pro is not used: Apple's
+     licence forbids it off Apple platforms. JetBrains Mono (OFL, bundled) only
+     for identifiers: hex IDs, INF names, paths, hardware IDs, serials.
+     'Segoe UI Variable' is the system fallback on Windows 11. */
+  --font-sans: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+  --font-features: "cv05";          /* Inter: l with tail, so Il1 never collide in sensor names */
+
+  /* ---------- Neutral scale (cool graphite) ---------------------------- */
+  --gray-0:   #ffffff;
+  --gray-25:  #fbfbfc;
+  --gray-50:  #f5f5f7;
+  --gray-75:  #f0f0f2;
+  --gray-100: #ebebee;
+  --gray-150: #e3e3e7;
+  --gray-200: #d8d8dd;
+  --gray-300: #c4c4ca;
+  --gray-400: #a2a2a9;
+  --gray-500: #86868b;
+  --gray-600: #6b6b71;
+  --gray-700: #545459;
+  --gray-800: #3a3a3e;
+  --gray-850: #2c2c2e;
+  --gray-900: #1d1d1f;
+
+  /* ---------- Brand: Nexum Crimson (hue 350 deg) ------------------------- */
+  --red-50:  #fff1f3;
+  --red-100: #ffe5ea;
+  --red-200: #ffbcc7;
+  --red-500: #df1f43;   /* logo gradient top only */
+  --red-600: #c8102e;   /* THE brand colour */
+  --red-650: #b60e2a;   /* hover */
+  --red-700: #a50d27;   /* pressed */
+  --red-800: #800b20;
+
+  --brand:          var(--red-600);
+  --brand-hover:    var(--red-650);
+  --brand-pressed:  var(--red-700);
+  --brand-fg:       #ffffff;          /* 5.88:1 on --brand */
+
+  --nav-selected-bg:  var(--brand);
+  --nav-selected-fg:  #ffffff;
+  --nav-selected-key: var(--red-100); /* F-key hint on the selected row: 4.94:1 (text, so >= 4.5) */
+
+  /* ---------- Surfaces & elevation -------------------------------------- */
+  --surface-canvas:   var(--gray-50);    /* grouped pages: cards sit on this */
+  --surface-content:  #ffffff;           /* list pages (Sensors, Drivers): full-bleed white */
+  --surface-sidebar:  #efeff2;           /* source list */
+  --surface-sidebar-card: rgba(255, 255, 255, 0.66);
+  --surface-toolbar:  #fafafb;
+  --surface-card:     #ffffff;
+  --surface-inset:    var(--gray-50);    /* wells, code, stat tiles inside cards */
+  --surface-row-alt:  #f7f7f9;           /* zebra rows in dense tables */
+  --surface-hover:    rgba(0, 0, 0, 0.04);
+  --surface-selected: rgba(0, 0, 0, 0.07); /* row / card selection: neutral, never red */
+  --surface-disabled: #f5f5f7;
+  --surface-scrim:    rgba(29, 29, 31, 0.30); /* covers the WHOLE window, sidebar included */
+  --surface-sheet:    #ffffff;
+
+  --border-hairline:  rgba(0, 0, 0, 0.08);
+  --border-subtle:    rgba(0, 0, 0, 0.12);
+  --border-strong:    rgba(0, 0, 0, 0.20);
+  --divider:          #ececef;
+  --selected-outline: var(--gray-900);   /* selected card: 1 px ink + 2 px neutral ring */
+  --selected-ring:    rgba(0, 0, 0, 0.08);
+
+  --shadow-card:    0 0 0 0.5px rgba(0,0,0,.07), 0 1px 2px rgba(0,0,0,.04), 0 2px 8px rgba(0,0,0,.025);
+  --shadow-raised:  0 0 0 0.5px rgba(0,0,0,.08), 0 2px 6px rgba(0,0,0,.06), 0 8px 24px rgba(0,0,0,.06);
+  --shadow-popover: 0 0 0 0.5px rgba(0,0,0,.10), 0 10px 30px rgba(0,0,0,.14);
+  --shadow-sheet:   0 0 0 0.5px rgba(0,0,0,.12), 0 24px 64px rgba(0,0,0,.22), 0 4px 12px rgba(0,0,0,.08);
+  --shadow-control: 0 0 0 1px rgba(0,0,0,.14), 0 1px 1.5px rgba(0,0,0,.07);
+  --shadow-control-disabled: 0 0 0 1px rgba(0,0,0,.08);
+  --shadow-primary: 0 0 0 .5px rgba(120,0,20,.30), 0 1px 1.5px rgba(120,0,20,.25);
+
+  /* ---------- Text ------------------------------------------------------- */
+  --text-primary:   var(--gray-900);   /* 16.8:1 on white */
+  --text-secondary: #5f5f65;           /* >= 5.6:1 on every surface */
+  --text-tertiary:  #646469;           /* >= 4.6:1 on every surface incl. hover and selection: units, meta, axis */
+  --text-disabled:  var(--gray-400);   /* disabled controls only (exempt), never content */
+  --text-on-brand:  #ffffff;
+
+  /* Links: ink + grey chevron, as in macOS System Settings. Never red, never blue. */
+  --link-fg:        var(--text-primary);
+  --link-chevron:   var(--text-tertiary);
+
+  --icon-primary:   var(--gray-800);
+  --icon-secondary: #55555b;
+
+  /* ---------- Graphite controls (WCAG 1.4.11: boundaries >= 3:1) ---------- */
+  --control-bg:      #ffffff;
+  --control-border:  var(--gray-500);  /* #86868B: 3.6:1 white, 3.3:1 canvas, 3.1:1 sidebar */
+  --control-on:      var(--gray-850);  /* toggle on, checkbox on, slider fill */
+  --seg-track:       #e8e8ec;
+  --seg-selected-bg: var(--gray-850);
+  --seg-selected-fg: #ffffff;
+  --slider-track:    var(--gray-200);
+  --meter-track:     var(--gray-100);
+  --meter-fill:      var(--gray-800);
+  --meter-fill-warn: #b87200;          /* amber meter: 3.2:1 vs track (icon amber #C47A00 is 2.9:1) */
+  --kbd-bg:          #e8e8ec;
+  --tag-bg:          #efeff2;
+  --badge-bg:        #ffffff;
+  --btn-secondary-bg:#ffffff;
+
+  /* ---------- Status (semantic, distinct from brand) ---------------------- */
+  --status-ok-fg:      #1b7a3a;  --status-ok-icon:      #28a04d;
+  --status-ok-bg:      #eaf6ee;  --status-ok-border:    #c5e6cf;
+
+  --status-warn-fg:    #925200;  --status-warn-icon:    #c47a00;
+  --status-warn-bg:    #fff5e1;  --status-warn-border:  #f6dca6;
+
+  --status-crit-fg:    #b3260f;  --status-crit-icon:    #d9381e;
+  --status-crit-bg:    #fdede9;  --status-crit-border:  #f5c4b8;
+
+  --status-info-fg:    #0a5fc2;  --status-info-icon:    #1f74db;
+  --status-info-bg:    #eaf2fd;  --status-info-border:  #c3daf7;
+
+  --status-unknown-fg: #535a66;  --status-unknown-icon: #7a8291;  /* Partial sensors / not measured */
+  --status-unknown-bg: #eff1f4;  --status-unknown-border:#d6dae1;
+  /* "Checking" (before the first evaluation) is neutral: card surface, subtle border, tertiary icon. */
+
+  /* ---------- Data visualisation ----------------------------------------
+     All-pairs CVD-checked (contrast.txt): worst protan dE76 16.6, deutan 26.9,
+     tritan 25.4. VRAM is graphite AND dashed, so line identity never depends on
+     hue. Every multi-series chart also labels its line ends with live values. */
+  --series-1: #1e4fc2;  /* CPU   navy   7.1:1 */
+  --series-2: #0e97a6;  /* GPU   teal   3.4:1 */
+  --series-3: #b06cf0;  /* RAM   violet 3.4:1 */
+  --series-4: #5b5b61;  /* VRAM  graphite, dashed 4 3 */
+  --series-4-dash: 4 3;
+  --series-single: var(--gray-800);  /* single-series charts: frame times, I/O total, wear */
+  --series-neutral: #8e8e95;         /* sparklines in tables, "other" */
+  --chart-grid:     #ececef;
+  --chart-axis:     #c9c9ce;
+  --chart-label:    var(--text-tertiary);
+  --chart-ref-line: #b9b9bf;          /* refresh-rate references (dashed) */
+  --chart-area-opacity: 0.08;
+
+  /* ---------- Radii ------------------------------------------------------- */
+  --radius-xs: 4px;     /* kbd, tiny tags */
+  --radius-sm: 6px;     /* fields, segmented items */
+  --radius-btn: 7px;    /* buttons */
+  --radius-md: 7px;     /* nav items */
+  --radius-lg: 10px;    /* inner panels, wells, banners */
+  --radius-card: 14px;  /* cards */
+  --radius-sheet: 16px; /* dialogs, sheets, inspector */
+  --radius-pill: 999px; /* status pill, chips */
+
+  /* ---------- Spacing (4 px base) ---------------------------------------- */
+  --space-0_5: 2px;  --space-1: 4px;  --space-1_5: 6px; --space-2: 8px;
+  --space-3: 12px;   --space-4: 16px; --space-5: 20px;  --space-6: 24px;
+  --space-7: 28px;   --space-8: 32px; --space-10: 40px; --space-12: 48px;
+
+  /* ---------- Layout ----------------------------------------------------- */
+  --sidebar-w: 220px;        /* 200px below 1400px window width */
+  --toolbar-h: 52px;
+  --nav-item-h: 28px;
+  --page-pad-x: 28px;        /* 24px below 1400px */
+  --page-pad-y: 20px;
+  --grid-gap: 16px;
+  --card-pad-x: 20px;
+  --card-pad-y: 16px;
+  --row-h-dense: 24px;       /* Sensors tree, Drivers table */
+  --row-h-regular: 32px;     /* lists inside cards */
+  --inspector-w: 380px;      /* docked inspector below 1400px */
+  --bp-compact-w: 1400px;    /* below this width OR 900px height: titles move into the toolbar */
+  --bp-compact-h: 900px;
+
+  /* ---------- Typography scale (Inter) -----------------------------------
+     token              weight size/line-height         tracking */
+  --type-hero:          600 84px/1 var(--font-sans);    --track-hero: -0.045em;      /* FPS hero */
+  --type-display:       600 36px/40px var(--font-sans); --track-display: -0.03em;    /* KPI numerals */
+  --type-large-num:     600 26px/30px var(--font-sans); --track-large-num: -0.02em;
+  --type-title-1:       600 26px/32px var(--font-sans); --track-title-1: -0.021em;   /* large page title */
+  --type-toolbar-title: 600 15px/19px var(--font-sans); --track-toolbar-title: -0.01em;
+  --type-toolbar-subtitle: 400 11.5px/14px var(--font-sans);
+  --type-title-2:       600 15px/20px var(--font-sans); --track-title-2: -0.009em;   /* card title */
+  --type-headline:      600 13px/18px var(--font-sans);
+  --type-body:          400 13px/20px var(--font-sans); --track-body: -0.003em;
+  --type-body-strong:   500 13px/20px var(--font-sans);
+  --type-callout:       400 12px/17px var(--font-sans);
+  --type-caption:       500 11px/14px var(--font-sans); --track-caption: 0.01em;
+  --type-axis:          500 11px/1 var(--font-sans);
+  --type-table:         400 12.5px/24px var(--font-sans);
+  --type-table-value:   600 12.5px/24px var(--font-sans);
+  --type-table-header:  600 11px/1 var(--font-sans);
+  --type-mono:          400 11.5px/16px var(--font-mono);
+
+  /* ---------- Focus ring: graphite, 2px with 1px white gap ---------------- */
+  --focus-color: var(--gray-850);
+  --focus-ring: 0 0 0 1px #ffffff, 0 0 0 3px var(--focus-color);
+  --focus-ring-inset: inset 0 0 0 2px var(--focus-color);
+
+  /* ---------- Motion ------------------------------------------------------ */
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-emphasized: cubic-bezier(0.3, 0, 0, 1.15);
+  --ease-exit: cubic-bezier(0.4, 0, 1, 1);
+  --dur-instant: 80ms;   /* hover, press */
+  --dur-fast: 140ms;     /* toggles, tabs, pill state change */
+  --dur-base: 220ms;     /* popovers, inspector */
+  --dur-slow: 300ms;     /* sheets, dialogs */
+  --dur-value: 400ms;    /* bar tweening; never on 1 Hz sensor text */
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --dur-fast: 0ms; --dur-base: 0ms; --dur-slow: 0ms; --dur-value: 0ms; }
+}
+
+/* Windows high contrast: drop decoration, keep structure (icons + words carry status). */
+@media (forced-colors: active) {
+  :root { --shadow-card: none; --shadow-raised: none; --shadow-popover: none; --shadow-sheet: none; }
+}

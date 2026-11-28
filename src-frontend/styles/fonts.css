@@ -1,0 +1,10 @@
+/* Nexum fonts (CONTRACT §4.9). Bundled from the @fontsource packages: no CDN, no network fonts.
+   Inter 400 / 500 / 600 carries all UI text AND all numbers (tabular figures via .num / .tnum).
+   JetBrains Mono 400 / 500 is for identifiers only (hex IDs, INF names, hardware IDs, paths, serials).
+   No other weights are shipped: font-bold and heavier are clamped to 600 in nexum.css so nothing
+   ever renders as a synthesised bold. SF Pro is never used (Apple's licence forbids it on Windows). */
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/500.css";

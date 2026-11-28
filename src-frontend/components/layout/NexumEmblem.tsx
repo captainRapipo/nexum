@@ -1,79 +1,60 @@
-import { useId } from "react";
 import { cn } from "../../lib/format";
 
 export interface NexumEmblemProps {
   size?: number;
   className?: string;
-  /** Add a soft teal bloom behind the mark. Default true. */
+  /** Kept for API compatibility. The light theme has no glow; the prop is ignored. */
   glow?: boolean;
   title?: string;
 }
 
 /**
- * NEXUM mark: hexagonal frame enclosing an "N" drawn as a linked circuit trace,
- * with gold nodes at its two terminals (the "connection").
+ * NEXUM mark ("the bond"): one continuous trace draws the N and joins two nodes.
+ * Flat Nexum Crimson (the `brand` token), no gradient, no glow. At 18 px and below it switches to the
+ * 16 px optical master (heavier stroke, nodes kept clear of the stems) so it stays crisp.
+ * Source: docs/design/logo/NexumEmblem.tsx (the colour comes from the theme instead of a hex literal).
  */
-export function NexumEmblem({ size = 28, className, glow = true, title = "Nexum" }: NexumEmblemProps) {
-  const uid = useId().replace(/[^a-zA-Z0-9_-]/g, "");
-  const ring = `nx-ring-${uid}`;
-  const fill = `nx-fill-${uid}`;
-  const bloom = `nx-bloom-${uid}`;
-
+export function NexumEmblem({ size = 28, className, title = "Nexum" }: NexumEmblemProps) {
+  const small = size <= 18;
   return (
     <svg
       width={size}
       height={size}
-      viewBox="0 0 64 64"
+      viewBox={small ? "0 0 16 16" : "0 0 24 24"}
       role="img"
       aria-label={title}
-      className={cn("shrink-0 overflow-visible", className)}
+      className={cn("shrink-0 fill-brand stroke-brand", className)}
     >
-      <defs>
-        <linearGradient id={ring} x1="8" y1="4" x2="56" y2="60" gradientUnits="userSpaceOnUse">
-          <stop offset="0" stopColor="#5EEAD4" />
-          <stop offset="0.55" stopColor="#2DD4BF" />
-          <stop offset="1" stopColor="#0F766E" />
-        </linearGradient>
-        <radialGradient id={fill} cx="32" cy="26" r="34" gradientUnits="userSpaceOnUse">
-          <stop offset="0" stopColor="#2DD4BF" stopOpacity="0.16" />
-          <stop offset="1" stopColor="#2DD4BF" stopOpacity="0.02" />
-        </radialGradient>
-        <filter id={bloom} x="-30%" y="-30%" width="160%" height="160%">
-          <feGaussianBlur stdDeviation="2.2" />
-        </filter>
-      </defs>
-
-      {glow && (
-        <g filter={`url(#${bloom})`} opacity="0.55">
-          <polygon points="32,3.5 56.7,17.75 56.7,46.25 32,60.5 7.3,46.25 7.3,17.75" fill="none" stroke="#2DD4BF" strokeWidth="2.4" />
-          <path d="M22 43V21l20 22V21" fill="none" stroke="#2DD4BF" strokeWidth="3.6" strokeLinecap="round" strokeLinejoin="round" />
-        </g>
+      <title>{title}</title>
+      {small ? (
+        <>
+          <path d="M3.5 12.75V3.75L12.5 12.25V3.25" strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round" fill="none" />
+          <circle cx={3.5} cy={12.75} r={2} stroke="none" />
+          <circle cx={12.5} cy={3.25} r={2} stroke="none" />
+        </>
+      ) : (
+        <>
+          <path d="M6 18.4V6.2L18 17.8V5.6" strokeWidth={3} strokeLinecap="round" strokeLinejoin="round" fill="none" />
+          <circle cx={6} cy={18.4} r={2.55} stroke="none" />
+          <circle cx={18} cy={5.6} r={2.55} stroke="none" />
+        </>
       )}
+    </svg>
+  );
+}
 
-      {/* outer frame */}
-      <polygon
-        points="32,3.5 56.7,17.75 56.7,46.25 32,60.5 7.3,46.25 7.3,17.75"
-        fill={`url(#${fill})`}
-        stroke={`url(#${ring})`}
-        strokeWidth="2.4"
-        strokeLinejoin="round"
-      />
-      {/* inner gold trace ring */}
-      <polygon
-        points="32,11 50.19,21.5 50.19,42.5 32,53 13.81,42.5 13.81,21.5"
-        fill="none"
-        stroke="#D4A359"
-        strokeOpacity="0.4"
-        strokeWidth="0.9"
-        strokeDasharray="3 2.2"
-      />
-      {/* N trace */}
-      <path d="M22 43V21l20 22V21" fill="none" stroke="#2DD4BF" strokeWidth="3.6" strokeLinecap="round" strokeLinejoin="round" />
-      {/* nodes */}
-      <circle cx="22" cy="43" r="2.6" fill="#2DD4BF" stroke="#070B0E" strokeWidth="1.3" />
-      <circle cx="42" cy="21" r="2.6" fill="#2DD4BF" stroke="#070B0E" strokeWidth="1.3" />
-      <circle cx="22" cy="21" r="3.3" fill="#D4A359" stroke="#070B0E" strokeWidth="1.3" />
-      <circle cx="42" cy="43" r="3.3" fill="#D4A359" stroke="#070B0E" strokeWidth="1.3" />
+/** The outlined NEXUM wordmark (docs/design/logo/wordmark.svg) in the current text colour. `height` in px. */
+export function NexumWordmark({ height = 11, className }: { height?: number; className?: string }) {
+  return (
+    <svg
+      height={height}
+      width={(height * 421.5) / 74.75}
+      viewBox="0 -73.75 421.50 74.75"
+      role="img"
+      aria-label="Nexum"
+      className={cn("shrink-0 fill-current", className)}
+    >
+      <path d="M21.22 0.00L7.54 0.00L7.54 -72.75L22.73 -72.75L48.63 -32.67Q50.24 -30.18 52.05 -27.03Q53.86 -23.88 55.83 -20.02L55.83 -20.02Q56.83 -17.97 57.84 -15.77L57.84 -15.77Q57.69 -17.77 57.59 -19.82L57.59 -19.82Q57.28 -24.12 57.16 -28.00Q57.03 -31.88 57.03 -34.57L57.03 -34.57L57.03 -72.75L70.66 -72.75L70.66 0.00L55.42 0.00L32.04 -36.08Q29.82 -39.55 27.86 -42.92Q25.90 -46.29 23.64 -50.54L23.64 -50.54Q22.18 -53.32 20.27 -56.79L20.27 -56.79Q20.47 -53.66 20.62 -50.73L20.62 -50.73Q20.87 -45.95 21.05 -42.19Q21.22 -38.43 21.22 -36.13L21.22 -36.13L21.22 0.00ZM143.63 0.00L94.75 0.00L94.75 -72.75L143.43 -72.75L143.43 -61.77L108.18 -61.77L108.18 -42.14L135.21 -42.14L135.21 -31.30L108.18 -31.30L108.18 -10.99L143.63 -10.99L143.63 0.00ZM176.67 0.00L161.23 0.00L188.14 -37.21L163.40 -72.75L178.94 -72.75L188.04 -59.47Q190.35 -56.05 191.86 -53.42Q193.37 -50.78 194.63 -48.34L194.63 -48.34Q195.18 -47.22 195.79 -46.04L195.79 -46.04Q196.39 -47.22 196.94 -48.29L196.94 -48.29Q198.20 -50.73 199.73 -53.39Q201.27 -56.05 203.63 -59.47L203.63 -59.47L212.89 -72.75L228.07 -72.75L203.48 -37.60L230.04 0.00L214.24 0.00L202.88 -16.31Q200.81 -19.38 199.48 -21.53Q198.15 -23.68 197.04 -25.68L197.04 -25.68Q196.39 -26.86 195.63 -28.22L195.63 -28.22Q194.93 -26.90 194.28 -25.78L194.28 -25.78Q193.17 -23.78 191.81 -21.58Q190.45 -19.38 188.24 -16.31L188.24 -16.31L176.67 0.00ZM279.62 1.07L279.62 1.07Q270.47 1.07 263.63 -2.27Q256.79 -5.62 253.02 -11.55Q249.24 -17.48 249.24 -25.24L249.24 -25.24L249.24 -72.75L262.67 -72.75L262.67 -26.32Q262.67 -21.78 264.76 -18.21Q266.85 -14.65 270.64 -12.62Q274.44 -10.60 279.62 -10.60L279.62 -10.60Q284.80 -10.60 288.60 -12.62Q292.40 -14.65 294.48 -18.21Q296.57 -21.78 296.57 -26.32L296.57 -26.32L296.57 -72.75L310.00 -72.75L310.00 -25.24Q310.00 -17.48 306.20 -11.55Q302.40 -5.62 295.59 -2.27Q288.77 1.07 279.62 1.07ZM347.21 0.00L334.04 0.00L334.04 -72.75L354.25 -72.75L368.49 -35.21Q369.24 -33.11 370.17 -29.81Q371.10 -26.51 372.08 -22.71Q373.06 -18.90 373.97 -15.28L373.97 -15.28Q374.02 -14.99 374.07 -14.70L374.07 -14.70Q374.12 -14.94 374.22 -15.19L374.22 -15.19Q375.08 -18.75 376.06 -22.58Q377.04 -26.42 377.97 -29.74Q378.90 -33.06 379.60 -35.21L379.60 -35.21L393.68 -72.75L413.95 -72.75L413.95 0.00L400.57 0.00L400.57 -36.72Q400.57 -39.06 400.62 -42.38Q400.67 -45.70 400.77 -49.51Q400.88 -53.32 400.98 -57.23L400.98 -57.23Q401.03 -59.13 401.03 -60.94L401.03 -60.94Q400.47 -58.84 399.87 -56.74L399.87 -56.74Q398.66 -52.69 397.51 -48.90Q396.35 -45.12 395.32 -41.94Q394.29 -38.77 393.53 -36.72L393.53 -36.72L379.70 0.00L368.29 0.00L354.25 -36.72Q353.50 -38.77 352.47 -41.87Q351.44 -44.97 350.26 -48.73Q349.07 -52.49 347.92 -56.59L347.92 -56.59Q347.31 -58.59 346.76 -60.55L346.76 -60.55Q346.76 -59.08 346.81 -57.52L346.81 -57.52Q346.91 -53.66 346.99 -49.80Q347.06 -45.95 347.14 -42.55Q347.21 -39.16 347.21 -36.72L347.21 -36.72L347.21 0.00Z" />
     </svg>
   );
 }

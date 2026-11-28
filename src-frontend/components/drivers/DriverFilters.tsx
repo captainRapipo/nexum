@@ -1,127 +1,186 @@
-import { Search, X } from "lucide-react";
-import type { DriverCategory } from "../../types";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown, Download, HardDriveDownload } from "lucide-react";
+import { Button, Segmented, Toggle, type SegmentedOption } from "../ui";
 import { cn } from "../../lib/format";
-import { DRIVER_CATEGORIES, type DriverStatusFilter } from "./driverUtils";
+import { DRIVER_CATEGORIES, type DriverScope } from "./driverUtils";
 
 export interface DriverFiltersProps {
-  query: string;
-  onQuery: (q: string) => void;
-  category: DriverCategory | "all";
-  onCategory: (c: DriverCategory | "all") => void;
-  status: DriverStatusFilter;
-  onStatus: (s: DriverStatusFilter) => void;
-  categoryCounts: Record<string, number>;
-  statusCounts: Record<DriverStatusFilter, number>;
-  total: number;
+  /** One selection: everything, one status, or one category. */
+  scope: DriverScope;
+  onScope: (s: DriverScope) => void;
+  /** Row counts per scope (after the text filter and "Third-party only"). */
+  counts: Partial<Record<DriverScope, number>>;
+  thirdPartyOnly: boolean;
+  onThirdPartyOnly: (on: boolean) => void;
+  exporting: "json" | "csv" | null;
+  onExport: (format: "json" | "csv") => void;
+  canExport: boolean;
+  backingUp: boolean;
+  onBackup: () => void;
+  /** Hover text of the backup button (what it does, and the administrator note). */
+  backupTitle: string;
 }
 
-const STATUS_OPTIONS: { id: DriverStatusFilter; label: string; tone: string }[] = [
-  { id: "all", label: "All", tone: "text-silver" },
-  { id: "problem", label: "Problem", tone: "text-crit" },
-  { id: "unsigned", label: "Unsigned", tone: "text-warn" },
-  { id: "ok", label: "OK", tone: "text-ok" },
-];
+const PROBLEM_RULE =
+  "Devices for which Windows reports an error code (Device Manager), except 22 (disabled by you) and 45 (not connected).";
+const UNSIGNED_RULE = "Drivers without a valid digital signature.";
 
+/**
+ * Filter bar of the Drivers list page (SPEC §3, CONTRACT §4.10.3): 44 px, white, hairline below.
+ * One segmented control with counts (All, Problems, Unsigned when there are any, then each category
+ * that has drivers), the "Third-party only" switch, and the two actions. The text filter lives in the
+ * app toolbar (Ctrl+K).
+ */
 export default function DriverFilters({
-  query,
-  onQuery,
-  category,
-  onCategory,
-  status,
-  onStatus,
-  categoryCounts,
-  statusCounts,
-  total,
+  scope,
+  onScope,
+  counts,
+  thirdPartyOnly,
+  onThirdPartyOnly,
+  exporting,
+  onExport,
+  canExport,
+  backingUp,
+  onBackup,
+  backupTitle,
 }: DriverFiltersProps) {
+  const options = useMemo(() => {
+    const out: SegmentedOption<DriverScope>[] = [
+      { value: "all", label: "All", count: counts.all ?? 0, title: "Every driver" },
+      { value: "st:problem", label: "Problems", count: counts["st:problem"] ?? 0, title: PROBLEM_RULE },
+    ];
+    const unsigned = counts["st:unsigned"] ?? 0;
+    if (unsigned > 0 || scope === "st:unsigned") out.push({ value: "st:unsigned", label: "Unsigned", count: unsigned, title: UNSIGNED_RULE });
+    for (const c of DRIVER_CATEGORIES) {
+      const key: DriverScope = `cat:${c}`;
+      const n = counts[key] ?? 0;
+      if (n === 0 && scope !== key) continue;
+      out.push({ value: key, label: c, count: n });
+    }
+    return out;
+  }, [counts, scope]);
+
+  // Many categories do not fit a narrow window: the control then scrolls sideways (the arrow keys
+  // reach every segment) and its cut edge fades, so it never looks like the list simply ends.
+  const scroller = useRef<HTMLDivElement>(null);
+  const [fade, setFade] = useState<{ left: boolean; right: boolean }>({ left: false, right: false });
+  useLayoutEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    const measure = () => {
+      const left = el.scrollLeft > 1;
+      const right = el.scrollWidth - el.clientWidth - el.scrollLeft > 1;
+      setFade((prev) => (prev.left === left && prev.right === right ? prev : { left, right }));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    if (el.firstElementChild) ro.observe(el.firstElementChild);
+    el.addEventListener("scroll", measure, { passive: true });
+    return () => {
+      ro.disconnect();
+      el.removeEventListener("scroll", measure);
+    };
+  }, [options.length]);
+
+  // Keep the chosen segment in view (keyboard navigation, or a category picked while scrolled).
+  useEffect(() => {
+    scroller.current?.querySelector('[aria-checked="true"]')?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [scope]);
+
   return (
-    <div className="flex flex-col gap-3">
-      <div className="flex flex-wrap items-center gap-3">
-        {/* Search */}
-        <div className="relative min-w-[260px] flex-1">
-          <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted" />
-          <input
-            type="search"
-            value={query}
-            onChange={(e) => onQuery(e.target.value)}
-            placeholder="Search device, provider, version, INF, hardware ID…"
-            aria-label="Search drivers"
-            spellCheck={false}
-            className="w-full rounded-lg border border-line bg-canvas-0/70 py-2 pl-9 pr-8 text-[13px] text-ink placeholder:text-muted/80 outline-none transition focus:border-gold/50 focus:shadow-[0_0_0_3px_rgba(212,163,89,0.12)]"
-          />
-          {query && (
-            <button
-              type="button"
-              aria-label="Clear search"
-              onClick={() => onQuery("")}
-              className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-muted hover:text-ink"
-            >
-              <X size={13} />
-            </button>
-          )}
-        </div>
-
-        {/* Status segmented control */}
-        <div role="radiogroup" aria-label="Driver status" className="flex rounded-lg border border-line bg-canvas-0/60 p-0.5">
-          {STATUS_OPTIONS.map((o) => {
-            const active = status === o.id;
-            return (
-              <button
-                key={o.id}
-                type="button"
-                role="radio"
-                aria-checked={active}
-                onClick={() => onStatus(o.id)}
-                className={cn(
-                  "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[12px] font-medium transition",
-                  active ? "bg-white/[0.07] text-ink shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08)]" : "text-muted hover:text-silver",
-                )}
-              >
-                <span className={active ? o.tone : undefined}>{o.label}</span>
-                <span className="font-mono text-[10.5px] text-muted">{statusCounts[o.id] ?? 0}</span>
-              </button>
-            );
-          })}
-        </div>
+    <div className="flex h-11 shrink-0 items-center gap-3.5 whitespace-nowrap border-b border-hairline bg-content px-(--page-pad-x)">
+      <div
+        ref={scroller}
+        className={cn(
+          "-my-1 min-w-0 shrink overflow-x-auto py-1 [scrollbar-width:none]",
+          fade.right && !fade.left && "[mask-image:linear-gradient(to_right,black_calc(100%-28px),transparent)]",
+          fade.left && !fade.right && "[mask-image:linear-gradient(to_left,black_calc(100%-28px),transparent)]",
+          fade.left && fade.right && "[mask-image:linear-gradient(to_right,transparent,black_28px,black_calc(100%-28px),transparent)]",
+        )}
+      >
+        <Segmented value={scope} options={options} onChange={onScope} size="sm" ariaLabel="Drivers shown" />
       </div>
+      <span className="shrink-0" title="Hides drivers that ship with Windows.">
+        <Toggle checked={thirdPartyOnly} onChange={onThirdPartyOnly} label="Third-party only" />
+      </span>
 
-      {/* Category chips */}
-      <div className="flex flex-wrap gap-1.5">
-        <Chip active={category === "all"} onClick={() => onCategory("all")} label="All" count={total} />
-        {DRIVER_CATEGORIES.map((c) => {
-          const n = categoryCounts[c] ?? 0;
-          if (n === 0 && category !== c) return null;
-          return <Chip key={c} active={category === c} onClick={() => onCategory(c)} label={c} count={n} />;
-        })}
-      </div>
+      <span className="min-w-0 flex-1" />
+
+      <ExportMenu exporting={exporting} onExport={onExport} disabled={!canExport} />
+      <Button size="sm" icon={HardDriveDownload} onClick={onBackup} loading={backingUp} title={backupTitle}>
+        {backingUp ? "Backing up…" : "Back up drivers"}
+      </Button>
     </div>
   );
 }
 
-function Chip({
-  active,
-  onClick,
-  label,
-  count,
+/** "Export list": a small menu with the two file formats. */
+function ExportMenu({
+  exporting,
+  onExport,
+  disabled,
 }: {
-  active: boolean;
-  onClick: () => void;
-  label: string;
-  count: number;
+  exporting: "json" | "csv" | null;
+  onExport: (format: "json" | "csv") => void;
+  disabled: boolean;
 }) {
+  const [open, setOpen] = useState(false);
+  const wrap = useRef<HTMLDivElement>(null);
+  const first = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    first.current?.focus();
+    const onDown = (e: MouseEvent) => {
+      if (wrap.current && !wrap.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        setOpen(false);
+      }
+    };
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey, true);
+    };
+  }, [open]);
+
+  const pick = (format: "json" | "csv") => {
+    setOpen(false);
+    onExport(format);
+  };
+  const item =
+    "focus-inset flex h-7 w-full items-center rounded-sm px-2.5 text-left text-body text-ink hover:bg-hover active:bg-pressed";
+
   return (
-    <button
-      type="button"
-      aria-pressed={active}
-      onClick={onClick}
-      className={cn(
-        "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[11.5px] transition",
-        active
-          ? "border-gold/55 bg-gold/10 text-gold shadow-[0_0_12px_rgba(212,163,89,0.18)]"
-          : "border-line bg-white/[0.02] text-silver hover:border-white/20 hover:text-ink",
+    <div ref={wrap} className="relative shrink-0">
+      <Button
+        size="sm"
+        icon={Download}
+        iconRight={ChevronDown}
+        onClick={() => setOpen((v) => !v)}
+        disabled={disabled}
+        loading={exporting !== null}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title="Save the driver list as a file"
+      >
+        {exporting ? "Exporting…" : "Export list"}
+      </Button>
+      {open && (
+        <div role="menu" aria-label="Export list" className="absolute right-0 top-full z-30 mt-1.5 w-44 animate-fade-in rounded-lg bg-card p-1 shadow-popover">
+          <button ref={first} type="button" role="menuitem" className={item} onClick={() => pick("csv")}>
+            Spreadsheet (.csv)
+          </button>
+          <button type="button" role="menuitem" className={item} onClick={() => pick("json")}>
+            JSON (.json)
+          </button>
+        </div>
       )}
-    >
-      {label}
-      <span className={cn("font-mono text-[10.5px]", active ? "text-gold/80" : "text-muted")}>{count}</span>
-    </button>
+    </div>
   );
 }

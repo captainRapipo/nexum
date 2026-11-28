@@ -1,10 +1,10 @@
 import { useId, useState, type FormEvent } from "react";
-import { Plus, X } from "lucide-react";
+import { X } from "lucide-react";
 import { FIXED_FRAME_EXCLUDES, FPS_EXCLUDES_MAX } from "../../types";
 import { errorMessage } from "../../lib/api";
 import { cn } from "../../lib/format";
-import { Button } from "../ui";
-import { checkExclude } from "./gamingText";
+import { Button, TextField } from "../ui";
+import { EXCLUDES_HINT, checkExclude } from "./gamingText";
 
 export interface ExcludesEditorProps {
   /** `Settings.fpsExcludes`. */
@@ -15,15 +15,17 @@ export interface ExcludesEditorProps {
 }
 
 /**
- * User excludes (CONTRACT §2.13, §4.10.1). Validation matches Rust's sanitizer; the agent filters
- * these rows itself, so editing the list never restarts the PresentMon session.
+ * "Never follow": the user's excludes (CONTRACT §2.13, §4.10.1). Validation matches Rust's
+ * sanitizer; the rows are filtered at the source, so editing the list never restarts the
+ * PresentMon session.
  */
 export default function ExcludesEditor({ excludes, setExcludes, className }: ExcludesEditorProps) {
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const inputId = useId();
-  const errId = `${inputId}-err`;
+  // Nexum's own programs are on the fixed list too; the hover names them as "Nexum itself", not by file name.
+  const always = `Always ignored: ${[...FIXED_FRAME_EXCLUDES.filter((n) => !/^nexum/i.test(n)), "Nexum itself"].join(", ")}`;
 
   const apply = async (next: string[]): Promise<boolean> => {
     setBusy(true);
@@ -57,65 +59,34 @@ export default function ExcludesEditor({ excludes, setExcludes, className }: Exc
   };
 
   return (
-    <div className={cn("flex min-w-0 flex-col gap-2", className)}>
-      <div className="flex items-start justify-between gap-3">
-        <p className="text-[11.5px] leading-snug text-muted">
-          Frames from these apps are ignored and they are never chosen as the target, for example a recorder or a
-          launcher.
-        </p>
-        <span className="num shrink-0 text-[11px] text-slate-500" title={`Up to ${FPS_EXCLUDES_MAX} apps`}>
-          {excludes.length} / {FPS_EXCLUDES_MAX}
+    <div className={cn("flex min-w-0 flex-col", className)}>
+      <div className="mb-2 flex items-baseline justify-between gap-3">
+        <label htmlFor={inputId} className="text-[12px] font-semibold leading-4 text-ink-2" title={`${EXCLUDES_HINT}\n\n${always}`}>
+          Never follow
+        </label>
+        <span className="tnum text-caption text-ink-3" title={`Up to ${FPS_EXCLUDES_MAX} apps. ${always}`}>
+          {excludes.length} of {FPS_EXCLUDES_MAX}
         </span>
       </div>
-      <label htmlFor={inputId} className="sr-only">
-        Program file name to ignore
-      </label>
-
-      <form onSubmit={(e) => void onAdd(e)} className="flex items-start gap-2" noValidate>
-        <input
-          id={inputId}
-          type="text"
-          value={draft}
-          spellCheck={false}
-          autoComplete="off"
-          maxLength={64}
-          placeholder="name.exe"
-          aria-invalid={error ? true : undefined}
-          aria-describedby={error ? errId : undefined}
-          onChange={(e) => {
-            setDraft(e.target.value);
-            if (error) setError(null);
-          }}
-          className={cn(
-            "num h-8 min-w-0 flex-1 rounded-md border bg-black/30 px-2.5 text-[12px] text-ink outline-none placeholder:text-slate-600",
-            error ? "border-crit/60" : "border-line focus:border-teal/50",
-          )}
-        />
-        <Button type="submit" size="sm" variant="teal" icon={Plus} loading={busy} disabled={draft.trim() === ""}>
-          Add
-        </Button>
-      </form>
-      {error && (
-        <p id={errId} role="alert" className="text-[11.5px] text-rose-400">
-          {error}
-        </p>
-      )}
+      <p className="sr-only">
+        {EXCLUDES_HINT} {always}
+      </p>
 
       {excludes.length > 0 && (
-        <ul className="flex flex-wrap gap-1.5" aria-label="Ignored apps">
+        <ul className="mb-2.5 flex max-h-[84px] flex-wrap gap-1.5 overflow-y-auto" aria-label="Apps that are never followed">
           {excludes.map((name) => (
             <li
               key={name}
-              className="inline-flex h-7 items-center gap-1 rounded-md border border-line bg-white/[0.03] pl-2.5 pr-1 text-[12px]"
+              className="inline-flex h-6 items-center gap-0.5 rounded-full bg-inset pl-[9px] pr-0.5 font-mono text-[11.5px] text-ink shadow-[inset_0_0_0_0.5px_var(--color-subtle)]"
             >
-              <span className="num text-slate-200">{name}</span>
+              {name}
               <button
                 type="button"
                 onClick={() => onRemove(name)}
                 disabled={busy}
                 title={`Remove ${name}`}
                 aria-label={`Remove ${name}`}
-                className="flex size-5 items-center justify-center rounded text-slate-500 hover:bg-white/[0.08] hover:text-slate-200 disabled:opacity-40"
+                className="flex size-5 items-center justify-center rounded-full text-ink-3 transition-colors duration-[80ms] hover:bg-hover hover:text-ink disabled:text-ink-disabled"
               >
                 <X size={12} aria-hidden="true" />
               </button>
@@ -123,9 +94,28 @@ export default function ExcludesEditor({ excludes, setExcludes, className }: Exc
           ))}
         </ul>
       )}
-      <p className="text-[11px] text-slate-500" title="These are excluded by Nexum itself and cannot be removed.">
-        Always ignored: {FIXED_FRAME_EXCLUDES.join(", ")}
-      </p>
+
+      <form onSubmit={(e) => void onAdd(e)} className="flex items-start gap-2" noValidate>
+        <TextField
+          id={inputId}
+          mono
+          value={draft}
+          onChange={(v) => {
+            setDraft(v);
+            if (error) setError(null);
+          }}
+          placeholder="name.exe"
+          spellCheck={false}
+          autoComplete="off"
+          maxLength={64}
+          invalid={error != null}
+          message={error != null ? <span role="alert">{error}</span> : undefined}
+          className="flex-1"
+        />
+        <Button type="submit" size="sm" className="h-7" loading={busy} disabled={draft.trim() === ""}>
+          Add
+        </Button>
+      </form>
     </div>
   );
 }

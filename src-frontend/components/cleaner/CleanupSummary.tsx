@@ -1,7 +1,7 @@
-import { CheckCircle2, ExternalLink, FolderOpen, Info, SkipForward, Trash2 } from "lucide-react";
+import { Info } from "lucide-react";
 import type { PurgeResult } from "../../types";
 import { api } from "../../lib/api";
-import { Button } from "../ui";
+import { Button, InkLink, StatusIcon } from "../ui";
 import { toast } from "../feedback/Toast";
 import { cn } from "../../lib/format";
 import { fmtDuration } from "./purgeEngine";
@@ -11,22 +11,39 @@ export interface CleanupSummaryProps {
   result: PurgeResult;
   onDone: () => void;
   doneLabel?: string;
-  /** Optional secondary action (e.g. "Scan again"). */
+  /** Optional secondary action (e.g. "Measure again"). */
   secondary?: { label: string; onClick: () => void };
+  /**
+   * "page" (default): headline, numbers, links and the buttons (all secondary: a page has no primary).
+   * "dialog": numbers and links only; the dialog shows `summaryHeadline()` as its title and owns the buttons.
+   */
+  variant?: "page" | "dialog";
+  className?: string;
 }
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/** `Freed 6.4 GB in 2.3s` / `Nothing to remove`. */
+export function summaryHeadline(result: PurgeResult): string {
+  if (result.freedBytes <= 0 && result.filesDeleted === 0) return "Nothing to remove";
+  return `Freed ${fmtIn(result.freedBytes, pickUnit(result.freedBytes))} in ${fmtDuration(result.durationMs)}`;
+}
+
+/** One sentence under the headline. */
+export function summaryDetail(result: PurgeResult): string {
+  return result.freedBytes <= 0 && result.filesDeleted === 0
+    ? "The selected categories had no files that could be removed."
+    : "Cleanup finished. Every file is listed in the log.";
+}
+
 /** After a cleanup: "Freed 6.4 GB in 2.3 s", per-category breakdown with skip notes, and the audit log. */
-export default function CleanupSummary({ result, onDone, doneLabel = "Done", secondary }: CleanupSummaryProps) {
+export default function CleanupSummary({ result, onDone, doneLabel = "Done", secondary, variant = "page", className }: CleanupSummaryProps) {
   const rows = [...(result.perCategory ?? [])].sort((a, b) => b.freedBytes - a.freedBytes);
   const unit = listUnit(rows.map((r) => ({ bytes: r.freedBytes })));
-  const totalUnit = pickUnit(result.freedBytes);
-  const max = Math.max(1, ...rows.map((r) => r.freedBytes));
-  const nothing = result.freedBytes <= 0 && result.filesDeleted === 0;
   const hasDumps = rows.some((r) => r.id === "dumps" || r.id === "memory-dump");
+  const page = variant === "page";
 
   const viewLog = () => {
     if (!result.logPath) return;
@@ -37,60 +54,50 @@ export default function CleanupSummary({ result, onDone, doneLabel = "Done", sec
   };
 
   return (
-    <div className="flex flex-col gap-5">
-      <div className="flex flex-col items-center text-center">
-        <CheckCircle2 size={40} className="text-ok" aria-hidden="true" />
-        <h3 className="mt-3 text-[24px] font-semibold tracking-tight text-ink">
-          {nothing ? (
-            "Nothing to remove"
-          ) : (
-            <>
-              Freed <span className="font-mono">{fmtIn(result.freedBytes, totalUnit)}</span> in{" "}
-              <span className="font-mono">{fmtDuration(result.durationMs)}</span>
-            </>
-          )}
-        </h3>
-        <p className="mt-1 text-[12.5px] text-muted">
-          {nothing ? "The selected categories had no files that could be removed." : "Cleanup finished. Every file is listed in the log."}
-        </p>
-      </div>
-
-      <div className="grid grid-cols-2 gap-3">
-        <div className="rounded-xl border border-line bg-white/[0.02] px-4 py-3">
-          <div className="flex items-center gap-1.5 text-[10.5px] uppercase tracking-[0.16em] text-muted">
-            <Trash2 size={12} className="text-silver" />
-            Files deleted
+    <div className={cn("flex flex-col gap-3.5", page && "px-(--card-pad-x) pb-(--card-pad-y) pt-1", className)}>
+      {page && (
+        <div className="flex items-start gap-2.5">
+          <StatusIcon tone="ok" size={20} className="mt-1" />
+          <div className="min-w-0">
+            <h3 className="tnum text-[22px] font-semibold leading-7 tracking-[-0.015em] text-ink">{summaryHeadline(result)}</h3>
+            <p className="text-body text-ink-2">{summaryDetail(result)}</p>
           </div>
-          <div className="mt-1 font-mono text-[22px] font-semibold text-ink">{result.filesDeleted.toLocaleString("en-US")}</div>
         </div>
-        <div className="rounded-xl border border-line bg-white/[0.02] px-4 py-3">
-          <div className="flex items-center gap-1.5 text-[10.5px] uppercase tracking-[0.16em] text-muted">
-            <SkipForward size={12} className="text-silver" />
+      )}
+
+      <div className="rounded-lg bg-inset px-3 py-1">
+        <div className="tnum flex h-8 items-center justify-between gap-3 border-b border-divider text-body">
+          <span className="text-ink-2">Files deleted</span>
+          <span className="font-semibold text-ink">{result.filesDeleted.toLocaleString("en-US")}</span>
+        </div>
+        <div className="tnum flex h-8 items-center justify-between gap-3 text-body">
+          <span className="text-ink-2" title="Files in use, too new or protected are skipped, never forced.">
             Skipped
-          </div>
-          <div className="mt-1 font-mono text-[22px] font-semibold text-silver">{result.filesSkipped.toLocaleString("en-US")}</div>
+          </span>
+          <span className="font-medium text-ink">{result.filesSkipped.toLocaleString("en-US")}</span>
         </div>
       </div>
 
       {rows.length > 0 && (
         <div>
-          <div className="mb-2 text-[10.5px] font-semibold uppercase tracking-[0.18em] text-silver">By category</div>
-          <ul className="flex flex-col gap-1.5">
+          <div className="mb-1 text-[12px] font-semibold leading-4 text-ink-2">By category</div>
+          <ul>
             {rows.map((r) => (
-              <li key={r.id} className="relative overflow-hidden rounded-lg border border-line px-3 py-2">
-                <span aria-hidden className="absolute inset-y-0 left-0 bg-teal/[0.07]" style={{ width: `${(r.freedBytes / max) * 100}%` }} />
-                <div className="relative flex items-center justify-between gap-3 text-[12.5px]">
-                  <span className="truncate text-silver">{r.label}</span>
-                  <span className="flex shrink-0 items-baseline gap-3 font-mono">
-                    <span className="text-[10.5px] text-muted">
+              <li key={r.id} className="border-b border-divider py-1.5 last:border-b-0">
+                <div className="tnum flex items-baseline justify-between gap-3 text-body">
+                  <span className="min-w-0 truncate text-ink">{r.label}</span>
+                  <span className="flex shrink-0 items-baseline gap-3">
+                    <span className="text-callout text-ink-3">
                       {r.deleted.toLocaleString("en-US")} deleted{r.skipped > 0 ? ` · ${r.skipped.toLocaleString("en-US")} skipped` : ""}
                     </span>
-                    <span className={cn("w-20 text-right", r.freedBytes > 0 ? "text-ink" : "text-muted")}>{fmtIn(r.freedBytes, unit)}</span>
+                    <span className={cn("w-[68px] text-right", r.freedBytes > 0 ? "font-semibold text-ink" : "text-ink-3")}>
+                      {fmtIn(r.freedBytes, unit)}
+                    </span>
                   </span>
                 </div>
                 {r.note && (
-                  <div className="relative mt-1 flex items-start gap-1.5 text-[11px] text-cyan">
-                    <Info size={11} className="mt-[2px] shrink-0" aria-hidden="true" />
+                  <div className="mt-0.5 flex items-start gap-1.5 text-callout text-ink-2">
+                    <Info size={13} className="mt-0.5 shrink-0 text-info-icon" aria-hidden="true" />
                     <span>{r.note}</span>
                   </div>
                 )}
@@ -100,40 +107,21 @@ export default function CleanupSummary({ result, onDone, doneLabel = "Done", sec
         </div>
       )}
 
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-3 text-[12px]">
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
           {result.logPath && (
-            <button
-              type="button"
-              onClick={viewLog}
-              title={result.logPath}
-              className="inline-flex items-center gap-1.5 text-silver underline decoration-white/20 underline-offset-2 transition hover:text-ink"
-            >
-              <FolderOpen size={13} aria-hidden="true" />
+            <InkLink onClick={viewLog} title={result.logPath}>
               View log
-            </button>
+            </InkLink>
           )}
-          {hasDumps && (
-            <button
-              type="button"
-              onClick={openReliability}
-              className="inline-flex items-center gap-1.5 text-silver underline decoration-white/20 underline-offset-2 transition hover:text-ink"
-            >
-              <ExternalLink size={13} aria-hidden="true" />
-              Open Reliability Monitor
-            </button>
-          )}
+          {hasDumps && <InkLink onClick={openReliability}>Open Reliability Monitor</InkLink>}
         </div>
-        <div className="flex gap-2">
-          {secondary && (
-            <Button variant="ghost" onClick={secondary.onClick}>
-              {secondary.label}
-            </Button>
-          )}
-          <Button variant="teal" onClick={onDone}>
-            {doneLabel}
-          </Button>
-        </div>
+        {page && (
+          <div className="flex gap-2">
+            {secondary && <Button onClick={secondary.onClick}>{secondary.label}</Button>}
+            <Button onClick={onDone}>{doneLabel}</Button>
+          </div>
+        )}
       </div>
     </div>
   );

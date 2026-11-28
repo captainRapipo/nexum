@@ -1,13 +1,11 @@
 import { useState } from "react";
-import { FileSpreadsheet, FolderOpen, Square } from "lucide-react";
+import { FileText, Square } from "lucide-react";
 import { SENSOR_LOG_INTERVALS_MS } from "../../types";
 import { errorMessage } from "../../lib/api";
-import { cn, fmtCount } from "../../lib/format";
+import { fmtCount } from "../../lib/format";
 import { useSensorLog } from "../../hooks/useSensorLog";
 import { useSettings } from "../../hooks/useSettings";
-import { Button } from "../ui/Button";
-import { Segmented } from "../ui/Segmented";
-import { STATUS_CLASS } from "../ui/tones";
+import { Button, InkLink, Segmented, StatusIcon } from "../ui";
 import { toast } from "../feedback/Toast";
 
 /** Rust accepts at most this many explicit ids (CONTRACT §2.9). */
@@ -26,11 +24,12 @@ export interface SensorLogControlsProps {
 }
 
 /**
- * "Log to CSV" control group of the Sensors view (CONTRACT §4.10.2, §2.9). Rust samples and writes the
- * file; this only starts/stops it and shows the status. The column set and interval are fixed at start.
+ * "Log to CSV" group of the Sensors filter bar (CONTRACT §4.10.2, §2.9): the interval and the
+ * Start log / Stop log button. Rust samples and writes the file; this only starts and stops it. The
+ * column set and interval are fixed at start. The running status is shown by `SensorLogStatusLine`.
  */
 export function SensorLogControls({ selectedIds, disabled }: SensorLogControlsProps) {
-  const { status, start, stop, openFolder } = useSensorLog();
+  const { status, start, stop } = useSensorLog();
   const { settings, update } = useSettings();
   const [busy, setBusy] = useState<"start" | "stop" | null>(null);
 
@@ -72,86 +71,70 @@ export function SensorLogControls({ selectedIds, disabled }: SensorLogControlsPr
     }
   };
 
-  const onOpenFolder = () => {
-    openFolder().catch((e: unknown) => toast(`Could not open the folder: ${errorMessage(e)}`, "warn"));
-  };
-
   return (
-    <div
-      role="group"
-      aria-label="Log to CSV"
-      className="flex flex-wrap items-center gap-x-3 gap-y-2 border-t border-line/70 py-2.5"
-    >
-      <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">
-        <FileSpreadsheet size={13} aria-hidden="true" className="text-slate-500" />
-        Log to CSV
+    <div role="group" aria-label="Log to CSV" className="flex shrink-0 items-center gap-2">
+      <span className="text-body text-ink-2 tight:hidden" title="How often a row is written to the CSV file">
+        Log every
       </span>
-      <Segmented
-        value={interval}
-        options={INTERVAL_OPTIONS}
-        onChange={onInterval}
-        size="sm"
-        ariaLabel="Log interval"
-        disabled={active || disabled}
-      />
+      <Segmented value={interval} options={INTERVAL_OPTIONS} onChange={onInterval} size="sm" ariaLabel="Log interval" disabled={active || disabled} />
       {active ? (
-        <Button
-          size="sm"
-          variant="ghost"
-          icon={Square}
-          loading={busy === "stop"}
-          onClick={() => void onStop()}
-          title="Stop writing the CSV file"
-        >
+        <Button size="sm" icon={Square} loading={busy === "stop"} onClick={() => void onStop()} title="Stop writing the CSV file">
           Stop log
         </Button>
       ) : (
         <Button
           size="sm"
-          variant="ghost"
-          icon={FileSpreadsheet}
+          icon={FileText}
           loading={busy === "start"}
           disabled={disabled}
           onClick={() => void onStart()}
-          title={`${scope}. Select rows first to log only those.`}
+          title={`Log to CSV. ${scope}. Select rows first to log only those.`}
         >
           Start log
         </Button>
       )}
-
-      <div className="flex min-w-0 flex-1 items-center gap-3 text-[11.5px]">
-        {active ? (
-          <span className="num flex min-w-0 items-center gap-1.5 truncate text-slate-300" title={status.path ?? undefined}>
-            <span aria-hidden="true" className="size-1.5 shrink-0 animate-pulse rounded-full bg-teal" />
-            <span className="truncate">
-              Logging {fmtCount(status.sensorCount)} sensors · {fmtCount(status.rows)} rows
-            </span>
-          </span>
-        ) : status.error ? (
-          <span className={cn("min-w-0 truncate", STATUS_CLASS.crit.text)} title={status.error}>
-            {status.error}
-          </span>
-        ) : status.path ? (
-          <span className="min-w-0 truncate text-slate-500" title={status.path}>
-            Last log: {fileName(status.path)} · {fmtCount(status.totalRows)} rows
-          </span>
-        ) : (
-          <span className="min-w-0 truncate text-slate-500">{scope}.</span>
-        )}
-        {(active || status.path) && (
-          <Button
-            size="sm"
-            variant="ghost"
-            icon={FolderOpen}
-            onClick={onOpenFolder}
-            title={`Open ${status.folder}`}
-            className="shrink-0"
-          >
-            Open folder
-          </Button>
-        )}
-      </div>
     </div>
+  );
+}
+
+/**
+ * Status of the CSV log for the Sensors status bar: `Logging <n> sensors · <rows> rows` while it
+ * runs, the error that stopped it, or the last file; plus `Open folder`. Renders nothing before the
+ * first log of this session.
+ */
+export function SensorLogStatusLine() {
+  const { status, openFolder } = useSensorLog();
+  if (!status.active && !status.error && !status.path) return null;
+
+  const onOpenFolder = () => {
+    openFolder().catch((e: unknown) => toast(`Could not open the folder: ${errorMessage(e)}`, "warn"));
+  };
+
+  return (
+    <span className="flex min-w-0 items-center gap-2">
+      {status.active ? (
+        <span className="flex min-w-0 items-center gap-1.5 text-ink" title={status.path ?? undefined}>
+          <span aria-hidden="true" className="size-1.5 shrink-0 animate-led-pulse rounded-full bg-control-on" />
+          <span className="truncate tnum">
+            Logging {fmtCount(status.sensorCount)} sensors · {fmtCount(status.rows)} rows
+          </span>
+        </span>
+      ) : status.error ? (
+        <span className="flex min-w-0 items-center gap-1.5 text-crit" title={status.error}>
+          <StatusIcon tone="crit" size={13} />
+          <span className="truncate">{status.error}</span>
+        </span>
+      ) : (
+        <span className="min-w-0 truncate tnum" title={status.path ?? undefined}>
+          Last log: {fileName(status.path ?? "")} · {fmtCount(status.totalRows)} rows
+        </span>
+      )}
+      {(status.active || status.path) && (
+        <InkLink chevron={false} onClick={onOpenFolder} title={`Open ${status.folder}`} className="shrink-0">
+          Open folder
+        </InkLink>
+      )}
+    </span>
   );
 }
 

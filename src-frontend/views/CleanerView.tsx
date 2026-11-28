@@ -1,21 +1,36 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { History, Layers, Lock, RefreshCw, ShieldCheck, Sparkles } from "lucide-react";
+import { Lock, RefreshCw, ShieldCheck, Sparkles } from "lucide-react";
 import { DEFAULT_SETTINGS, type TrashCategory } from "../types";
 import { api } from "../lib/api";
 import { onRescanRequest } from "../lib/nav";
 import { useSettings } from "../hooks/useSettings";
-import { fmtBytes } from "../lib/format";
+import { fmtBytes, fmtClock } from "../lib/format";
 import GlassCard from "../components/layout/GlassCard";
-import { Button, Modal } from "../components/ui";
+import { PageHeader, usePageChrome } from "../components/layout/PageChrome";
+import { Button, InkLink, Modal, StatusIcon } from "../components/ui";
 import { toast } from "../components/feedback/Toast";
-import StatTile from "../components/drivers/StatTile";
 import CategoryList from "../components/cleaner/CategoryList";
 import CleanupSummary from "../components/cleaner/CleanupSummary";
 import PurgeProgressPanel from "../components/cleaner/PurgeProgressPanel";
 import ScanningState from "../components/cleaner/ScanningState";
+import SelectionWell from "../components/cleaner/SelectionWell";
 import { useCategorySelection, useTrashScan } from "../components/cleaner/useTrashScan";
 import { attachPurgeViewer, fmtDuration, getPurgeState, startPurge, usePurgeEngine } from "../components/cleaner/purgeEngine";
-import { fmtIn, headline, listUnit } from "../components/cleaner/cleanerCopy";
+import {
+  CLEANUP_RULES,
+  CONFIRM_BODY,
+  CONFIRM_REASSURANCE,
+  PAGE_DESCRIPTION,
+  PROTECTED_PATHS,
+  READY_NOTE_CONFIRM,
+  READY_NOTE_DIRECT,
+  dirnameOf,
+  fmtFiles,
+  fmtIn,
+  headline,
+  listUnit,
+  splitAmount,
+} from "../components/cleaner/cleanerCopy";
 
 /** Shown while the backend omits the browser category (it is only listed when includeBrowser is on). */
 const BROWSER_PLACEHOLDER: TrashCategory = {
@@ -33,35 +48,15 @@ const BROWSER_PLACEHOLDER: TrashCategory = {
   note: null,
 };
 
-/** Mirrors the non-negotiable rules enforced by the Rust cleaner (CONTRACT §3). */
-const PROTECTED = [
-  "%WINDIR%\\System32 (incl. \\config registry hives), SysWOW64, WinSxS, Prefetch",
-  "%ProgramFiles% and %ProgramFiles(x86)%",
-  "%ProgramData%\\Nexum and the hardware agent's folder",
-  "Documents, Desktop, Pictures, Videos, Music, Downloads, OneDrive",
-  "NTUSER.DAT*, UsrClass.dat*, *.regtrans-ms, *.blf",
-  "Drive roots and every category root folder itself",
-  "Symlinks, junctions and mount points (never followed)",
-  "Browser cookies, logins, history, Local Storage and IndexedDB",
-];
-
-const RULES = [
-  "Crash dumps: the 5 newest and anything less than 30 days old are kept.",
-  "Windows Update downloads are skipped while an update is waiting to install or restart.",
-  "Delivery Optimization is cleared only through Windows' own cmdlet.",
-  "Browser and Discord caches are skipped while that app is open.",
-  "Recycle Bin: with an age set, only items deleted longer ago than that are removed, and only from your own bin.",
-  "Every cleanup writes a log of each file it deleted or skipped.",
-];
-
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : typeof e === "string" ? e : String(e);
 }
 
-function fmtTime(ts: number) {
-  return new Date(ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-}
-
+/**
+ * Clean caches (F9 row of the sidebar; CONTRACT §3, §4.10, §4.10.3): the measured categories on the
+ * left, the total with the one button and this session's history on the right. The page button is
+ * secondary and opens the confirmation; that dialog owns the only primary button.
+ */
 export default function CleanerView() {
   const { settings: rawSettings, update } = useSettings();
   const settings = rawSettings ?? DEFAULT_SETTINGS;
@@ -70,7 +65,7 @@ export default function CleanerView() {
   const scanner = useTrashScan();
   const { rescan } = scanner;
   const includeBrowser = settings.includeBrowserCaches;
-  // Recycle Bin age filter (CONTRACT §3.2): passed explicitly to every scan, and the purge reuses the value
+  // Recycle Bin age filter (CONTRACT §3.2): passed explicitly to every scan, and the cleanup reuses the value
   // the shown estimate was measured with (scanner.scannedRecycleAge).
   const recycleAge = settings.recycleMinAgeDays;
   const recycleAgeRef = useRef(recycleAge);
@@ -80,12 +75,18 @@ export default function CleanerView() {
   const selection = useCategorySelection(scanner.scan, forced);
 
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [rulesOpen, setRulesOpen] = useState(false);
   /** Run id whose summary is pinned on this page until dismissed. */
   const [summaryRun, setSummaryRun] = useState<number | null>(null);
+  /** When the shown estimate was measured (the scan itself carries no timestamp). */
+  const [measuredAt, setMeasuredAt] = useState<number | null>(null);
+  useEffect(() => {
+    if (scanner.scanStamp > 0) setMeasuredAt(Date.now());
+  }, [scanner.scanStamp]);
 
   useEffect(() => attachPurgeViewer(), []);
 
-  // Any cleanup running while this page is visible (e.g. from the Clean caches modal) gets its summary here too.
+  // Any cleanup running while this page is visible (e.g. from the Clean caches dialog) gets its summary here too.
   useEffect(() => {
     if (engine.running) setSummaryRun(engine.runId);
   }, [engine.running, engine.runId]);
@@ -96,7 +97,7 @@ export default function CleanerView() {
     if (!getPurgeState().running) void rescan(includeBrowser, recycleAge);
   }, [includeBrowser, recycleAge, rescan]);
 
-  // F5 while on the Cleaner re-measures (CONTRACT §4.6), unless a cleanup is running.
+  // F5 while on this page re-measures (CONTRACT §4.6), unless a cleanup is running.
   useEffect(
     () =>
       onRescanRequest("cleaner", () => {
@@ -117,7 +118,7 @@ export default function CleanerView() {
   const categories = useMemo(() => {
     const list = scanner.scan?.categories ?? [];
     if (list.some((c) => c.id === "browser")) return list;
-    // Keep the browser row visible (as a toggle bound to the setting) even when the backend omitted it.
+    // Keep the browser row visible (as a switch bound to the setting) even when the backend omitted it.
     return [...list, BROWSER_PLACEHOLDER];
   }, [scanner.scan]);
 
@@ -160,7 +161,7 @@ export default function CleanerView() {
     if (getPurgeState().running) return;
     const runId = getPurgeState().runId + 1;
     setSummaryRun(runId);
-    startPurge(selectedCats, "Cleaner", scanner.scannedRecycleAge).catch((e: unknown) => {
+    startPurge(selectedCats, "Clean caches page", scanner.scannedRecycleAge).catch((e: unknown) => {
       // A run that started reports its own failure; only errors raised before the run began need surfacing.
       if (getPurgeState().lastRunId !== runId && !getPurgeState().running) toast(`Cleanup failed: ${errMsg(e)}`, "crit");
     });
@@ -173,90 +174,69 @@ export default function CleanerView() {
   };
 
   const sessionFreed = engine.history.reduce((a, h) => a + h.result.freedBytes, 0);
-  const sessionFiles = engine.history.reduce((a, h) => a + h.result.filesDeleted, 0);
   const showSummary =
     summaryRun !== null && !engine.running && engine.lastRunId === summaryRun && engine.lastResult !== null;
   const runFailed =
     summaryRun !== null && !engine.running && engine.lastRunId === summaryRun && engine.lastResult === null && engine.error;
 
   const scanning = scanner.phase === "scanning" || (scanner.phase === "idle" && !scanner.scan);
-  const showFooter = !engine.running && !showSummary;
   const unit = listUnit(categories);
+  const idle = !engine.running && !showSummary;
+  const [readyAmount, readyUnit] = splitAmount(head.now);
+  const availableCount = categories.filter((c) => c.available !== false).length;
+  const measuredClock = measuredAt != null ? fmtClock(measuredAt, false) : null;
+  const lastLog = engine.history.find((h) => h.result.logPath)?.result.logPath ?? null;
+
+  usePageChrome({
+    subtitle: engine.running
+      ? "Cleaning…"
+      : scanner.scan && measuredClock
+        ? `${head.now} ready · measured ${measuredClock}`
+        : "Measuring…",
+  });
+
+  const openLogFolder = () => {
+    if (!lastLog) return;
+    api.openExternal(dirnameOf(lastLog)).catch((e: unknown) => toast(`Could not open the log folder: ${errMsg(e)}`, "crit"));
+  };
+
+  const remeasure = () => void rescan(includeBrowser, recycleAgeRef.current);
 
   return (
-    <div className="flex flex-col gap-5">
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h1 className="text-[22px] font-semibold tracking-tight text-ink">Cache cleanup</h1>
-          <p className="mt-0.5 text-[12.5px] text-muted">
-            Measures reclaimable caches first, then deletes only what you select. Files in use are skipped, never forced.
-          </p>
-        </div>
-        <Button
-          variant="ghost"
-          size="sm"
-          icon={<RefreshCw size={14} className={scanner.phase === "scanning" ? "animate-spin" : undefined} />}
-          onClick={() => void rescan(includeBrowser, recycleAgeRef.current)}
-          disabled={scanner.phase === "scanning" || engine.running}
-          title="Measure again (F5)"
-        >
-          Measure again
-        </Button>
-      </div>
+    <div className="flex flex-1 flex-col">
+      <PageHeader
+        view="cleaner"
+        description={PAGE_DESCRIPTION}
+        actions={
+          <Button
+            icon={<RefreshCw size={15} className={scanner.phase === "scanning" ? "animate-spin" : undefined} aria-hidden="true" />}
+            onClick={remeasure}
+            disabled={scanner.phase === "scanning" || engine.running}
+            title="Measure again (F5)"
+          >
+            Measure again
+          </Button>
+        }
+      />
 
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <StatTile
-          label="Selected"
-          value={scanner.scan ? head.now : "…"}
-          accent="teal"
-          icon={<Sparkles size={15} />}
-          sub={`${selection.selectedFiles.toLocaleString("en-US")} files in ${selectedCats.length} ${selectedCats.length === 1 ? "category" : "categories"}`}
-        />
-        <StatTile
-          label="Reclaimable caches"
-          value={scanner.scan ? fmtBytes(scanner.scan.totalBytes, 2) : "…"}
-          accent="cyan"
-          icon={<Layers size={15} />}
-          title="Sum of every category that can run in this session"
-          sub={
-            scanner.scan
-              ? head.more
-                ? `${head.more} more as administrator`
-                : `Measured in ${fmtDuration(scanner.scan.durationMs)}`
-              : "Measuring…"
-          }
-        />
-        <StatTile
-          label="Freed this session"
-          value={fmtBytes(sessionFreed, 2)}
-          accent="purple"
-          icon={<Sparkles size={15} />}
-          sub={`${sessionFiles.toLocaleString("en-US")} files removed`}
-        />
-        <StatTile
-          label="Cleanups run"
-          value={engine.history.length}
-          accent="silver"
-          icon={<History size={15} />}
-          sub={engine.history[0] ? `Last at ${fmtTime(engine.history[0].at)}` : "None yet"}
-        />
-      </div>
-
-      <div className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
+      <div className="grid flex-1 grid-cols-[minmax(0,1fr)_380px] items-stretch gap-(--grid-gap) tight:grid-cols-[minmax(0,1fr)_340px]">
         <GlassCard
-          title={engine.running ? "Cleaning…" : showSummary ? "Cleanup finished" : "Reclaimable caches"}
-          icon={<Layers size={15} />}
-          accent="teal"
+          padded={false}
+          bodyClassName="flex flex-col"
+          title={engine.running ? "Cleaning…" : showSummary ? "Cleanup finished" : "Categories"}
           actions={
-            !engine.running && !showSummary && scanner.scan ? (
-              <div className="flex gap-3 text-[11px]">
-                <button type="button" className="text-silver transition hover:text-ink" onClick={() => selection.setAll(true)}>
-                  Select all
-                </button>
-                <button type="button" className="text-silver transition hover:text-ink" onClick={() => selection.setAll(false)}>
+            idle && scanner.scan ? (
+              <span className="flex gap-3.5">
+                <InkLink chevron={false} onClick={selection.resetOverrides} title="Back to the categories that are on by default">
+                  Select defaults
+                </InkLink>
+                <InkLink chevron={false} onClick={() => selection.setAll(true)}>
+                  All
+                </InkLink>
+                <InkLink chevron={false} onClick={() => selection.setAll(false)}>
                   None
-                </button>
-              </div>
+                </InkLink>
+              </span>
             ) : undefined
           }
         >
@@ -265,17 +245,23 @@ export default function CleanerView() {
           ) : showSummary && engine.lastResult ? (
             <CleanupSummary result={engine.lastResult} onDone={() => setSummaryRun(null)} />
           ) : (
-            <div className="flex flex-col gap-4">
+            <>
               {runFailed && (
-                <div className="rounded-lg border border-crit/40 bg-crit/[0.07] px-3 py-2.5 text-[12.5px] text-rose-300">
-                  Cleanup failed: {engine.error}
+                <div role="alert" className="mx-(--card-pad-x) mb-3 flex items-center gap-2.5 rounded-lg border border-crit-border bg-crit-bg px-3.5 py-2.5 text-body">
+                  <StatusIcon tone="crit" size={18} />
+                  <span className="min-w-0 flex-1">
+                    <b className="font-semibold text-ink">Cleanup failed.</b> <span className="text-ink-2">{engine.error}</span>
+                  </span>
                 </div>
               )}
               {scanner.phase === "error" && (
-                <div className="flex items-center justify-between gap-3 rounded-lg border border-crit/40 bg-crit/[0.07] px-3 py-2.5 text-[12.5px] text-rose-300">
-                  <span>Measuring failed: {scanner.error}</span>
-                  <Button variant="danger" size="sm" onClick={() => void rescan(includeBrowser, recycleAgeRef.current)}>
-                    Retry
+                <div role="alert" className="mx-(--card-pad-x) mb-3 flex items-center gap-2.5 rounded-lg border border-crit-border bg-crit-bg px-3.5 py-2.5 text-body">
+                  <StatusIcon tone="crit" size={18} />
+                  <span className="min-w-0 flex-1">
+                    <b className="font-semibold text-ink">Measuring failed.</b> <span className="text-ink-2">{scanner.error}</span>
+                  </span>
+                  <Button size="sm" onClick={remeasure}>
+                    Try again
                   </Button>
                 </div>
               )}
@@ -283,134 +269,186 @@ export default function CleanerView() {
               {scanning && !scanner.scan ? (
                 <ScanningState />
               ) : (
-                <div className={scanner.phase === "scanning" ? "pointer-events-none opacity-60 transition-opacity" : undefined}>
-                  <CategoryList
-                    categories={categories}
-                    unit={unit}
-                    selected={selection.selected}
-                    onToggle={onToggle}
-                    disabled={scanner.phase === "scanning"}
-                    onOpenReliabilityMonitor={openReliability}
-                    extraNotes={{ browser: "Same switch as Settings › Include browser caches" }}
-                    recycleAge={{
-                      value: recycleAge,
-                      onChange: onRecycleAge,
-                      disabled: savingAge || scanner.phase === "scanning" || engine.running,
-                    }}
-                    details={{
-                      recycleMinAgeDays: scanner.scannedRecycleAge === undefined ? recycleAge : scanner.scannedRecycleAge,
-                      scanStamp: scanner.scanStamp,
-                    }}
-                  />
-                </div>
+                <CategoryList
+                  className={scanner.phase === "scanning" ? "pointer-events-none opacity-60 transition-opacity" : undefined}
+                  categories={categories}
+                  unit={unit}
+                  selected={selection.selected}
+                  onToggle={onToggle}
+                  disabled={scanner.phase === "scanning"}
+                  onOpenReliabilityMonitor={openReliability}
+                  extraNotes={{ browser: "Same switch as Settings › Include browser caches" }}
+                  recycleAge={{
+                    value: recycleAge,
+                    onChange: onRecycleAge,
+                    disabled: savingAge || scanner.phase === "scanning" || engine.running,
+                  }}
+                  details={{
+                    recycleMinAgeDays: scanner.scannedRecycleAge === undefined ? recycleAge : scanner.scannedRecycleAge,
+                    scanStamp: scanner.scanStamp,
+                  }}
+                />
               )}
-            </div>
+            </>
           )}
         </GlassCard>
 
-        <div className="flex flex-col gap-5">
-          <GlassCard title="Session history" icon={<History size={15} />} accent="purple">
+        <div className="flex min-w-0 flex-col gap-(--grid-gap)">
+          <GlassCard>
+            <div className="text-[12.5px] font-medium leading-[17px] text-ink-2">Ready to clean</div>
+            <div className="tnum mt-1 text-[52px] font-semibold leading-[56px] tracking-[-0.035em] text-ink">
+              {scanner.scan ? (
+                <>
+                  {readyAmount}
+                  <small className="ml-[5px] text-[20px] font-medium leading-none tracking-normal text-ink-2">{readyUnit}</small>
+                </>
+              ) : (
+                <span className="text-ink-3" title="Measuring…" aria-label="Measuring">
+                  —
+                </span>
+              )}
+            </div>
+            <div className="tnum mt-0.5 text-callout text-ink-2">
+              {scanner.scan
+                ? `${selectedCats.length} of ${availableCount} categories · ${fmtFiles(selection.selectedFiles)}${measuredClock ? ` · measured ${measuredClock}` : ""}`
+                : "Measuring…"}
+            </div>
+            {head.more && (
+              <div className="tnum mt-0.5 text-callout text-ink-3" title="Sum of the categories that need administrator rights">
+                {head.more} more as administrator
+              </div>
+            )}
+
+            <ul className="tnum my-3.5 border-t border-divider">
+              {selectedCats.map((c) => (
+                <li key={c.id} className="flex h-[30px] items-center justify-between gap-3 border-b border-divider">
+                  <span className="min-w-0 truncate">{c.label}</span>
+                  <span className="shrink-0 font-medium">{fmtIn(c.bytes, head.unit)}</span>
+                </li>
+              ))}
+              {selectedCats.length === 0 && (
+                <li className="flex h-[30px] items-center border-b border-divider text-ink-2">
+                  {scanner.scan ? "Nothing is selected." : "Measuring reclaimable caches…"}
+                </li>
+              )}
+            </ul>
+
+            {/* Secondary on purpose: it opens the confirmation, and that dialog owns the only primary (CONTRACT §4.9 rule 1). */}
+            <Button
+              size="lg"
+              className="w-full justify-center"
+              icon={Sparkles}
+              onClick={onCleanClick}
+              disabled={nothingSelected || engine.running || !scanner.scan}
+            >
+              {`Clean ${head.now}${settings.confirmBeforePurge ? "…" : ""}`}
+            </Button>
+            <p className="mt-3 flex gap-2 text-callout text-ink-2">
+              <ShieldCheck size={14} className="mt-px shrink-0 text-ok-icon" aria-hidden="true" />
+              <span>
+                {settings.confirmBeforePurge ? READY_NOTE_CONFIRM : READY_NOTE_DIRECT}{" "}
+                <InkLink onClick={() => setRulesOpen(true)} className="align-baseline">
+                  What is never touched
+                </InkLink>
+              </span>
+            </p>
+          </GlassCard>
+
+          <GlassCard
+            className="flex-1"
+            bodyClassName="flex flex-col"
+            title="History"
+            actions={
+              lastLog ? (
+                <InkLink chevron={false} onClick={openLogFolder} title={dirnameOf(lastLog)}>
+                  Open log folder
+                </InkLink>
+              ) : undefined
+            }
+            footer={
+              <>
+                <span>Freed this session</span>
+                <b className="tnum font-semibold text-ink">{fmtBytes(sessionFreed, 2)}</b>
+              </>
+            }
+          >
             {engine.history.length === 0 ? (
-              <div className="py-6 text-center text-[12px] text-muted">No cleanups yet this session.</div>
+              <p className="border-t border-divider py-3 text-callout text-ink-2">No cleanups yet this session.</p>
             ) : (
-              <ul className="nx-scroll flex max-h-[320px] flex-col gap-2 overflow-y-auto pr-1">
+              <ul className="tnum max-h-[300px] min-h-0 flex-1 overflow-y-auto">
                 {engine.history.map((h) => (
-                  <li key={h.id} className="rounded-lg border border-line bg-white/[0.02] px-3 py-2.5">
-                    <div className="flex items-baseline justify-between gap-2">
-                      <span className="font-mono text-[15px] font-semibold text-ink">{fmtBytes(h.result.freedBytes)}</span>
-                      <span className="font-mono text-[10.5px] text-muted">
-                        {fmtTime(h.at)} · {fmtDuration(h.result.durationMs)}
-                      </span>
-                    </div>
-                    <div className="mt-0.5 flex items-center justify-between gap-2 text-[11px] text-muted">
-                      <span className="truncate" title={h.categories.join(", ")}>
-                        {h.source} · {h.categories.length} {h.categories.length === 1 ? "category" : "categories"}
-                      </span>
-                      <span className="shrink-0 font-mono">
-                        {h.result.filesDeleted.toLocaleString("en-US")} deleted · {h.result.filesSkipped.toLocaleString("en-US")} skipped
-                      </span>
-                    </div>
+                  <li key={h.id} className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-0.5 border-t border-divider py-[9px]">
+                    <b className="font-medium">
+                      {fmtClock(h.at)} <span className="font-normal text-ink-3">· {h.source}</span>
+                    </b>
+                    <em className="text-right font-semibold not-italic">{fmtBytes(h.result.freedBytes, 2)}</em>
+                    <span className="truncate text-callout text-ink-2" title={h.categories.join(", ")}>
+                      {h.categories.join(", ")}
+                    </span>
+                    <span
+                      className="text-right text-callout text-ink-3"
+                      title={`${h.result.filesSkipped.toLocaleString("en-US")} skipped · took ${fmtDuration(h.result.durationMs)}`}
+                    >
+                      {fmtFiles(h.result.filesDeleted)}
+                    </span>
                   </li>
                 ))}
               </ul>
             )}
           </GlassCard>
-
-          <GlassCard title="Safety rules" icon={<ShieldCheck size={15} />} accent="teal">
-            <p className="text-[12px] leading-relaxed text-muted">
-              Nexum deletes only <span className="text-silver">inside</span> the listed cache folders, measures and cleans with the
-              same rules, and handles every file individually. These locations are never touched:
-            </p>
-            <ul className="mt-3 flex flex-col gap-1.5">
-              {PROTECTED.map((p) => (
-                <li key={p} className="flex items-start gap-2 text-[11.5px] text-silver">
-                  <Lock size={11} className="mt-[3px] shrink-0 text-teal" />
-                  <span className="font-mono text-[11px] leading-snug">{p}</span>
-                </li>
-              ))}
-            </ul>
-            <ul className="mt-3 flex flex-col gap-1 border-t border-line pt-3">
-              {RULES.map((r) => (
-                <li key={r} className="text-[11px] leading-snug text-muted">
-                  {r}
-                </li>
-              ))}
-            </ul>
-          </GlassCard>
         </div>
       </div>
 
-      {/* Sticky "Ready to clean" footer (MF-10): the action never sits below the fold. */}
-      {showFooter && (
-        <div className="sticky bottom-0 z-20 -mx-1 mt-1">
-          {/* glass-strong: near-opaque, so the scrolled list does not show through the footer text. */}
-          <div className="glass-strong flex flex-wrap items-center justify-between gap-4 border border-teal/25 px-5 py-3 shadow-[0_-12px_32px_rgba(0,0,0,0.55)]">
-            <div className="min-w-0">
-              <div className="text-[10.5px] uppercase tracking-[0.18em] text-muted">Ready to clean</div>
-              <div className="flex flex-wrap items-baseline gap-x-3">
-                <span className="font-mono text-[24px] font-semibold leading-tight text-ink">{scanner.scan ? head.now : "…"}</span>
-                {head.more && <span className="font-mono text-[12px] text-silver">now · {head.more} more as administrator</span>}
-              </div>
-              <div className="text-[11px] text-muted">
-                {selectedCats.length} {selectedCats.length === 1 ? "category" : "categories"}
-                {settings.confirmBeforePurge ? " · asks before deleting" : ""}
-              </div>
-            </div>
-            <Button
-              variant="teal"
-              icon={<Sparkles size={16} />}
-              onClick={onCleanClick}
-              disabled={nothingSelected || engine.running || !scanner.scan}
-            >
-              {`Clean ${head.now}`}
-            </Button>
-          </div>
-        </div>
-      )}
-
+      {/* Confirmation (SPEC §18): the app icon, the summary well and the only primary button of the screen. */}
       <Modal
         open={confirmOpen}
         onClose={() => setConfirmOpen(false)}
-        title="Clean the selected caches?"
-        subtitle="The selected files are deleted permanently. Files in use are skipped."
-        icon={<Sparkles size={17} />}
-        width={460}
+        variant="alert"
+        title={`Clean ${head.now} of cache files?`}
+        subtitle={CONFIRM_BODY}
         footer={
-          <div className="flex justify-end gap-2">
-            <Button variant="ghost" onClick={() => setConfirmOpen(false)}>
+          <>
+            <Button onClick={() => setConfirmOpen(false)} data-autofocus>
               Cancel
             </Button>
-            <Button variant="teal" icon={<Sparkles size={15} />} onClick={runClean}>
+            <Button variant="primary" onClick={runClean}>
               {`Clean ${head.now}`}
             </Button>
-          </div>
+          </>
         }
       >
-        <ul className="flex flex-col gap-1 text-[12.5px]">
-          {selectedCats.map((c) => (
-            <li key={c.id} className="flex items-center justify-between gap-3">
-              <span className="text-silver">{c.label}</span>
-              <span className="font-mono text-ink">{fmtIn(c.bytes, head.unit)}</span>
+        <SelectionWell categories={selectedCats} unit={head.unit} totalFiles={selection.selectedFiles} totalBytes={selection.selectedBytes} />
+        <p className="mt-3 flex gap-2 text-callout text-ink-2">
+          <ShieldCheck size={14} className="mt-px shrink-0 text-ok-icon" aria-hidden="true" />
+          {CONFIRM_REASSURANCE}
+        </p>
+      </Modal>
+
+      {/* The rules of CONTRACT §3, one click away from the button they protect. */}
+      <Modal
+        open={rulesOpen}
+        onClose={() => setRulesOpen(false)}
+        title="What is never touched"
+        subtitle="The same rules apply to measuring and to cleaning"
+        icon={ShieldCheck}
+        width={560}
+        footer={<Button onClick={() => setRulesOpen(false)}>Close</Button>}
+      >
+        <p className="text-body text-ink-2">
+          Nexum deletes only inside the listed cache folders and handles every file individually. These locations are never touched:
+        </p>
+        <ul className="mt-2.5 rounded-lg bg-inset px-3 py-1">
+          {PROTECTED_PATHS.map((p) => (
+            <li key={p} className="flex items-start gap-2 border-b border-divider py-1.5 last:border-b-0">
+              <Lock size={12} className="mt-0.5 shrink-0 text-ink-3" aria-hidden="true" />
+              <span className="font-mono text-[11.5px] leading-4 text-ink">{p}</span>
+            </li>
+          ))}
+        </ul>
+        <ul className="mt-3 flex flex-col gap-1">
+          {CLEANUP_RULES.map((r) => (
+            <li key={r} className="text-callout text-ink-2">
+              {r}
             </li>
           ))}
         </ul>

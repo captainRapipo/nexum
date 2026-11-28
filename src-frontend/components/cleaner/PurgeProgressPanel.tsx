@@ -1,14 +1,16 @@
 import { useEffect, useState } from "react";
-import { Check, Loader2, Sparkles } from "lucide-react";
+import { Loader2 } from "lucide-react";
 import { cn, fmtBytes } from "../../lib/format";
+import { StatusIcon } from "../ui";
 import LedProgress from "./LedProgress";
+import { splitAmount } from "./cleanerCopy";
 import { fmtDuration, type PurgeEngineState } from "./purgeEngine";
 
 /**
- * Live cleanup progress: step x/y, current category, running freed bytes, LED bar and a
- * per-category checklist driven by `purge-progress` events.
+ * Live cleanup progress: the running total, step x of y with the current category, a 4 px bar and
+ * a per-category checklist driven by `purge-progress` events.
  */
-export default function PurgeProgressPanel({ engine }: { engine: PurgeEngineState }) {
+export default function PurgeProgressPanel({ engine, compact = false }: { engine: PurgeEngineState; compact?: boolean }) {
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     if (!engine.running) return;
@@ -24,25 +26,21 @@ export default function PurgeProgressPanel({ engine }: { engine: PurgeEngineStat
   const pct = p ? Math.min(100, ((doneCount + inFlight) / total) * 100) : null;
   const elapsed = engine.startedAt ? now - engine.startedAt : 0;
   const currentId = p?.categoryId ?? null;
-
-  const checklist = engine.plan;
+  const [amount, unit] = splitAmount(fmtBytes(engine.freedSoFar, 2));
 
   return (
-    <div className="flex flex-col gap-6 py-2">
-      <div className="flex flex-col items-center text-center">
-        <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.24em] text-teal">
-          <Sparkles size={13} className="animate-pulse" />
-          Cleaning caches
+    <div className={cn("flex flex-col", compact ? "gap-3.5 py-1" : "gap-5 px-(--card-pad-x) pb-(--card-pad-y) pt-2")}>
+      <div>
+        <div className="text-[12.5px] font-medium leading-[17px] text-ink-2">Freed so far</div>
+        <div className={cn("tnum mt-1 font-semibold text-ink", compact ? "text-display" : "text-[52px] leading-[56px] tracking-[-0.035em]")}>
+          {amount}
+          <small className={cn("ml-[5px] font-medium leading-none tracking-normal text-ink-2", compact ? "text-[16px]" : "text-[20px]")}>{unit}</small>
         </div>
-        <div className="mt-3 font-mono text-[44px] font-semibold leading-none text-ink tabular-nums">
-          {fmtBytes(engine.freedSoFar, 2)}
-        </div>
-        <div className="mt-1.5 text-[12px] text-muted">freed so far</div>
       </div>
 
       <div>
-        <div className="mb-2 flex items-center justify-between text-[12px]">
-          <span className="truncate text-silver">
+        <div className="mb-2 flex items-baseline justify-between gap-3 text-callout">
+          <span className="min-w-0 truncate text-ink-2">
             {p ? (
               <>
                 Cleaning <span className="font-semibold text-ink">{p.label}</span>
@@ -51,47 +49,36 @@ export default function PurgeProgressPanel({ engine }: { engine: PurgeEngineStat
               "Preparing…"
             )}
           </span>
-          <span className="shrink-0 font-mono text-muted">
-            {p ? `Step ${step}/${total}` : `0/${total}`} · {fmtDuration(elapsed)}
+          <span className="tnum shrink-0 text-ink-3">
+            {p ? `Step ${step} of ${total}` : `0 of ${total}`} · {fmtDuration(elapsed)}
           </span>
         </div>
-        <LedProgress value={pct} segments={40} tone="teal" height={12} />
+        <LedProgress value={pct} label="Cleanup progress" />
       </div>
 
-      <ul className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
-        {checklist.map((c) => {
+      <ul className={cn("grid gap-x-6", compact ? "grid-cols-1" : "grid-cols-2")}>
+        {engine.plan.map((c) => {
           const done = engine.completed.includes(c.id);
           const active = !done && c.id === currentId && engine.running;
           return (
-            <li
-              key={c.id}
-              className={cn(
-                "flex items-center gap-2 rounded-lg border px-3 py-2 text-[12px] transition-colors",
-                active
-                  ? "border-teal/45 bg-teal/[0.07] text-ink"
-                  : done
-                    ? "border-teal/30 bg-teal/[0.05] text-silver"
-                    : "border-line text-muted",
-              )}
-            >
-              <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+            <li key={c.id} className="flex h-7 items-center gap-2 border-b border-divider text-body">
+              <span className="flex size-4 shrink-0 items-center justify-center">
                 {active ? (
-                  <Loader2 size={14} className="animate-spin text-teal" />
+                  <Loader2 size={14} className="animate-spin text-ink-2" aria-hidden="true" />
                 ) : done ? (
-                  <Check size={14} className="text-teal" />
+                  <StatusIcon tone="ok" size={14} />
                 ) : (
-                  <span className="h-1.5 w-1.5 rounded-full bg-white/20" />
+                  <span aria-hidden="true" className="size-1.5 rounded-full bg-control-border" />
                 )}
               </span>
-              <span className="truncate">{c.label}</span>
+              <span className={cn("min-w-0 flex-1 truncate", active ? "font-medium text-ink" : done ? "text-ink" : "text-ink-2")}>{c.label}</span>
+              <span className="shrink-0 text-callout text-ink-3">{active ? "Cleaning" : done ? "Done" : "Waiting"}</span>
             </li>
           );
         })}
       </ul>
 
-      <p className="text-center text-[11px] text-muted">
-        Files in use are skipped, never forced. Protected system paths are never touched.
-      </p>
+      <p className="text-callout text-ink-3">Files in use are skipped, never forced. Protected system paths are never touched.</p>
     </div>
   );
 }

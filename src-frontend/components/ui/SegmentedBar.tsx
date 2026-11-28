@@ -1,35 +1,30 @@
 import { clamp, cn } from "../../lib/format";
-import { TONE_CLASS, toneForLevel, type Tone } from "./tones";
+import type { Tone } from "./tones";
+
+// CONTRACT §4.7 / docs/design/SPEC.md (meters): the 1.1 LED bar is now a plain meter.
 
 export interface SegmentedBarProps {
   /** 0–100 */
   value: number;
-  segments?: number;
-  /** Fixed tone, or "auto" (teal → gold ≥75 → rose ≥90 by value). Default "auto". */
-  tone?: Tone | "auto";
-  /** Colour each lit segment by its own position (classic LED meter). */
-  zoned?: boolean;
-  /** Bar height in px. Default 10. */
+  /**
+   * "warn" = amber fill (a worn drive, a nearly full volume). Every other value is graphite:
+   * the legacy accent tones and "auto" no longer colour the bar.
+   */
+  tone?: Tone | "auto" | "warn";
+  /** Bar height in px. Default 6. */
   height?: number;
   className?: string;
+  /** Accessible name. */
   label?: string;
+  /** Ignored since 1.2 (the bar is continuous). Kept so call sites compile. */
+  segments?: number;
+  /** Ignored since 1.2. Kept so call sites compile. */
+  zoned?: boolean;
 }
 
-/** Segmented LED progress bar. */
-export function SegmentedBar({
-  value,
-  segments = 24,
-  tone = "auto",
-  zoned = false,
-  height = 10,
-  className,
-  label,
-}: SegmentedBarProps) {
-  const v = clamp(value, 0, 100);
-  const count = Math.max(1, Math.round(segments));
-  const lit = Math.round((v / 100) * count);
-  const baseTone: Tone = tone === "auto" ? toneForLevel(v) : tone;
-
+/** A plain meter: neutral track, graphite fill. (1.1 name; also exported as `Meter`.) */
+export function SegmentedBar({ value, tone = "auto", height = 6, className, label }: SegmentedBarProps) {
+  const v = clamp(Number.isFinite(value) ? value : 0, 0, 100);
   return (
     <div
       role="progressbar"
@@ -37,25 +32,14 @@ export function SegmentedBar({
       aria-valuemax={100}
       aria-valuenow={Math.round(v)}
       aria-label={label}
-      className={cn("flex w-full gap-[3px]", className)}
+      className={cn("w-full overflow-hidden rounded-[3px] bg-meter-track", className)}
       style={{ height }}
     >
-      {Array.from({ length: count }, (_, i) => {
-        const on = i < lit;
-        const segTone: Tone = zoned ? toneForLevel(((i + 1) / count) * 100) : baseTone;
-        return (
-          <span
-            key={i}
-            className={cn(
-              "min-w-0 flex-1 rounded-[2px] transition-[background-color,box-shadow,opacity] duration-300",
-              on ? TONE_CLASS[segTone].led : "bg-white/[0.06]",
-              on && i === lit - 1 && "brightness-125",
-            )}
-          />
-        );
-      })}
+      <div className={cn("h-full rounded-[3px]", tone === "warn" ? "bg-meter-warn" : "bg-meter-fill")} style={{ width: `${v}%` }} />
     </div>
   );
 }
+
+export const Meter = SegmentedBar;
 
 export default SegmentedBar;

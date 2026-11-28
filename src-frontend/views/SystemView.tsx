@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { ClipboardCopy, Info, Loader2, RefreshCw } from "lucide-react";
+import { Copy, Info, Loader2, RefreshCw } from "lucide-react";
 import type { UnavailableReason } from "../types";
 import { fmtClock } from "../lib/format";
 import { resolveUnavailable } from "../lib/status";
@@ -7,10 +7,12 @@ import { useSystemSpec } from "../hooks/useSystemSpec";
 import { useSystemInfo } from "../hooks/useSystemInfo";
 import { useSettings } from "../hooks/useSettings";
 import { useTelemetry } from "../hooks/useTelemetryStream";
-import { Button } from "../components/ui/Button";
+import GlassCard from "../components/layout/GlassCard";
+import { PageHeader, usePageChrome } from "../components/layout/PageChrome";
+import { Button } from "../components/ui";
 import { toast } from "../components/feedback/Toast";
-import { copyText } from "../components/sensors/copyText";
-import { SpecTabs, panelDomId, tabDomId } from "../components/system/SpecTabs";
+import { copyText } from "../components/system/clipboard";
+import { SpecTabs, panelDomId } from "../components/system/SpecTabs";
 import { SaveReportMenu } from "../components/system/SaveReportMenu";
 import {
   BoardPanel,
@@ -25,6 +27,18 @@ import { buildSpecText, SPEC_TABS, type RowCtx, type SpecTabId } from "../compon
 
 const TAB_STORE = "nexum.system.tab";
 
+const DESCRIPTION = "Processor, mainboard, memory, graphics and Windows. Read once and kept until you refresh.";
+
+/** Toolbar subtitle: the selected tab's name (CONTRACT §4.6.1). */
+const TAB_NAME: Record<SpecTabId, string> = {
+  cpu: "Processor",
+  board: "Mainboard",
+  memory: "Memory",
+  spd: "Memory modules (SPD)",
+  graphics: "Graphics",
+  os: "Windows and security",
+};
+
 function loadTab(): SpecTabId {
   try {
     const v = localStorage.getItem(TAB_STORE);
@@ -36,9 +50,10 @@ function loadTab(): SpecTabId {
 }
 
 /**
- * System (F3): CPU-Z style spec sheet (CONTRACT §1.4, §1.4.1, §2.6, §4.10, §4.10.2): memory timings with
- * their source, SPD JEDEC timings, FCLK/UCLK/MEMCLK, PCIe links, "Copy as text" and "Save report".
- * F5 (handled by App) and the Refresh button re-query with refresh:true.
+ * System (F3): the spec sheet (CONTRACT §1.4, §1.4.1, §2.6, §4.10, §4.10.2, §4.10.3): one hero card
+ * per tab, then key-value rows and dense tables; memory timings with their source, SPD JEDEC timings,
+ * FCLK / UCLK / MEMCLK, PCIe links, "Copy as text" and "Save report". F5 (handled by App) re-reads
+ * the details.
  */
 export default function SystemView() {
   const { spec, loading, error, refresh } = useSystemSpec();
@@ -59,7 +74,9 @@ export default function SystemView() {
     }
   }, [tab]);
 
-  // Reason for a whole agent-owned section being null.
+  usePageChrome({ subtitle: TAB_NAME[tab] });
+
+  // Reason for a whole section being null.
   const sectionReason: UnavailableReason = agent ? resolveUnavailable(agent, "none") : "agentOffline";
   const ctx: RowCtx = useMemo(
     () => ({
@@ -97,40 +114,34 @@ export default function SystemView() {
 
   const busy = loading || refreshing;
 
-  const offlineDetail =
-    sectionReason === "agentOffline"
-      ? "These details come from the hardware agent, which is not running."
-      : "The hardware agent did not return these details.";
+  const missingDetail =
+    sectionReason === "agentOffline" ? "These details are not available right now." : "This PC did not report these details.";
 
   let panel: ReactNode = null;
   if (spec) {
     switch (tab) {
       case "cpu":
-        panel = spec.cpu ? (
-          <CpuPanel cpu={spec.cpu} ctx={ctx} />
-        ) : (
-          <SectionUnavailable title="Processor" reason={sectionReason} detail={offlineDetail} />
-        );
+        panel = spec.cpu ? <CpuPanel cpu={spec.cpu} ctx={ctx} /> : <SectionUnavailable title="Processor" reason={sectionReason} detail={missingDetail} />;
         break;
       case "board":
         panel = spec.board ? (
           <BoardPanel board={spec.board} ctx={ctx} />
         ) : (
-          <SectionUnavailable title="Motherboard" reason={sectionReason} detail={offlineDetail} />
+          <SectionUnavailable title="Motherboard" reason={sectionReason} detail={missingDetail} />
         );
         break;
       case "memory":
         panel = spec.memory ? (
           <MemoryPanel memory={spec.memory} ctx={ctx} onOpenSlot={openSlot} />
         ) : (
-          <SectionUnavailable title="Memory" reason={sectionReason} detail={offlineDetail} />
+          <SectionUnavailable title="Memory" reason={sectionReason} detail={missingDetail} />
         );
         break;
       case "spd":
         panel = spec.memory ? (
           <SpdPanel memory={spec.memory} ctx={ctx} slot={slot} onSlot={setSlot} />
         ) : (
-          <SectionUnavailable title="Memory modules" reason={sectionReason} detail={offlineDetail} />
+          <SectionUnavailable title="Memory modules" reason={sectionReason} detail={missingDetail} />
         );
         break;
       case "graphics":
@@ -138,84 +149,63 @@ export default function SystemView() {
           spec.gpus.length > 0 ? (
             <GraphicsPanel gpus={spec.gpus} ctx={ctx} />
           ) : (
-            <SectionUnavailable title="Graphics" reason={sectionReason} detail={offlineDetail} />
+            <SectionUnavailable title="Graphics" reason={sectionReason} detail={missingDetail} />
           );
         break;
       case "os":
-        panel = (
-          <OsPanel os={spec.os} security={spec.security} ctx={ctx} diskLinks={spec.diskLinks ?? []} disks={disks} />
-        );
+        panel = <OsPanel os={spec.os} security={spec.security} ctx={ctx} diskLinks={spec.diskLinks ?? []} disks={disks} />;
         break;
     }
   }
 
   return (
-    <div className="flex flex-col gap-4">
-      {/* Header */}
-      <div className="flex flex-wrap items-end justify-between gap-x-6 gap-y-3">
-        <div className="min-w-0">
-          <div className="text-[10.5px] uppercase tracking-[0.22em] text-gold/80">F3 · System details</div>
-          <h1 className="mt-1 text-[22px] font-semibold tracking-tight text-ink">System</h1>
-          <p className="mt-0.5 text-[12.5px] text-muted">
-            Processor, mainboard, memory timings, graphics, storage links and Windows, read once and kept until you refresh.
-          </p>
-        </div>
+    <div className="flex min-h-full flex-1 flex-col">
+      <PageHeader view="system" description={DESCRIPTION} />
+
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+        <SpecTabs value={tab} onChange={setTab} />
         <div className="flex items-center gap-2">
           {spec && (
-            <span className="mr-1 text-[11.5px] text-slate-500">
-              Read at <span className="num text-slate-300">{fmtClock(spec.capturedTs, false)}</span>
+            <span className="tnum mr-1 whitespace-nowrap text-callout text-ink-3" title="Press F5 to read the details again.">
+              Read at {fmtClock(spec.capturedTs, false)}
             </span>
           )}
-          <Button
-            size="sm"
-            variant="ghost"
-            icon={<RefreshCw size={14} className={busy ? "animate-spin" : undefined} aria-hidden="true" />}
-            onClick={() => void doRefresh()}
-            disabled={busy}
-            title="Read the details again (F5)"
-          >
-            Refresh
-          </Button>
           <SaveReportMenu disabled={!spec} />
-          <Button size="sm" variant="teal" icon={ClipboardCopy} onClick={() => void copyAll()} disabled={!spec} title="Copy every tab as plain text">
+          <Button icon={Copy} onClick={() => void copyAll()} disabled={!spec} title="Copy every tab as plain text">
             Copy as text
           </Button>
         </div>
       </div>
 
-      <SpecTabs value={tab} onChange={setTab} />
-
-      <div
-        role="tabpanel"
-        id={panelDomId(tab)}
-        aria-labelledby={tabDomId(tab)}
-        tabIndex={-1}
-        className="min-w-0 outline-none"
-      >
+      <div role="region" id={panelDomId(tab)} aria-label={TAB_NAME[tab]} className="min-w-0">
         {panel ??
           (spec == null && loading ? (
-            <div className="flex items-center gap-2 py-16 text-[12.5px] text-muted">
-              <Loader2 size={14} className="animate-spin text-teal" aria-hidden="true" />
-              Reading hardware details…
-            </div>
+            <GlassCard>
+              <div className="flex items-center gap-2 py-10 text-body text-ink-2">
+                <Loader2 size={14} className="animate-spin" aria-hidden="true" />
+                Reading hardware details…
+              </div>
+            </GlassCard>
           ) : (
-            <div className="flex flex-col items-start gap-3 py-12">
-              <p className="text-[13px] text-slate-300">{error ? `Could not read system details: ${error}` : "No system details yet."}</p>
-              <Button size="sm" variant="ghost" icon={RefreshCw} onClick={() => void doRefresh()} loading={busy}>
-                Try again
-              </Button>
-            </div>
+            <GlassCard>
+              <div className="flex flex-col items-start gap-3 py-6">
+                <p className="text-body text-ink">{error ? `Could not read system details: ${error}` : "No system details yet."}</p>
+                <Button size="sm" icon={RefreshCw} onClick={() => void doRefresh()} loading={busy}>
+                  Try again
+                </Button>
+              </div>
+            </GlassCard>
           ))}
       </div>
 
       {spec && spec.errors.length > 0 && (
-        <div className="flex items-start gap-2 rounded-lg border border-line bg-white/[0.02] px-3 py-2.5 text-[11.5px] text-slate-500">
-          <Info size={13} className="mt-[1px] shrink-0" aria-hidden="true" />
-          <div>
-            <span className="text-slate-400">Some details could not be read: </span>
+        <p className="mt-4 flex items-start gap-2 text-callout text-ink-2">
+          <Info size={14} className="mt-px shrink-0 text-ink-3" aria-hidden="true" />
+          <span>
+            <span className="font-medium text-ink">Some details could not be read: </span>
             {spec.errors.join(" · ")}
-          </div>
-        </div>
+          </span>
+        </p>
       )}
     </div>
   );

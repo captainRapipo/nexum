@@ -166,7 +166,9 @@ export function FramesProvider({ children }: { children: ReactNode }) {
       if (isObj(t) && typeof t.reason === "string") applyTarget(t);
     });
     const offStatus = subscribe<AgentStatus>(EVENTS.agentStatus, (s) => {
-      if (isObj(s) && s.running === false) reset();
+      // [CHANGED 1.2] Any phase other than "running" means the capture process is gone or being replaced
+      // (after restart_agent Rust reports phase "starting" with running:true, CONTRACT §2.3.1).
+      if (isObj(s) && (s.running === false || (typeof s.phase === "string" && s.phase !== "running"))) reset();
     });
     loadState();
     return () => {

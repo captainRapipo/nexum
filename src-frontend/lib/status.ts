@@ -1,13 +1,19 @@
 // One function per domain produces label AND tone together (ROADMAP §6.1, CONTRACT §4.5 lib/status.ts),
 // plus the frontend health derivation (MF-6, CONTRACT §5). [CHANGED 1.1] Drive, temperature and
 // free-space conditions are evaluated by Rust (alerts.rs) and arrive as a HealthAlertsSnapshot; this
-// file keeps only the frontend-owned rules (fan fail-safe, agent offline, fan override, limited mode,
-// drive health unknown) and merges the two (CONTRACT §5.0).
+// file keeps only the frontend-owned rules (fan fail-safe, sensors unavailable, fan override, limited
+// mode, drive health unknown) and merges the two (CONTRACT §5.0).
+// [CHANGED 1.2] No text here names the sensor service: while it works or restarts the UI says
+// nothing (level "checking", values "—"); only phase "failed" produces rule 2 (CONTRACT §4.8.1, §5).
 
 import { AlertTriangle, CheckCircle2, Lock, OctagonAlert, type LucideIcon } from "lucide-react";
 import {
   DEFAULT_ALERT_SETTINGS,
   HEALTH_THRESHOLDS as T,
+  SENSORS_DOWN_REASON,
+  SENSORS_DOWN_SHORT,
+  SENSORS_DOWN_TITLE,
+  SENSORS_RETRY_LABEL,
   type AgentStatus,
   type DiskTelemetry,
   type DriveHealth,
@@ -26,7 +32,7 @@ import {
   type UnavailableReason,
   type Volume,
 } from "../types";
-import type { StatusTone } from "../components/ui/tones";
+import type { StatusPillTone, StatusTone } from "../components/ui/tones";
 import { api, PAWNIO_URL } from "./api";
 import { alertToCondition } from "./alerts";
 import { driveDisplayName, joinDisks } from "./disks";
@@ -70,25 +76,56 @@ export function alertState(sev: HealthSeverity): StatusTone {
   return sev === "crit" ? "crit" : sev === "warn" ? "warn" : "info";
 }
 
-/** Pill tone for an overall health level (CONTRACT §5.3). [CHANGED 1.1] "checking" → unknown. */
-export function healthLevelTone(level: SystemHealthLevel): StatusTone {
+/** Pill tone for an overall health level (CONTRACT §5.3). [CHANGED 1.2] "checking" → the neutral "checking" tone. */
+export function healthLevelTone(level: SystemHealthLevel): StatusPillTone {
   switch (level) {
     case "critical":
       return "crit";
     case "attention":
       return "warn";
     case "partial":
-    case "checking":
       return "unknown";
+    case "checking":
+      return "checking";
     case "optimal":
     default:
       return "ok";
   }
 }
 
-/** Why a value is null, for <Unavailable reason=…/> (CONTRACT §4.5). */
+/**
+ * [NEW 1.2] True while sensor reading is up: the service runs and has said hello (phase "running").
+ * A core that predates 1.2 sends no phase; normalizeAgentStatus() fills it from `running`.
+ */
+export function sensorsUp(agent: AgentStatus | null | undefined): boolean {
+  return !!agent && agent.running && (agent.phase == null || agent.phase === "running");
+}
+
+/** [NEW 1.2] True only when Rust gave up restarting sensor reading: the one state the UI reports (CONTRACT §4.8.1). */
+export function sensorsFailed(agent: AgentStatus | null | undefined): boolean {
+  return agent?.phase === "failed";
+}
+
+/**
+ * [NEW 1.2] True while the app-level limited-mode bar is on screen (CONTRACT §5.4): sensors are up, some
+ * are out of reach, and the user has not chosen "no kernel driver" for a PawnIO-only cause. The Health
+ * card uses it to show that condition as one line instead of repeating the bar's text and button.
+ */
+export function limitedBannerShown(agent: AgentStatus | null | undefined, sensorDriverChoice: string | null | undefined): boolean {
+  if (!agent || !sensorsUp(agent)) return false;
+  const reasons = agent.limitedReasons ?? [];
+  const notElevated = reasons.includes("notElevated") || !agent.isAdmin;
+  if (!notElevated && reasons.length === 0) return false;
+  return notElevated || sensorDriverChoice !== "none";
+}
+
+/**
+ * Why a value is null, for <Unavailable reason=…/> (CONTRACT §4.5). "agentOffline" is the internal id of
+ * "Not available right now": sensor reading is starting, restarting or down. [CHANGED 1.2] It also covers
+ * phase "starting" (spawned, nothing read yet), where Rust already reports `running: true`.
+ */
 export function resolveUnavailable(agent: AgentStatus | null | undefined, need: FeatureNeed): UnavailableReason {
-  if (!agent || !agent.running) return "agentOffline";
+  if (!sensorsUp(agent) || !agent) return "agentOffline";
   if (need === "none") return "unsupported";
   const reasons = agent.limitedReasons ?? [];
   if (reasons.includes("notElevated")) return "notElevated";
@@ -123,7 +160,7 @@ export type FeatureKey = keyof typeof FEATURE_NEEDS;
 /* ------------------------------------------------------------------ */
 
 /**
- * Low-space colours for StorageGauge / VolumeList, from the same setting Rust's `space` rule uses:
+ * Low-space colours for VolumeList, from the same setting Rust's `space` rule uses:
  * warn below `freeSpacePct`, critical below `max(1, floor(freeSpacePct / 2))`.
  */
 export function spaceThresholds(s: Pick<Settings, "alerts"> | null | undefined): { warnPct: number; critPct: number } {
@@ -154,7 +191,7 @@ export interface DeriveHealthInput {
 /** Frontend-owned rule texts (shown on the pill hover and in the empty Health alerts card). */
 export const HEALTH_RULES = {
   failsafe: "Critical while Nexum's fan control was interrupted and fans may not be under BIOS control",
-  offline: "Attention when the hardware agent sends no data for 5 seconds (or 3 poll intervals)",
+  offline: "Attention when Nexum cannot read sensors and restarting sensor reading did not help",
   fanOverride: "Attention while fans are held at 100% because the CPU or GPU reached its limit or a temperature sensor stopped reporting",
   limited: "Partial sensors while Nexum runs without administrator rights or without the PawnIO driver",
   driveUnknown: "Partial sensors while a drive does not report wear data",
@@ -238,6 +275,10 @@ export function deriveHealth(input: DeriveHealthInput): SystemHealth {
   // (agent-status is not re-emitted for every packet).
   const lastTs = Math.max(agent?.lastPacketTs ?? 0, latest?.ts ?? 0);
   const offline = !agent || !agent.running || latest == null || now - lastTs > staleMs;
+  // [NEW 1.2] §5.1: only "failed" is a condition. Missing or stale data while the sensor service is
+  // starting or being restarted produces no message: values render "—" and the level is "checking".
+  const failed = sensorsFailed(agent);
+  const sensorsPending = offline && !failed;
 
   const out: Draft[] = [];
   const tele: DiskTelemetry[] = latest?.disks ?? [];
@@ -262,19 +303,21 @@ export function deriveHealth(input: DeriveHealthInput): SystemHealth {
     );
   }
 
-  // 2. Agent offline
-  if (offline) {
+  // 2. Sensors unavailable (internal id "agent-offline", unchanged). [CHANGED 1.2] Only after Rust's
+  // automatic restarts gave up; the app-level banner shows the same title, reason and action.
+  if (failed) {
+    const reason = agent?.failReason ? SENSORS_DOWN_REASON[agent.failReason] : undefined;
     out.push(
       cond(2, {
         id: "agent-offline",
         severity: "warn",
         source: "agent",
         group: "agent-offline",
-        short: "Agent offline",
-        title: "Hardware agent offline",
-        detail: "Sensor values are not updating. Use Restart agent in Settings.",
+        short: SENSORS_DOWN_SHORT,
+        title: SENSORS_DOWN_TITLE,
+        detail: reason ?? "Sensor values are not updating.",
         rule: HEALTH_RULES.offline,
-        action: null,
+        action: { label: SENSORS_RETRY_LABEL, command: "retrySensors" },
         stateKey: "warn",
       }),
     );
@@ -312,8 +355,8 @@ export function deriveHealth(input: DeriveHealthInput): SystemHealth {
     out.push({ ...alertToCondition(a), order: rustRuleOrder(a.id) });
   }
 
-  // 9. Limited mode. ROADMAP MF-6: Optimal needs an *elevated* agent, so a non-elevated agent counts as
-  // limited even if a core that predates protocol 2 sent no limitedReasons.
+  // 9. Limited mode. ROADMAP MF-6: Optimal needs elevated sensor reading, so a non-elevated one counts
+  // as limited even if a core that predates protocol 2 sent no limitedReasons.
   const reasons = agent?.limitedReasons ?? [];
   if (!offline && agent && (reasons.length > 0 || !agent.isAdmin)) {
     const notElevated = reasons.includes("notElevated") || !agent.isAdmin;
@@ -390,8 +433,9 @@ export function deriveHealth(input: DeriveHealthInput): SystemHealth {
 
   const rules = [...HEALTH_RULE_LIST, ...(alerts?.rules ?? [])];
 
-  // Checking (CONTRACT §5.0): never "Optimal" before Rust has evaluated once.
-  if (conditions.length === 0 && !offline && !alerts?.ready) {
+  // Checking (CONTRACT §5.0): never "Optimal" before Rust has evaluated once, and never while sensor
+  // data is missing or stale (app start, an automatic restart, the moment after "Try again").
+  if (conditions.length === 0 && (!alerts?.ready || sensorsPending)) {
     return { level: "checking", label: "Checking", summary: null, conditions, rules };
   }
 
@@ -450,7 +494,8 @@ export type { HealthSource };
 
 /**
  * `{label, nav}` → requestNavigate(nav); `restartAsAdmin` → api.restartAsAdmin();
- * `getPawnIo` → api.openExternal("https://pawnio.eu/"). Rejects with the backend error.
+ * `getPawnIo` → api.openExternal("https://pawnio.eu/"); [NEW 1.2] `retrySensors` → api.restartAgent().
+ * Rejects with the backend error.
  */
 export async function runHealthAction(action: HealthAction | null | undefined): Promise<void> {
   if (!action) return;
@@ -460,4 +505,5 @@ export async function runHealthAction(action: HealthAction | null | undefined): 
   }
   if (action.command === "restartAsAdmin") await api.restartAsAdmin();
   else if (action.command === "getPawnIo") await api.openExternal(PAWNIO_URL);
+  else if (action.command === "retrySensors") await api.restartAgent();
 }

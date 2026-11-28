@@ -1,15 +1,14 @@
 import { useState } from "react";
-import { Cpu, ExternalLink } from "lucide-react";
+import { ExternalLink } from "lucide-react";
 import { api, errorMessage, PAWNIO_URL } from "../../lib/api";
 import { useSettings } from "../../hooks/useSettings";
 import { useTelemetry } from "../../hooks/useTelemetryStream";
-import { Button } from "../ui/Button";
-import { Modal } from "../ui/Modal";
+import { Button, Modal } from "../ui";
 import { toast } from "./Toast";
 
 /**
  * First-run sensor-driver choice (MF-3, CONTRACT §5.4). Shown once while
- * `sensorDriverChoice === "undecided"` and the agent reports PawnIO missing or outdated.
+ * `sensorDriverChoice === "undecided"` and the sensor report says PawnIO is missing or too old.
  * "No kernel driver" is a first-class choice, not an error.
  */
 export function PawnIoConsent() {
@@ -49,26 +48,26 @@ export function PawnIoConsent() {
       closeOnBackdrop={false}
       title={outdated ? "Update the sensor driver?" : "Use a sensor driver?"}
       subtitle="CPU, motherboard and fan sensors need a kernel driver"
-      icon={Cpu}
       size="md"
       footer={
         <>
           <span className="min-w-0 flex-1" />
-          <Button variant="ghost" onClick={() => void choose("none")} disabled={saving}>
+          <Button onClick={() => void choose("none")} disabled={saving}>
             Continue without kernel driver
           </Button>
-          <Button variant="teal" icon={ExternalLink} onClick={() => void choose("pawnio")} loading={saving}>
+          {/* The dialog's default button: the one primary on screen while it is open. */}
+          <Button variant="primary" icon={ExternalLink} onClick={() => void choose("pawnio")} loading={saving}>
             Get PawnIO
           </Button>
         </>
       }
     >
-      <div className="space-y-3 text-[13px] leading-relaxed text-slate-300">
+      <div className="space-y-3 text-body text-ink">
         <p>
           PawnIO is a vendor-signed kernel driver. Nexum uses it to read CPU temperature, power and clock, motherboard
           temperatures, voltages and fans, and to control fans.
         </p>
-        <ul className="list-disc space-y-1 pl-5 text-slate-400">
+        <ul className="list-disc space-y-1 pl-5 text-ink-2">
           <li>Install it from its official website, pawnio.eu. Nexum never installs or uninstalls it, because other apps may use it.</li>
           <li>
             Nexum needs version {minVersion} or newer.
@@ -76,7 +75,7 @@ export function PawnIoConsent() {
           </li>
           <li>Without it, Nexum still shows GPU, drive, memory and network data, and CPU load.</li>
         </ul>
-        <p className="text-[12px] text-muted">You can change this later in Settings › Sensor driver.</p>
+        <p className="text-callout text-ink-3">You can change this later in Settings, under Sensor driver.</p>
       </div>
     </Modal>
   );

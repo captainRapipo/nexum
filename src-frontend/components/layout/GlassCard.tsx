@@ -1,77 +1,104 @@
 import type { HTMLAttributes, ReactNode } from "react";
 import { cn } from "../../lib/format";
-import { renderIcon, type IconLike } from "../ui/icon";
+import type { IconLike } from "../ui/icon";
 import type { Tone } from "../ui/tones";
+
+// CONTRACT §4.7 / docs/design/SPEC.md §6. Owner: P. The 1.1 name is kept; it is a plain white card now.
 
 export type GlassAccent = Tone;
 
 export interface GlassCardProps extends Omit<HTMLAttributes<HTMLElement>, "title"> {
+  /** Card title, sentence case (15/20 semibold). A node may add a tag or chip after the text. */
   title?: ReactNode;
-  /** Shown next to the title: element or lucide component. */
-  icon?: IconLike;
-  /** Right side of the header (buttons, pills…). */
+  /** Callout line under the title. */
+  subtitle?: ReactNode;
+  /** Right side of the header: ONE of a callout meta, an ink link, a tag or a small button (or a short row of them). */
   actions?: ReactNode;
-  /** Vertical glowing accent line on the left edge. */
+  /** Footer line: top divider, pushed to the bottom, callout text. Ends a card at a summary instead of whitespace. */
+  footer?: ReactNode;
+  /** false = no body padding (the body is a flush table or list; it is clipped to the card's corners). Default true. */
+  padded?: boolean;
+  /** Neutral selected look (1 px ink + 3 px grey ring). Never crimson. */
+  selected?: boolean;
+  /** Ignored since 1.2 (cards have no title icon). Kept so call sites compile. */
+  icon?: IconLike;
+  /** Ignored since 1.2 (cards have no accent bar). Kept so call sites compile. */
   accent?: GlassAccent;
   className?: string;
   bodyClassName?: string;
   children?: ReactNode;
 }
 
-const ACCENT_BAR: Record<GlassAccent, string> = {
-  teal: "bg-teal shadow-[0_0_10px_1px_rgba(45,212,191,0.6)]",
-  gold: "bg-gold shadow-[0_0_10px_1px_rgba(212,163,89,0.6)]",
-  purple: "bg-purple-500 shadow-[0_0_10px_1px_rgba(168,85,247,0.65)]",
-  rose: "bg-rose shadow-[0_0_10px_1px_rgba(225,29,72,0.65)]",
-  cyan: "bg-cyan shadow-[0_0_10px_1px_rgba(34,211,238,0.6)]",
-  silver: "bg-silver shadow-[0_0_10px_1px_rgba(203,213,225,0.45)]",
-};
-
-const ACCENT_ICON: Record<GlassAccent, string> = {
-  teal: "text-teal",
-  gold: "text-gold",
-  purple: "text-purple-400",
-  rose: "text-rose-400",
-  cyan: "text-cyan",
-  silver: "text-silver",
-};
-
-/** Translucent HUD card. Header renders only when title / icon / actions are given. */
+/**
+ * The card: white, radius 14, soft shadow, no border, padding 16 × 20. The header renders only when
+ * a title or actions are given. The body takes the remaining height, so a `footer` always sits at
+ * the bottom edge.
+ */
 export function GlassCard({
   title,
-  icon,
+  subtitle,
   actions,
-  accent,
+  footer,
+  padded = true,
+  selected = false,
+  icon: _icon,
+  accent: _accent,
   className,
   bodyClassName,
   children,
   ...rest
 }: GlassCardProps) {
-  const hasHeader = title != null || icon != null || actions != null;
+  const hasHeader = title != null || actions != null;
+  const plainTitle = typeof title === "string" || typeof title === "number";
   return (
-    <section className={cn("glass relative flex min-w-0 flex-col overflow-hidden", className)} {...rest}>
-      {/* top sheen */}
-      <span
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-x-6 top-0 h-px bg-linear-to-r from-transparent via-white/15 to-transparent"
-      />
-      {accent && (
-        <span aria-hidden="true" className={cn("pointer-events-none absolute bottom-3 left-0 top-3 w-[2px] rounded-full", ACCENT_BAR[accent])} />
+    <section
+      className={cn(
+        "relative flex min-w-0 flex-col rounded-card bg-card forced-colors:border",
+        selected ? "shadow-selected" : "shadow-card",
+        !padded && "overflow-hidden",
+        className,
       )}
+      {...rest}
+    >
       {hasHeader && (
-        <header className="flex min-h-10 shrink-0 items-center gap-2 px-4 pb-1.5 pt-3">
-          {icon != null && (
-            <span className={cn("flex shrink-0 items-center", accent ? ACCENT_ICON[accent] : "text-slate-400")}>
-              {renderIcon(icon, 14)}
-            </span>
+        <header
+          className={cn(
+            "flex min-h-[22px] shrink-0 gap-3 px-(--card-pad-x) pt-(--card-pad-y) pb-3 box-content",
+            subtitle != null ? "items-start" : "items-center",
           )}
-          {title != null && <h3 className="label-caps min-w-0 truncate [--label-color:#94a3b8]">{title}</h3>}
-          {actions != null && <div className="ml-auto flex shrink-0 items-center gap-1.5">{actions}</div>}
+        >
+          <div className="min-w-0 flex-1">
+            {title != null && (
+              <h3 className="flex min-w-0 items-center gap-2 whitespace-nowrap text-title-2 text-ink">
+                {plainTitle ? <span className="truncate">{title}</span> : title}
+              </h3>
+            )}
+            {subtitle != null && <p className="mt-px truncate text-callout text-ink-2">{subtitle}</p>}
+          </div>
+          {actions != null && <div className="flex shrink-0 items-center gap-2 text-callout text-ink-2">{actions}</div>}
         </header>
       )}
-      <div className={cn("min-h-0 flex-1 px-4 pb-4", !hasHeader && "pt-4", bodyClassName)}>{children}</div>
+      <div
+        className={cn(
+          "min-h-0 flex-1",
+          padded && "px-(--card-pad-x)",
+          padded && !hasHeader && "pt-(--card-pad-y)",
+          padded && footer == null && "pb-(--card-pad-y)",
+          bodyClassName,
+        )}
+      >
+        {children}
+      </div>
+      {footer != null && (
+        <footer className="tnum mx-(--card-pad-x) flex shrink-0 items-center justify-between gap-3 whitespace-nowrap border-t border-divider pt-2.5 pb-(--card-pad-y) text-callout text-ink-2">
+          {footer}
+        </footer>
+      )}
     </section>
   );
 }
+
+/** The same component under its 1.2 name. */
+export const Card = GlassCard;
 
 export default GlassCard;

@@ -1,4 +1,5 @@
 import type { DiskTelemetry, DriveHealth } from "../../types";
+import type { StatusTone } from "../ui";
 
 /** Health used when a PhysicalDisk has no telemetry match (CONTRACT §1.1.3 join rule step 3). */
 export const UNMATCHED_HEALTH: DriveHealth = {
@@ -17,20 +18,29 @@ export function needsAttention(h: DriveHealth): boolean {
   return h.state === "attention" || h.state === "replace" || h.state === "failing";
 }
 
-/** `Life 44%`, or null when the drive reports no wear figure. */
-export function lifeText(tele: DiskTelemetry | null | undefined): string | null {
+/** Chip word: the classifier's label, or the single word "Unknown" for the long unknown labels. */
+export function healthWord(h: DriveHealth): string {
+  return h.state === "unknown" ? "Unknown" : h.label || "Unknown";
+}
+
+/** Remaining life 0–100 (rounded), or null when the drive reports no wear figure. */
+export function lifePct(tele: DiskTelemetry | null | undefined): number | null {
   const h = tele?.healthPct;
   if (typeof h !== "number" || !Number.isFinite(h)) return null;
-  return `Life ${Math.round(Math.max(0, Math.min(100, h)))}%`;
+  return Math.round(Math.max(0, Math.min(100, h)));
+}
+
+/** `Life 44%`, or null when the drive reports no wear figure. */
+export function lifeText(tele: DiskTelemetry | null | undefined): string | null {
+  const l = lifePct(tele);
+  return l == null ? null : `Life ${l}%`;
 }
 
 /**
- * "1 of 3 drives needs attention" / "2 of 3 drives need attention". When no drive could be read at all,
- * "0 of 3 need attention" would read as an all-clear, so say that health is unknown instead.
+ * Tone of a life meter: amber only when the classifier says the drive needs attention (worn,
+ * replace soon, failing); graphite otherwise. The tone comes from the classifier, never from the
+ * percentage itself (CONTRACT §1.1.3).
  */
-export function attentionText(n: number, total: number, unknown = 0): string {
-  if (n === 0 && total > 0 && unknown >= total) {
-    return total === 1 ? "Drive health unknown" : `Health unknown for all ${total} drives`;
-  }
-  return `${n} of ${total} ${total === 1 ? "drive" : "drives"} ${n === 1 ? "needs" : "need"} attention`;
+export function lifeMeterTone(tone: StatusTone): "warn" | undefined {
+  return tone === "warn" || tone === "crit" ? "warn" : undefined;
 }

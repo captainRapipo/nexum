@@ -1,6 +1,8 @@
 import { Lock } from "lucide-react";
-import type { UnavailableReason } from "../../types";
+import { NOT_AVAILABLE_TEXT, type UnavailableReason } from "../../types";
 import { cn } from "../../lib/format";
+
+// CONTRACT §4.7, §4.8.1 / docs/design/SPEC.md §22.
 
 /** Exact cause texts (CONTRACT §4.7). */
 export const UNAVAILABLE_TEXT: Record<UnavailableReason, string> = {
@@ -8,7 +10,7 @@ export const UNAVAILABLE_TEXT: Record<UnavailableReason, string> = {
   pawnIoMissing: "Needs PawnIO driver",
   pawnIoOutdated: "PawnIO update needed",
   unsupported: "Not reported by this hardware",
-  agentOffline: "Hardware agent offline",
+  agentOffline: NOT_AVAILABLE_TEXT,
 };
 
 export interface UnavailableProps {
@@ -20,28 +22,37 @@ export interface UnavailableProps {
 
 /**
  * "Unavailable is not zero" (MF-2): use in place of any null value.
- * Em dash + lock icon + one-line cause.
+ * Em dash + 12 px lock + one-line cause, all in tertiary text. In a large value slot (KPI, hero)
+ * draw the "—" yourself at display size and put the full <Unavailable> in the meta line.
  */
 export function Unavailable({ reason, compact = false, className }: UnavailableProps) {
   const text = UNAVAILABLE_TEXT[reason] ?? UNAVAILABLE_TEXT.unsupported;
+  // Nothing is locked here: the value is just missing at the moment, so both variants show only the dash.
+  if (reason === "agentOffline") {
+    return (
+      <span role="img" aria-label={text} title={text} className={cn("inline-flex items-center whitespace-nowrap text-ink-3", className)}>
+        <span aria-hidden="true">—</span>
+      </span>
+    );
+  }
   if (compact) {
     return (
       <span
         role="img"
         aria-label={`Unavailable: ${text}`}
         title={text}
-        className={cn("inline-flex items-center gap-1 whitespace-nowrap text-slate-500", className)}
+        className={cn("inline-flex items-center gap-[5px] whitespace-nowrap text-ink-3", className)}
       >
         <span aria-hidden="true">—</span>
-        <Lock size={11} strokeWidth={2} aria-hidden="true" />
+        <Lock size={12} strokeWidth={1.75} aria-hidden="true" className="shrink-0" />
       </span>
     );
   }
   return (
-    <span className={cn("inline-flex min-w-0 items-center gap-1.5 whitespace-nowrap text-slate-500", className)} title={text}>
+    <span className={cn("inline-flex min-w-0 items-center gap-[5px] whitespace-nowrap text-ink-3", className)} title={text}>
       <span aria-hidden="true">—</span>
-      <Lock size={11} strokeWidth={2} aria-hidden="true" className="shrink-0" />
-      <span className="truncate text-[11px] font-normal normal-case tracking-normal">{text}</span>
+      <Lock size={12} strokeWidth={1.75} aria-hidden="true" className="shrink-0" />
+      <span className="truncate text-callout font-normal">{text}</span>
     </span>
   );
 }

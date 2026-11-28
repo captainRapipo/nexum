@@ -1,11 +1,11 @@
-import { useEffect, useState } from "react";
-import { createPortal } from "react-dom";
-import { Check, Copy, Cpu, ExternalLink, X } from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
+import { Check, Copy, ExternalLink, X } from "lucide-react";
 import type { DriverInfo } from "../../types";
 import { api } from "../../lib/api";
-import { DottedLeaderRow } from "../ui";
+import { cn } from "../../lib/format";
+import { Button, IconButton, KeyValueRow, StatusIcon, STATUS_CLASS, type StatusTone } from "../ui";
 import { toast } from "../feedback/Toast";
-import { DriverStatusBadge, SignatureBadge } from "./DriverTable";
+import { DriverStatusBadge } from "./DriverTable";
 import { fmtAge, NEUTRAL_CODES, problemText, signatureKind, signatureLabel, vendorPortalFor } from "./driverUtils";
 
 export interface DriverDetailPanelProps {
@@ -13,20 +13,26 @@ export interface DriverDetailPanelProps {
   /** All identical devices when the table row is a group ("Processor × 16"). */
   members?: DriverInfo[];
   onClose: () => void;
+  className?: string;
 }
 
-/** Right-hand slide-over with the full metadata of one driver (INF lives here, not in the table). */
-export default function DriverDetailPanel({ driver, members, onClose }: DriverDetailPanelProps) {
+/**
+ * Details of one driver as a docked inspector (CONTRACT §4.10.3, SPEC §19): 380 px on the right,
+ * hairline on its left, no scrim; the list beside it stays usable. The INF name and hardware ids live
+ * here, not in the table. Esc or × closes it.
+ */
+export default function DriverDetailPanel({ driver, members, onClose, className }: DriverDetailPanelProps) {
   const [copied, setCopied] = useState(false);
   const open = driver !== null;
 
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        onClose();
-      }
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      // Esc in the toolbar filter clears the filter first; a menu or dialog handles its own Esc.
+      const t = e.target;
+      if (t instanceof HTMLElement && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -36,7 +42,7 @@ export default function DriverDetailPanel({ driver, members, onClose }: DriverDe
     setCopied(false);
   }, [driver]);
 
-  if (!driver || typeof document === "undefined") return null;
+  if (!driver) return null;
 
   const portal = vendorPortalFor(driver);
   const sig = signatureKind(driver);
@@ -61,152 +67,114 @@ export default function DriverDetailPanel({ driver, members, onClose }: DriverDe
     }
   };
 
-  return createPortal(
-    <div className="fixed inset-0 z-[60] flex justify-end" role="dialog" aria-modal="true" aria-label="Driver details">
-      <button
-        type="button"
-        aria-label="Close details"
-        onClick={onClose}
-        className="absolute inset-0 cursor-default bg-black/45 backdrop-blur-[2px]"
-      />
-      <aside className="nx-drawer-in relative flex h-full w-[460px] max-w-[92vw] flex-col border-l border-line bg-[rgba(9,16,19,0.94)] shadow-[-24px_0_60px_rgba(0,0,0,0.5)] backdrop-blur-xl">
-        <style>{`@keyframes nx-drawer-in{from{transform:translateX(24px);opacity:0}to{transform:none;opacity:1}}.nx-drawer-in{animation:nx-drawer-in 200ms ease-out}@media (prefers-reduced-motion: reduce){.nx-drawer-in{animation:none}}`}</style>
-
-        {/* Header */}
-        <div className="flex items-start gap-3 border-b border-line px-5 py-4">
-          <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-line bg-white/[0.04] text-silver">
-            <Cpu size={18} />
+  return (
+    <aside
+      aria-label="Driver details"
+      className={cn("flex h-full w-(--inspector-w) shrink-0 animate-fade-in flex-col border-l border-hairline bg-content", className)}
+    >
+      {/* Header */}
+      <div className="flex shrink-0 items-start gap-2 border-b border-divider py-3 pl-5 pr-2.5">
+        <div className="min-w-0 flex-1">
+          <h2 className="text-title-2 text-ink">
+            {driver.deviceName || "Unknown device"}
+            {group && <span className="ml-1.5 font-normal text-ink-3 tnum">× {group.length}</span>}
+          </h2>
+          <p className="mt-0.5 truncate text-callout text-ink-2">
+            {[driver.category, driver.provider].filter(Boolean).join(" · ")}
+          </p>
+          <div className="mt-2 flex h-5 items-center">
+            <DriverStatusBadge driver={driver} />
           </div>
-          <div className="min-w-0 flex-1">
-            <div className="text-[10.5px] uppercase tracking-[0.18em] text-muted">{driver.category} · Driver</div>
-            <h2 className="mt-0.5 text-[15px] font-semibold leading-snug text-ink">
-              {driver.deviceName || "Unknown device"}
-              {group && <span className="ml-1.5 font-mono text-[13px] font-normal text-silver">× {group.length}</span>}
-            </h2>
-            <div className="mt-2 flex flex-wrap items-center gap-2">
-              <DriverStatusBadge driver={driver} />
-              <SignatureBadge driver={driver} />
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close"
-            title="Close"
-            className="rounded-md p-1.5 text-muted transition hover:bg-white/5 hover:text-ink"
-          >
-            <X size={16} />
-          </button>
         </div>
+        <IconButton icon={X} label="Close (Esc)" onClick={onClose} />
+      </div>
 
-        {/* Body */}
-        <div className="nx-scroll flex-1 space-y-5 overflow-y-auto px-5 py-4">
-          {driver.status === "problem" && (
-            <p className="rounded-md border border-crit/40 bg-crit/[0.07] px-3 py-2 text-[12px] leading-relaxed text-rose-300">
-              Windows reports a problem with this device: {problemText(driver.problemCode)}. Open Device Manager for
-              Windows' own troubleshooting steps.
-            </p>
-          )}
-          {neutralCode && (
-            <p className="rounded-md border border-line bg-white/[0.03] px-3 py-2 text-[12px] leading-relaxed text-silver">
-              {problemText(driver.problemCode)}. This is not a fault.
-            </p>
-          )}
+      {/* Body */}
+      <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-5 py-4">
+        {driver.status === "problem" && (
+          <Note tone="warn">
+            Windows reports a problem with this device: {problemText(driver.problemCode)}. Open Device Manager for the troubleshooting steps Windows
+            offers.
+          </Note>
+        )}
+        {neutralCode && <Note tone="unknown">{problemText(driver.problemCode)}. This is not a fault.</Note>}
 
-          <section>
-            <SectionLabel>Driver package</SectionLabel>
-            <div className="space-y-1.5">
-              <DottedLeaderRow label="Provider" value={driver.provider || "—"} />
-              <DottedLeaderRow label="Manufacturer" value={driver.manufacturer || "—"} />
-              <DottedLeaderRow label="Version" value={driver.version || "—"} valueClassName="font-mono" />
-              <DottedLeaderRow label="Release date" value={driver.date || "—"} valueClassName="font-mono whitespace-nowrap" />
-              <DottedLeaderRow label="Age" value={fmtAge(driver.ageDays)} valueClassName="font-mono text-slate-400" />
-              <DottedLeaderRow label="INF file" value={driver.infName || "—"} valueClassName="font-mono" />
-              <DottedLeaderRow
-                label="Origin"
-                value={driver.isInbox ? "In-box (ships with Windows)" : "Third-party package"}
-              />
-            </div>
-            <p className="mt-2 text-[11px] leading-relaxed text-muted">
-              Driver age is information only. An older driver that works is not a problem.
-            </p>
-          </section>
+        <Section title="Driver package">
+          <KeyValueRow label="Provider" value={driver.provider || "—"} />
+          <KeyValueRow label="Manufacturer" value={driver.manufacturer || "—"} />
+          <KeyValueRow label="Version" value={driver.version || "—"} />
+          <KeyValueRow label="Release date" value={driver.date || "—"} valueClassName="whitespace-nowrap" />
+          <KeyValueRow label="Age" value={fmtAge(driver.ageDays)} valueClassName="text-ink-3" />
+          <KeyValueRow label="INF file" value={driver.infName || "—"} valueClassName="font-mono text-[11.5px]" />
+          <KeyValueRow label="Origin" value={driver.isInbox ? "In-box (ships with Windows)" : "Third-party package"} />
+          <p className="mt-2 text-callout text-ink-3">Driver age is information only. An older driver that works is not a problem.</p>
+        </Section>
 
-          <section>
-            <SectionLabel>Device</SectionLabel>
-            <div className="space-y-1.5">
-              <DottedLeaderRow label="Device class" value={driver.deviceClass || "—"} />
-              <DottedLeaderRow label="Category" value={driver.category} />
+        <Section title="Device">
+          <KeyValueRow label="Device class" value={driver.deviceClass || "—"} />
+          <KeyValueRow label="Category" value={driver.category} />
+          <div className="mt-3 rounded-lg bg-inset p-3">
+            <div className="mb-1.5 flex items-center justify-between gap-2">
+              <span className="text-caption font-medium text-ink-2">{group ? `Hardware IDs (${group.length})` : "Hardware ID"}</span>
+              <Button size="sm" variant="plain" icon={copied ? Check : Copy} onClick={() => void copyId()} disabled={!driver.deviceId}>
+                {copied ? "Copied" : "Copy"}
+              </Button>
             </div>
-            <div className="mt-3 rounded-lg border border-line bg-canvas-0/70 p-3">
-              <div className="mb-1.5 flex items-center justify-between">
-                <span className="text-[10.5px] uppercase tracking-[0.16em] text-muted">
-                  {group ? `Device IDs (${group.length})` : "Hardware / Device ID"}
-                </span>
-                <button
-                  type="button"
-                  onClick={copyId}
-                  disabled={!driver.deviceId}
-                  className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-silver transition hover:bg-white/5 hover:text-ink disabled:opacity-40"
-                >
-                  {copied ? <Check size={12} className="text-teal" /> : <Copy size={12} />}
-                  {copied ? "Copied" : "Copy"}
-                </button>
-              </div>
-              {group ? (
-                <ul className="nx-scroll max-h-40 space-y-1 overflow-y-auto">
-                  {group.map((m) => (
-                    <li key={m.deviceId} className="break-all font-mono text-[11px] leading-relaxed text-cyan">
-                      {m.deviceId || "—"}
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <code className="block break-all font-mono text-[11.5px] leading-relaxed text-cyan">{driver.deviceId || "—"}</code>
-              )}
-            </div>
-          </section>
-
-          <section>
-            <SectionLabel>Digital signature</SectionLabel>
-            <div className="space-y-1.5">
-              <DottedLeaderRow label="Status" value={signatureLabel(sig)} valueClassName={sig === "unsigned" ? "text-warn" : "text-silver"} />
-              <DottedLeaderRow label="Signer" value={driver.signer || "—"} />
-            </div>
-            {sig === "unsigned" && (
-              <p className="mt-2 rounded-md border border-warn/35 bg-warn/[0.06] px-3 py-2 text-[12px] leading-relaxed text-warn">
-                This driver has no valid digital signature. Prefer a WHQL-certified package from the device maker.
-              </p>
+            {group ? (
+              <ul className="max-h-40 space-y-1 overflow-y-auto">
+                {group.map((m) => (
+                  <li key={m.deviceId} className="break-all font-mono text-mono text-ink">
+                    {m.deviceId || "—"}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <code className="block break-all font-mono text-mono text-ink">{driver.deviceId || "—"}</code>
             )}
-          </section>
-        </div>
-
-        {/* Footer */}
-        <div className="border-t border-line px-5 py-4">
-          <button
-            type="button"
-            onClick={openPortal}
-            className="flex w-full items-center justify-center gap-2 rounded-lg border border-white/15 bg-white/[0.04] px-4 py-2.5 text-[13px] font-semibold text-ink transition hover:bg-white/[0.08]"
-          >
-            <ExternalLink size={15} />
-            Open {portal.vendor} support page
-          </button>
-          <div className="mt-2 truncate text-center font-mono text-[10.5px] text-muted" title={portal.url}>
-            {portal.url}
           </div>
-          <p className="mt-2 text-center text-[11px] text-muted">Nexum never installs drivers.</p>
+        </Section>
+
+        <Section title="Digital signature">
+          <KeyValueRow label="Status" value={signatureLabel(sig)} />
+          <KeyValueRow label="Signer" value={driver.signer || "—"} />
+          {sig === "unsigned" && (
+            <Note tone="warn" className="mt-3">
+              This driver has no valid digital signature. Prefer a WHQL-certified package from the device maker.
+            </Note>
+          )}
+        </Section>
+      </div>
+
+      {/* Footer */}
+      <div className="shrink-0 border-t border-divider bg-toolbar px-5 py-3">
+        <Button icon={ExternalLink} onClick={() => void openPortal()} className="w-full" title={portal.url}>
+          Open {portal.vendor} support page
+        </Button>
+        <div className="mt-2 truncate text-center font-mono text-[10.5px] leading-4 text-ink-3" title={portal.url}>
+          {portal.url}
         </div>
-      </aside>
-    </div>,
-    document.body,
+        <p className="mt-1 text-center text-callout text-ink-2">Nexum never installs drivers.</p>
+      </div>
+    </aside>
   );
 }
 
-function SectionLabel({ children }: { children: string }) {
+function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <div className="mb-2 flex items-center gap-2 text-[10.5px] font-semibold uppercase tracking-[0.18em] text-silver">
-      <span className="h-px w-3 bg-white/25" />
-      {children}
-    </div>
+    <section className="shrink-0">
+      <h3 className="mb-1 text-headline text-ink">{title}</h3>
+      <div className="flex flex-col">{children}</div>
+    </section>
+  );
+}
+
+/** In-panel note: tint, icon and text from the status tokens (never colour alone). */
+function Note({ tone, children, className }: { tone: StatusTone; children: ReactNode; className?: string }) {
+  const c = STATUS_CLASS[tone];
+  return (
+    <p className={cn("flex shrink-0 items-start gap-2 rounded-lg border px-3 py-2 text-callout text-ink", c.soft, c.border, className)}>
+      <StatusIcon tone={tone} size={15} className="mt-px" />
+      <span className="min-w-0">{children}</span>
+    </p>
   );
 }

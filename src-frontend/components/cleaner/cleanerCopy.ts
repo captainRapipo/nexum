@@ -62,3 +62,57 @@ export function dirnameOf(p: string): string {
 }
 
 export type { TrashCategory };
+
+/* ------------------------------------------------------------------ */
+/* Page and dialog copy (CONTRACT §4.6.1, §4.8, §4.10.3)                */
+/* ------------------------------------------------------------------ */
+
+/** PageHeader description (CONTRACT §4.6.1 table). */
+export const PAGE_DESCRIPTION =
+  "Measured first with a dry run. Protected system paths, cookies, logins and personal files are never touched.";
+
+/** Body of the confirmation dialog. */
+export const CONFIRM_BODY =
+  "These files were measured in a dry run a moment ago. Only the categories below are removed; files in use are skipped.";
+
+/** Reassurance line of the confirmation dialog (green shield). */
+export const CONFIRM_REASSURANCE =
+  "Every deleted path is written to an audit log. Cookies, logins and personal files are never touched.";
+
+/** Under the page button: what happens when it is pressed. */
+export const READY_NOTE_CONFIRM = "You confirm first. Files in use are skipped and every deleted path is written to an audit log.";
+export const READY_NOTE_DIRECT =
+  "Starts right away: confirmation is off in Settings. Files in use are skipped and every deleted path is written to an audit log.";
+
+/** Mirrors the non-negotiable rules enforced by the Rust cleaner (CONTRACT §3). */
+export const PROTECTED_PATHS: readonly string[] = [
+  "%WINDIR%\\System32 (incl. \\config registry hives), SysWOW64, WinSxS, Prefetch",
+  "%ProgramFiles% and %ProgramFiles(x86)%",
+  "%ProgramData%\\Nexum and Nexum's own program folder",
+  "Documents, Desktop, Pictures, Videos, Music, Downloads, OneDrive",
+  "NTUSER.DAT*, UsrClass.dat*, *.regtrans-ms, *.blf",
+  "Drive roots and every category root folder itself",
+  "Symlinks, junctions and mount points (never followed)",
+  "Browser cookies, logins, history, Local Storage and IndexedDB",
+];
+
+export const CLEANUP_RULES: readonly string[] = [
+  "Crash dumps: the 5 newest and anything less than 30 days old are kept.",
+  "Windows Update downloads are skipped while an update is waiting to install or restart.",
+  "Delivery Optimization is cleared only through Windows' own cmdlet.",
+  "Browser and Discord caches are skipped while that app is open.",
+  "Recycle Bin: with an age set, only items deleted longer ago than that are removed, and only from your own bin.",
+  "Every cleanup writes a log of each file it deleted or skipped.",
+];
+
+/** `2.22 GB` → ["2.22", "GB"], so a large numeral can carry a small unit. */
+export function splitAmount(text: string): [string, string] {
+  const i = text.lastIndexOf(" ");
+  return i < 0 ? [text, ""] : [text.slice(0, i), text.slice(i + 1)];
+}
+
+/** `5,414 files` / `1 file`. */
+export function fmtFiles(n: number): string {
+  const v = Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0;
+  return `${v.toLocaleString("en-US")} ${v === 1 ? "file" : "files"}`;
+}

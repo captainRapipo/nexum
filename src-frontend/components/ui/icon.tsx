@@ -15,7 +15,7 @@ export function renderIcon(icon: IconLike | undefined, size = 16, className?: st
   if (isValidElement(icon)) return icon;
   if (isComponent(icon)) {
     const C = icon;
-    return <C size={size} className={className} aria-hidden="true" strokeWidth={1.9} />;
+    return <C size={size} className={className} aria-hidden="true" strokeWidth={1.75} />;
   }
   return icon as ReactNode;
 }

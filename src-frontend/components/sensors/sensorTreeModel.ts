@@ -1,6 +1,6 @@
-// Pure model for the Sensors view (CONTRACT §1.3, §4.10): flattens a SensorTree into the
+// Pure model for the Sensors view (CONTRACT §1.3, §4.10, §4.10.3): flattens a SensorTree into the
 // visible row list (hostname root → hardware nodes → kind groups → sensors) after applying
-// collapse state, search, user-hidden ids and the "unused" rule. No React in here.
+// collapse state, the filter, user-hidden ids and the "unused" rule. No React in here.
 
 import {
   Activity,
@@ -21,7 +21,6 @@ import {
   Network,
   Percent,
   Plug,
-  Server,
   Sigma,
   Thermometer,
   Timer,
@@ -33,8 +32,8 @@ import {
 } from "lucide-react";
 import { SENSOR_KIND_ORDER, type HardwareKind, type HardwareNode, type SensorKind, type SensorMeta, type SensorTree } from "../../types";
 
-/** Fixed row height of the virtualized list (px). */
-export const ROW_H = 28;
+/** Fixed row height of the virtualized list (px): the dense 24 px row of SPEC §7 (`--row-h-dense`). */
+export const ROW_H = 24;
 /** Indentation per tree level (px). */
 export const INDENT = 16;
 
@@ -109,30 +108,7 @@ export const HW_ICON: Record<HardwareKind, LucideIcon> = {
   other: Clock3,
 };
 
-export const ROOT_ICON: LucideIcon = Server;
-
-/**
- * Sparkline colour per sensor kind. Series colours only (CONTRACT §4.9): never the status
- * tokens' meaning, never gold (brand + GPU series).
- */
-export function sparkColor(kind: SensorKind): string {
-  switch (kind) {
-    case "temperature":
-      return "#22D3EE"; // cyan
-    case "load":
-    case "control":
-    case "level":
-      return "#A855F7"; // purple
-    case "fan":
-    case "flow":
-      return "#2DD4BF"; // teal
-    case "clock":
-    case "frequency":
-      return "#38BDF8"; // sky
-    default:
-      return "#CBD5E1"; // silver
-  }
-}
+export const ROOT_ICON: LucideIcon = Monitor;
 
 export type RowKind = "root" | "hw" | "group" | "sensor";
 
@@ -168,6 +144,8 @@ export interface GroupRow extends RowBase {
   expandable: true;
   expanded: boolean;
   sensorIds: string[];
+  /** Distinct units of the listed sensors, as reported ("°C", "RPM"); shown once on the group row. */
+  units: string[];
 }
 
 export interface SensorRowModel extends RowBase {
@@ -194,6 +172,8 @@ export interface FlattenInput {
   maxOf: (meta: SensorMeta) => number | null;
   isUnused: (meta: SensorMeta, max: number | null) => boolean;
   labelOf: (id: string, defaultName: string) => string;
+  /** Extra filter of the filter bar ("Pinned", "Changed"); omitted = every sensor. */
+  only?: (meta: SensorMeta) => boolean;
 }
 
 export interface FlattenResult {
@@ -206,6 +186,8 @@ export interface FlattenResult {
   hiddenUnused: number;
   /** Search active but nothing matched. */
   noMatches: boolean;
+  /** Hardware nodes that have at least one sensor (for "<n> sensors from <m> devices"). */
+  devices: number;
   /** All hardware keys (for "Collapse all"). */
   hwKeys: string[];
 }
@@ -238,7 +220,7 @@ function matches(q: string, ...fields: string[]): boolean {
  * match is visible.
  */
 export function flattenTree(input: FlattenInput): FlattenResult {
-  const { tree, rootName, collapsed, hidden, showHidden, hideUnused, maxOf, isUnused, labelOf } = input;
+  const { tree, rootName, collapsed, hidden, showHidden, hideUnused, maxOf, isUnused, labelOf, only } = input;
   const q = input.query.trim().toLowerCase();
   const searching = q.length > 0;
   const hardware = tree.hardware;
@@ -266,6 +248,7 @@ export function flattenTree(input: FlattenInput): FlattenResult {
         hiddenUnused++;
         continue;
       }
+      if (only && !only(meta)) continue;
       if (searching && !matches(q, labelOf(meta.id, meta.name), meta.name, hw.name)) continue;
       let list = byKind.get(meta.kind);
       if (!list) byKind.set(meta.kind, (list = []));
@@ -353,6 +336,7 @@ export function flattenTree(input: FlattenInput): FlattenResult {
           expandable: true,
           expanded: gOpen,
           sensorIds: list.map((s) => s.meta.id),
+          units: [...new Set(list.map((s) => s.meta.unit as string).filter(Boolean))],
         });
         if (!gOpen) continue;
         for (const { meta, userHidden } of list) {
@@ -379,6 +363,7 @@ export function flattenTree(input: FlattenInput): FlattenResult {
     hiddenByUser,
     hiddenUnused,
     noMatches: searching && shown === 0,
+    devices: hardware.filter((h) => h.sensors.length > 0).length,
     hwKeys: hardware.map((h) => hwKey(h.id)),
   };
 }

@@ -1,19 +1,8 @@
+// Settings (CONTRACT §4.8.1, §2.15.7; docs/design/IMPLEMENTATION-PLAN.md §3): grouped form rows in inset
+// wells, graphite controls. The preferences are saved with Save; the Updates section and the sensor
+// actions apply at once (they are actions and consent, not preferences to stage).
 import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
-import {
-  Activity,
-  Bell,
-  Cpu,
-  Eraser,
-  ExternalLink,
-  Gamepad2,
-  Info,
-  Power,
-  RotateCcw,
-  Save,
-  Settings as SettingsIcon,
-  ShieldCheck,
-  Thermometer,
-} from "lucide-react";
+import { ExternalLink, RotateCcw, ShieldCheck } from "lucide-react";
 import {
   CPU_DEFAULT_LIMIT_C,
   DEFAULT_ALERT_SETTINGS,
@@ -21,26 +10,28 @@ import {
   GPU_MEM_JUNCTION_CRIT_DEFAULT_C,
   RECYCLE_AGE_OPTIONS,
   SENSOR_LOG_INTERVALS_MS,
+  UPDATE_TEXT,
   type AlertSettings,
   type CpuLimitInfo,
   type Settings,
+  type UpdateCheckMode,
 } from "../../types";
-import { api, errorMessage, isTauri, PAWNIO_URL } from "../../lib/api";
+import { api, errorMessage, PAWNIO_URL } from "../../lib/api";
 import { cn, fmtRelative } from "../../lib/format";
 import { useNow } from "../../hooks/useNow";
 import { useHealthAlerts } from "../../hooks/useHealthAlerts";
 import { useSettings } from "../../hooks/useSettings";
 import { useTelemetry } from "../../hooks/useTelemetryStream";
-import { Button } from "../ui/Button";
-import { DottedLeaderRow } from "../ui/DottedLeaderRow";
-import { Modal } from "../ui/Modal";
-import { Segmented } from "../ui/Segmented";
-import { StatusPill } from "../ui/StatusPill";
-import { Toggle } from "../ui/Toggle";
+import { updateBusy, useUpdater } from "../../hooks/useUpdater";
+import { toast } from "../feedback/Toast";
+import { Button, InkLink, KeyValueRow, Modal, Segmented, StatusIcon, StatusPill, Tag, Toggle, type StatusPillTone } from "../ui";
+import { openReleasesPage } from "./UpdateDialog";
 
 export interface SettingsModalProps {
   open: boolean;
   onClose: () => void;
+  /** [NEW 1.2] "View update" in the Updates section: the shell closes Settings and opens the update dialog. */
+  onViewUpdate?: () => void;
 }
 
 const POLL_OPTIONS = [
@@ -132,26 +123,37 @@ function cpuLimitText(info: CpuLimitInfo, override: number | null): string {
   return `This CPU model is not in Nexum's table; using a conservative ${CPU_DEFAULT_LIMIT_C} °C limit.`;
 }
 
-function Section({ icon, title, children }: { icon: ReactNode; title: string; children: ReactNode }) {
+/** A titled group of form rows in an inset well (SPEC §6 "inner well"), rows separated by hairlines. */
+function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <section className="rounded-xl border border-line bg-white/[0.015] px-4 py-3">
-      <h3 className="mb-2 flex items-center gap-2">
-        <span className="text-teal">{icon}</span>
-        <span className="label-caps">{title}</span>
-      </h3>
-      <div className="divide-y divide-white/[0.05] [&>*]:py-2.5 [&>*:first-child]:pt-1 [&>*:last-child]:pb-1">{children}</div>
+    <section>
+      <h3 className="mb-1.5 px-1 text-headline text-ink">{title}</h3>
+      <div className="divide-y divide-line rounded-lg bg-inset px-3.5 [&>*]:py-2.5">{children}</div>
     </section>
   );
 }
+
+const DESC = "mt-0.5 text-callout text-ink-2";
 
 function FieldRow({ label, description, children }: { label: string; description?: ReactNode; children: ReactNode }) {
   return (
     <div className="flex items-center justify-between gap-4">
       <div className="min-w-0">
-        <div className="text-[13px] text-slate-200">{label}</div>
-        {description && <p className="mt-0.5 text-[11.5px] leading-snug text-muted">{description}</p>}
+        <div className="text-body text-ink">{label}</div>
+        {description && <p className={DESC}>{description}</p>}
       </div>
       <div className="shrink-0">{children}</div>
+    </div>
+  );
+}
+
+/** A label with its description above a full-width control. */
+function StackedRow({ label, description, children }: { label: string; description?: ReactNode; children: ReactNode }) {
+  return (
+    <div>
+      <div className="text-body text-ink">{label}</div>
+      {description && <p className={DESC}>{description}</p>}
+      <div className="mt-2">{children}</div>
     </div>
   );
 }
@@ -195,10 +197,10 @@ function NumberField({ label, description, value, onChange, min, max, unit, auto
   return (
     <div className="flex items-center justify-between gap-4">
       <div className="min-w-0">
-        <label htmlFor={id} className="block text-[13px] text-slate-200">
+        <label htmlFor={id} className="block text-body text-ink">
           {label}
         </label>
-        {description && <p className="mt-0.5 text-[11.5px] leading-snug text-muted">{description}</p>}
+        {description && <p className={DESC}>{description}</p>}
       </div>
       <div className="flex shrink-0 items-center gap-1.5">
         <input
@@ -216,15 +218,139 @@ function NumberField({ label, description, value, onChange, min, max, unit, auto
           onKeyDown={(e) => {
             if (e.key === "Enter") commit((e.target as HTMLInputElement).value);
           }}
-          className="num h-7 w-[84px] rounded-md border border-line bg-canvas-0/70 px-2 text-right text-[12.5px] text-ink outline-none transition placeholder:text-muted/70 focus:border-teal/50 focus:shadow-[0_0_0_3px_rgba(45,212,191,0.12)]"
+          className="tnum h-7 w-[96px] rounded-sm bg-white px-2 text-right text-body text-ink shadow-[inset_0_0_0_1px_var(--color-control-border)] placeholder:text-ink-3"
         />
-        <span className="w-6 text-[11.5px] text-muted">{unit}</span>
+        <span className="w-6 text-callout text-ink-3">{unit}</span>
       </div>
     </div>
   );
 }
 
-export function SettingsModal({ open, onClose }: SettingsModalProps) {
+/* ------------------------------------------------------------------ */
+/* Updates (CONTRACT §2.15.7)                                          */
+/* ------------------------------------------------------------------ */
+
+const UPDATE_MODE_OPTIONS = [
+  { value: "auto" as const, label: UPDATE_TEXT.modeAuto },
+  { value: "manual" as const, label: UPDATE_TEXT.modeManual },
+];
+
+/**
+ * Applies at once, outside the Save / Cancel draft: the choices here are the user's consent to the only
+ * network request Nexum makes, and "Check now" must use the channel that is shown.
+ */
+function UpdatesSection({ open, onViewUpdate }: { open: boolean; onViewUpdate?: () => void }) {
+  const { settings, update: saveSettings } = useSettings();
+  const { update, check } = useUpdater();
+  const now = useNow(open ? 30_000 : 3_600_000);
+  const [checking, setChecking] = useState(false);
+
+  const current = update.currentVersion || __NEXUM_VERSION__;
+  const versionRow = (
+    <KeyValueRow
+      label="Version"
+      value={
+        <span className="inline-flex items-center gap-2">
+          {update.buildChannel === "preview" && <Tag title="This is a preview version of Nexum.">Preview</Tag>}
+          <span>Nexum {current}</span>
+        </span>
+      }
+    />
+  );
+
+  if (update.state === "disabled") {
+    return (
+      <Section title={UPDATE_TEXT.sectionTitle}>
+        {versionRow}
+        <div>
+          <p className="text-callout text-ink-2">{UPDATE_TEXT.disabled}</p>
+          <InkLink className="mt-1.5" onClick={openReleasesPage}>
+            {UPDATE_TEXT.openReleases}
+          </InkLink>
+        </div>
+      </Section>
+    );
+  }
+
+  const save = (patch: Partial<Settings>) => {
+    saveSettings(patch).catch((err) => toast(errorMessage(err), "warn"));
+  };
+
+  // "ask" (the first-run question is still unanswered) displays as "Only when I ask".
+  const mode: Exclude<UpdateCheckMode, "ask"> = settings.updateCheck === "auto" ? "auto" : "manual";
+  const channel = update.channel ?? (settings.updateChannel === "default" ? update.buildChannel : settings.updateChannel);
+  const busy = updateBusy(update);
+  const isChecking = checking || update.state === "checking";
+  const offered = update.latestVersion;
+
+  const checkNow = async () => {
+    if (isChecking || busy) return;
+    setChecking(true);
+    try {
+      // The click is the answer to the first-run question: Rust refuses any request while it is "ask".
+      if (settings.updateCheck === "ask") await saveSettings({ updateCheck: "manual" });
+      await check();
+    } catch (err) {
+      toast(errorMessage(err), "warn");
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  let status: ReactNode;
+  if (isChecking) status = UPDATE_TEXT.statusChecking;
+  else if (update.state === "error")
+    status = (
+      <span className="flex items-start gap-1.5 text-ink">
+        <StatusIcon tone="warn" size={14} className="mt-[1.5px]" />
+        <span>{update.error}</span>
+      </span>
+    );
+  else if (offered) status = UPDATE_TEXT.statusAvailable.replace("{v}", offered);
+  else if (update.lastCheckTs == null) status = UPDATE_TEXT.statusNever;
+  else status = `${UPDATE_TEXT.statusUpToDate} ${UPDATE_TEXT.lastChecked.replace("{when}", fmtRelative(update.lastCheckTs, now))}`;
+
+  return (
+    <Section title={UPDATE_TEXT.sectionTitle}>
+      {versionRow}
+      <StackedRow label={UPDATE_TEXT.modeLabel}>
+        <Segmented
+          ariaLabel={UPDATE_TEXT.modeLabel}
+          size="sm"
+          value={mode}
+          options={UPDATE_MODE_OPTIONS}
+          onChange={(v) => save({ updateCheck: v })}
+          className="w-full [&>button]:flex-1 [&>button]:justify-center"
+        />
+      </StackedRow>
+      <Toggle
+        label={UPDATE_TEXT.previewToggle}
+        description={UPDATE_TEXT.previewToggleNote}
+        checked={channel === "preview"}
+        disabled={busy}
+        onChange={(on) => save({ updateChannel: on ? "preview" : "stable" })}
+      />
+      <div>
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0 pt-1 text-callout text-ink-2" role="status" aria-live="polite">
+            {status}
+            {offered && onViewUpdate && !isChecking && (
+              <InkLink className="ml-2 align-baseline" onClick={onViewUpdate}>
+                {UPDATE_TEXT.viewUpdate}
+              </InkLink>
+            )}
+          </div>
+          <Button size="sm" className="shrink-0" loading={isChecking} disabled={busy} onClick={() => void checkNow()}>
+            {UPDATE_TEXT.checkNow}
+          </Button>
+        </div>
+        <p className="mt-2 text-callout text-ink-3">{UPDATE_TEXT.sourceNote}</p>
+      </div>
+    </Section>
+  );
+}
+
+export function SettingsModal({ open, onClose, onViewUpdate }: SettingsModalProps) {
   const { settings, update } = useSettings();
   const { agent, latest } = useTelemetry();
   const { snapshot: alertSnapshot } = useHealthAlerts();
@@ -236,7 +362,6 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [restarting, setRestarting] = useState(false);
   const [restartMsg, setRestartMsg] = useState<{ ok: boolean; text: string } | null>(null);
-  const [version, setVersion] = useState<string>(__NEXUM_VERSION__);
 
   // Fresh draft each time the dialog opens.
   useEffect(() => {
@@ -246,21 +371,6 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     setRestartMsg(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- only reset on open
   }, [open]);
-
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .getAppVersion()
-      .then((v) => {
-        if (!cancelled && v) setVersion(v);
-      })
-      .catch(() => {
-        // keep build-time version
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   const dirty = useMemo(
     () => SETTING_KEYS.some((k) => (k === "alerts" ? !sameAlerts(draft.alerts, settings.alerts) : draft[k] !== settings[k])),
@@ -293,7 +403,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     setRestartMsg(null);
     try {
       await api.restartAgent();
-      setRestartMsg({ ok: true, text: "Restart requested. The agent reconnects in a few seconds." });
+      setRestartMsg({ ok: true, text: "Restarting sensor reading. Values return in a few seconds." });
     } catch (err) {
       setRestartMsg({ ok: false, text: errorMessage(err) });
     } finally {
@@ -310,8 +420,11 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   };
 
   const lastPacketTs = latest?.ts ?? agent?.lastPacketTs ?? null;
-  const agentTone = agent == null ? "unknown" : agent.running ? "ok" : "warn";
-  const agentLabel = agent == null ? "Unknown" : agent.running ? "Running" : "Stopped";
+  // CONTRACT §4.8.1: Working (running) · Starting… (starting, restarting) · Not working (failed, stopped).
+  const phase = agent?.phase ?? "starting";
+  const down = phase === "failed" || phase === "stopped";
+  const readingTone: StatusPillTone = phase === "running" ? "ok" : down ? "warn" : "checking";
+  const readingLabel = phase === "running" ? "Working" : down ? "Not working" : "Starting…";
   const driver = agent?.sensorDriver ?? null;
   const driverText =
     driver == null
@@ -329,34 +442,35 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
       open={open}
       onClose={onClose}
       title="Settings"
-      subtitle="Startup, telemetry, alerts, frame capture and cache cleanup preferences"
-      icon={SettingsIcon}
+      subtitle="Startup, readings, alerts, updates, frame capture and cache cleanup"
       size="xl"
       footer={
         <>
-          <div className="min-w-0 flex-1 truncate text-[12px]">
+          <div className="min-w-0 flex-1 truncate text-callout">
             {saveError ? (
-              <span className="text-rose-400" role="alert">
+              <span className="inline-flex items-center gap-1.5 text-crit" role="alert">
+                <StatusIcon tone="crit" size={14} />
                 {saveError}
               </span>
             ) : dirty ? (
-              <span className="text-warn">Unsaved changes</span>
+              <span className="text-ink">Unsaved changes</span>
             ) : (
-              <span className="text-muted">All changes saved</span>
+              <span className="text-ink-3">All changes saved</span>
             )}
           </div>
-          <Button variant="ghost" onClick={onClose} disabled={saving}>
+          <Button className="min-w-24" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
-          <Button variant="teal" icon={Save} onClick={() => void handleSave()} loading={saving} disabled={!dirty}>
+          {/* The dialog's default button: the one primary on screen while Settings is open. */}
+          <Button variant="primary" className="min-w-24" onClick={() => void handleSave()} loading={saving} disabled={!dirty}>
             Save
           </Button>
         </>
       }
     >
-      <div className="grid grid-cols-2 gap-3">
-        <div className="flex flex-col gap-3">
-          <Section icon={<Power size={14} aria-hidden="true" />} title="Startup & Tray">
+      <div className="grid grid-cols-2 items-start gap-x-5 gap-y-4">
+        <div className="flex min-w-0 flex-col gap-4">
+          <Section title="Startup and tray">
             <Toggle
               label="Launch Nexum on Windows startup"
               description="Task Scheduler entry with highest privileges, so no UAC prompt at boot."
@@ -377,19 +491,17 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
             />
           </Section>
 
-          <Section icon={<Thermometer size={14} aria-hidden="true" />} title="Telemetry">
-            <div>
-              <div className="text-[13px] text-slate-200">Poll interval</div>
-              <p className="mb-2 mt-0.5 text-[11.5px] leading-snug text-muted">How often the hardware agent samples sensors.</p>
+          <Section title="Readings">
+            <StackedRow label="Poll interval" description="How often Nexum reads the sensors.">
               <Segmented
                 ariaLabel="Poll interval"
                 size="sm"
                 value={draft.pollIntervalMs}
                 options={POLL_OPTIONS}
                 onChange={(v) => set("pollIntervalMs", v)}
-                className="w-full justify-between [&>button]:flex-1"
+                className="w-full [&>button]:flex-1 [&>button]:justify-center"
               />
-            </div>
+            </StackedRow>
             <FieldRow label="Temperature unit">
               <Segmented
                 ariaLabel="Temperature unit"
@@ -419,7 +531,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
             </FieldRow>
           </Section>
 
-          <Section icon={<Bell size={14} aria-hidden="true" />} title="Alerts & notifications">
+          <Section title="Alerts and notifications">
             <Toggle
               label="Windows notifications"
               description="Notify when an alert starts or becomes critical while Nexum is in the background. At most one per alert every 30 minutes. Off by default."
@@ -474,27 +586,29 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
               max={ALERT_BOUNDS.sustainSec.max}
               unit="s"
             />
-            <p className="text-[11.5px] leading-snug text-muted">
+            <p className="text-callout text-ink-3">
               Drive wear alerts follow the drive's own health report and have no threshold to set. Temperatures here are in °C.
             </p>
           </Section>
         </div>
 
-        <div className="flex flex-col gap-3">
-          <Section icon={<Gamepad2 size={14} aria-hidden="true" />} title="Frame capture">
+        <div className="flex min-w-0 flex-col gap-4">
+          <UpdatesSection open={open} onViewUpdate={onViewUpdate} />
+
+          <Section title="Frame capture">
             <Toggle
               label="Measure frame rate in games"
               description={FPS_CONSENT}
               checked={draft.fpsCaptureEnabled}
               onChange={(v) => set("fpsCaptureEnabled", v)}
             />
-            <div className="space-y-1.5 text-[11.5px] leading-snug text-muted">
+            <div className="space-y-1.5 text-callout text-ink-3">
               <p>{FPS_JAVELIN}</p>
               <p>{FPS_UNTESTED}</p>
             </div>
           </Section>
 
-          <Section icon={<Eraser size={14} aria-hidden="true" />} title="Cache cleanup">
+          <Section title="Cache cleanup">
             <Toggle
               label="List browser and Discord caches"
               description="Chrome, Edge, Firefox and Discord caches. Logins, cookies and history are kept. F9 never cleans them without asking."
@@ -507,37 +621,39 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
               checked={draft.confirmBeforePurge}
               onChange={(v) => set("confirmBeforePurge", v)}
             />
-            <div>
-              <div className="text-[13px] text-slate-200">Recycle Bin items to clean</div>
-              <p className="mb-2 mt-0.5 text-[11.5px] leading-snug text-muted">
-                Like Windows Storage Sense: keep recently deleted items. The Recycle Bin is never cleaned unless you select it.
-              </p>
+            <StackedRow
+              label="Recycle Bin items to clean"
+              description="Like Windows Storage Sense: keep recently deleted items. The Recycle Bin is never cleaned unless you select it."
+            >
               <Segmented
                 ariaLabel="Recycle Bin age"
                 size="sm"
                 value={draft.recycleMinAgeDays ?? RECYCLE_ALL}
                 options={RECYCLE_OPTIONS}
                 onChange={(v) => set("recycleMinAgeDays", v === RECYCLE_ALL ? null : v)}
-                className="w-full justify-between [&>button]:flex-1"
+                className="w-full [&>button]:flex-1 [&>button]:justify-center"
               />
-            </div>
+            </StackedRow>
           </Section>
 
-          <Section icon={<Activity size={14} aria-hidden="true" />} title="Sensor driver">
+          <Section title="Sensor driver">
             <div>
-              <DottedLeaderRow label="Installed" value={driverText} />
-              <DottedLeaderRow label="Your choice" value={DRIVER_CHOICE_TEXT[settings.sensorDriverChoice] ?? "—"} />
-              <p className="mt-1.5 text-[11.5px] leading-snug text-muted">
+              <KeyValueRow label="Installed" value={driverText} />
+              <KeyValueRow label="Your choice" value={DRIVER_CHOICE_TEXT[settings.sensorDriverChoice] ?? "—"} />
+              <p className="mt-2 text-callout text-ink-2">
                 PawnIO is a signed kernel driver from its own website. It gives Nexum CPU, motherboard and fan sensors. Nexum
                 never installs or removes it.
               </p>
               <div className="mt-2 flex flex-wrap gap-2">
-                <Button variant="ghost" size="sm" icon={ExternalLink} onClick={() => void api.openExternal(PAWNIO_URL)}>
+                <Button
+                  size="sm"
+                  icon={ExternalLink}
+                  onClick={() => void api.openExternal(PAWNIO_URL).catch((err) => toast(errorMessage(err), "warn"))}
+                >
                   Get PawnIO
                 </Button>
                 {settings.sensorDriverChoice !== "undecided" && (
                   <Button
-                    variant="ghost"
                     size="sm"
                     title="Show the sensor driver choice again the next time it applies"
                     onClick={() => void update({ sensorDriverChoice: "undecided" }).catch(() => undefined)}
@@ -549,44 +665,32 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
             </div>
           </Section>
 
-          <Section icon={<Cpu size={14} aria-hidden="true" />} title="Hardware Agent">
+          <Section title="Sensors">
             <div className="flex items-center justify-between gap-3">
-              <StatusPill tone={agentTone} pulse={agent?.running} title={agent?.message}>
-                {agentLabel}
-              </StatusPill>
-              <Button variant="teal" size="sm" icon={RotateCcw} onClick={() => void handleRestart()} loading={restarting}>
-                Restart agent
+              <div className="flex min-w-0 items-center gap-2.5">
+                <span className="text-body text-ink">Sensor reading</span>
+                <StatusPill tone={readingTone}>{readingLabel}</StatusPill>
+              </div>
+              <Button size="sm" icon={RotateCcw} onClick={() => void handleRestart()} loading={restarting}>
+                Restart sensor reading
               </Button>
             </div>
             <div>
-              <DottedLeaderRow
-                label="Privileges"
-                value={agent == null ? "—" : agent.isAdmin ? "Administrator" : "Not elevated"}
-                valueClassName={agent && !agent.isAdmin ? "text-warn" : undefined}
-              />
-              <DottedLeaderRow label="Last packet" value={lastPacketTs ? fmtRelative(lastPacketTs, now) : "—"} />
-              {agent?.protocol != null && <DottedLeaderRow label="Agent protocol" value={String(agent.protocol)} />}
-              {agent?.message && <p className="mt-1.5 break-words font-mono text-[10.5px] leading-relaxed text-slate-500">{agent.message}</p>}
+              <KeyValueRow label="Privileges" value={agent == null ? "—" : agent.isAdmin ? "Administrator" : "Standard user"} />
+              <KeyValueRow label="Last reading" value={lastPacketTs ? fmtRelative(lastPacketTs, now) : "—"} />
               {agent && !agent.isAdmin && (
                 <div className="mt-2">
-                  <Button variant="ghost" size="sm" icon={ShieldCheck} onClick={() => void handleElevate()}>
+                  <Button size="sm" icon={ShieldCheck} onClick={() => void handleElevate()}>
                     Restart as administrator
                   </Button>
                 </div>
               )}
               {restartMsg && (
-                <p className={cn("mt-1.5 text-[11.5px]", restartMsg.ok ? "text-teal" : "text-rose-400")} role="status">
-                  {restartMsg.text}
+                <p className={cn("mt-2 flex items-start gap-1.5 text-callout", restartMsg.ok ? "text-ink-2" : "text-crit")} role="status">
+                  {!restartMsg.ok && <StatusIcon tone="crit" size={14} className="mt-[1.5px]" />}
+                  <span>{restartMsg.text}</span>
                 </p>
               )}
-            </div>
-          </Section>
-
-          <Section icon={<Info size={14} aria-hidden="true" />} title="About">
-            <div>
-              <DottedLeaderRow label="Nexum version" value={`v${version}`} valueClassName="text-teal" />
-              <DottedLeaderRow label="Runtime" value={isTauri ? "Native (Tauri)" : "Browser preview"} />
-              <DottedLeaderRow label="Build" value={import.meta.env.DEV ? "Development" : "Release"} />
             </div>
           </Section>
         </div>

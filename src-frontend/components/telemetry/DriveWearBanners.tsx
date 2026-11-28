@@ -4,17 +4,18 @@ import { toast } from "../feedback/Toast";
 import { useHealth } from "../../hooks/useHealth";
 import { useHealthAlerts } from "../../hooks/useHealthAlerts";
 import { useSettings } from "../../hooks/useSettings";
+import { cn } from "../../lib/format";
 import type { HealthCondition } from "../../types";
 import { runHealthAction } from "./healthActions";
 
 /**
- * Dashboard drive banners (MF-1, CONTRACT §5.4): one per drive condition (ids "drive:<id>", evaluated by
- * Rust in 1.1 and mapped by deriveHealth) with severity warn or crit that the user has not dismissed.
+ * Dashboard drive banners (MF-1, CONTRACT §5.4): one in-page banner per drive condition (ids "drive:<id>",
+ * evaluated by Rust and mapped by deriveHealth) with severity warn or crit that the user has not dismissed.
  * A worse state produces a new dismiss key, so the banner comes back. Dismiss goes through
  * `dismiss_alert` (CONTRACT §2.10.5), which also mutes desktop notifications for that key; it never hides
  * the header pill or the Health alerts card.
  */
-export default function DriveWearBanners() {
+export default function DriveWearBanners({ className }: { className?: string }) {
   const health = useHealth();
   const { settings } = useSettings();
   const { dismiss: dismissAlert } = useHealthAlerts();
@@ -49,7 +50,7 @@ export default function DriveWearBanners() {
   if (banners.length === 0) return null;
 
   return (
-    <div className="flex flex-col gap-2">
+    <div className={cn("flex flex-col gap-2", className)}>
       {banners.map((c) => (
         <HealthBanner
           key={c.id}

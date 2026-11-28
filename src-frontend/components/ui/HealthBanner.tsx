@@ -1,8 +1,10 @@
-import { X } from "lucide-react";
 import type { HealthCondition } from "../../types";
 import { cn } from "../../lib/format";
-import { renderIcon } from "./icon";
-import { STATUS_ICON } from "./StatusPill";
+import { Button } from "./Button";
+import { StatusIcon } from "./StatusPill";
+import { STATUS_CLASS, type StatusTone } from "./tones";
+
+// CONTRACT §4.7 / docs/design/SPEC.md §17.
 
 export interface HealthBannerProps {
   alert: HealthCondition;
@@ -10,49 +12,60 @@ export interface HealthBannerProps {
   onAction?: () => void;
   /** Shows a "Dismiss" button when given. */
   onDismiss?: () => void;
+  /**
+   * "inline" (default): in-page banner (radius 10, 1 px border; the title on its own line, the detail under it).
+   * "bar": app-level banner under the toolbar (full-bleed, bottom border only, min-height 44, side
+   * padding --page-pad-x; the title and the detail run on in one paragraph).
+   */
+  variant?: "inline" | "bar";
+  /** Shows the action button as loading ("Try again" while the retry runs). */
+  busy?: boolean;
   className?: string;
 }
 
-const SEVERITY_STYLE = {
-  crit: { wrap: "border-crit/50 bg-crit/[0.09]", icon: "text-rose-400", tone: "crit" as const },
-  warn: { wrap: "border-warn/45 bg-warn/[0.08]", icon: "text-warn", tone: "warn" as const },
-  info: { wrap: "border-cyan/35 bg-cyan/[0.06]", icon: "text-cyan", tone: "info" as const },
-};
+const TONE: Record<HealthCondition["severity"], StatusTone> = { crit: "crit", warn: "warn", info: "info" };
 
-/** Full-width alert bar: warn = amber, crit = rose, info = cyan (CONTRACT §4.7). */
-export function HealthBanner({ alert, onAction, onDismiss, className }: HealthBannerProps) {
-  const s = SEVERITY_STYLE[alert.severity] ?? SEVERITY_STYLE.info;
+/**
+ * Alert banner: tint, border and icon from the status tokens (warn = amber triangle, crit =
+ * vermilion filled octagon, info = blue). The action is a small secondary button, never crimson.
+ */
+export function HealthBanner({ alert, onAction, onDismiss, variant = "inline", busy = false, className }: HealthBannerProps) {
+  const tone = TONE[alert.severity] ?? "info";
+  const c = STATUS_CLASS[tone];
+  const bar = variant === "bar";
   return (
     <div
       role={alert.severity === "crit" ? "alert" : "status"}
-      title={alert.rule}
-      className={cn("flex min-w-0 items-center gap-3 rounded-xl border px-4 py-2.5 text-[12.5px]", s.wrap, className)}
+      title={alert.rule || undefined}
+      className={cn(
+        "flex min-w-0 items-center",
+        c.soft,
+        c.border,
+        bar ? "min-h-11 shrink-0 gap-2.5 border-b px-(--page-pad-x) py-1.5 text-callout" : "gap-3 rounded-lg border px-3.5 py-2.5 text-body",
+        className,
+      )}
     >
-      <span className={cn("shrink-0", s.icon)}>{renderIcon(STATUS_ICON[s.tone], 16)}</span>
-      <div className="min-w-0 flex-1">
-        <span className="font-semibold text-ink">{alert.title}</span>
-        {alert.detail && <span className="ml-2 text-slate-300">{alert.detail}</span>}
-      </div>
+      <StatusIcon tone={tone} size={bar ? 17 : 18} />
+      {bar ? (
+        <p className="min-w-0 flex-1 text-ink-2">
+          <span className="font-semibold text-ink">{alert.title}</span>
+          {alert.detail ? <> {alert.detail}</> : null}
+        </p>
+      ) : (
+        <div className="min-w-0 flex-1">
+          <p className="font-semibold text-ink">{alert.title}</p>
+          {alert.detail && <p className="text-callout text-ink-2">{alert.detail}</p>}
+        </div>
+      )}
       {alert.action && onAction && (
-        <button
-          type="button"
-          onClick={onAction}
-          className="shrink-0 rounded-md border border-white/15 bg-white/[0.04] px-2.5 py-1 text-[12px] font-medium text-ink transition-colors hover:bg-white/[0.09]"
-        >
+        <Button size="sm" variant="secondary" loading={busy} onClick={onAction}>
           {alert.action.label}
-        </button>
+        </Button>
       )}
       {onDismiss && (
-        <button
-          type="button"
-          onClick={onDismiss}
-          title="Dismiss"
-          aria-label="Dismiss"
-          className="flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-[12px] text-slate-400 transition-colors hover:bg-white/[0.06] hover:text-slate-200"
-        >
-          <X size={13} aria-hidden="true" />
+        <Button size="sm" variant="plain" onClick={onDismiss}>
           Dismiss
-        </button>
+        </Button>
       )}
     </div>
   );

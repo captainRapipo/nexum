@@ -1,5 +1,6 @@
 import { createContext, createElement, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, errorMessage } from "../lib/api";
+import { sensorsUp } from "../lib/status";
 import type { SystemSpec } from "../types";
 import { useTelemetry } from "./useTelemetryStream";
 
@@ -56,8 +57,8 @@ export function SystemSpecProvider({ children }: { children: ReactNode }) {
 
   const refresh = useCallback(() => load(true), [load]);
 
-  // The agent came (back) up and our cached answer has no agent sections: ask again.
-  const running = agent?.running ?? false;
+  // Sensor reading came (back) up and our cached answer has none of its sections: ask again.
+  const running = sensorsUp(agent);
   const prevRunning = useRef(running);
   useEffect(() => {
     const was = prevRunning.current;

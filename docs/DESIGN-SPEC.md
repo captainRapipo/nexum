@@ -8,6 +8,8 @@
 > * IPC is stdio only: no localhost port and no WebSocket (ROADMAP C3, C6).
 > * The keymap is F1 Dashboard · F2 Sensors · F3 System · F4 Storage · F5 Rescan · F6 Cooling · F7 Drivers · F9 Clean caches (ROADMAP C2).
 > * §9 "Future V2 Enhancements" is superseded by ROADMAP §3.
+> * The dark, BIOS-style look described here was replaced in 1.2 by a light theme in white and crimson. The current design system is in [`design/`](design/) (`SPEC.md`, `RATIONALE.md`, `tokens.css`).
+> * Since 1.2 Nexum can update itself from this repository's GitHub releases: opt-in check, click to install, signature-verified (CONTRACT §2.15). It is still not a silent auto-updater.
 
 **Project Name:** Nexum (`Nexum.exe`)
 **Project Type:** Native Windows Desktop System Monitoring & Maintenance Suite (Windows 10/11)

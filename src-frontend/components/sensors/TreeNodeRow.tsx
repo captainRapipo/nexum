@@ -1,8 +1,9 @@
 import { memo, type MouseEvent } from "react";
-import { ChevronRight } from "lucide-react";
+import { ChevronDown, ChevronRight } from "lucide-react";
 import { cn } from "../../lib/format";
+import { unitText } from "../telemetry/sensorHelpers";
 import { GRID_COLS } from "./SensorRow";
-import { HW_ICON, INDENT, KIND_ICON, KIND_LABEL, ROOT_ICON, ROW_H, type GroupRow, type HwRow, type RootRow } from "./sensorTreeModel";
+import { HW_ICON, INDENT, KIND_LABEL, ROOT_ICON, ROW_H, type GroupRow, type HwRow, type RootRow } from "./sensorTreeModel";
 
 export interface TreeNodeRowProps {
   row: RootRow | HwRow | GroupRow;
@@ -10,31 +11,44 @@ export interface TreeNodeRowProps {
   rowIndex: number;
   domId: string;
   top: number;
+  /** Zebra: every second row of the list. */
+  alt: boolean;
+  tempUnit: "C" | "F";
   selected: boolean;
   focused: boolean;
   onPointerSelect: (e: MouseEvent, key: string) => void;
   onToggle: (key: string) => void;
 }
 
-/** Hostname root, hardware node or sensor-kind group header. Subtle, never zebra. */
-function TreeNodeRowImpl({ row, rowIndex, domId, top, selected, focused, onPointerSelect, onToggle }: TreeNodeRowProps) {
+/**
+ * This PC (root), a hardware node, or a sensor-kind group (SPEC §8). Hardware rows are semibold with
+ * a 15 px icon; a group row reads "Temperatures · °C 6": the unit once for the whole group, then
+ * the number of sensors in tertiary text.
+ */
+function TreeNodeRowImpl({ row, rowIndex, domId, top, alt, tempUnit, selected, focused, onPointerSelect, onToggle }: TreeNodeRowProps) {
   let Icon = ROOT_ICON;
   let title = "";
-  let meta = "";
+  let count = "";
+  let countLabel = "";
+  let units = "";
   if (row.kind === "root") {
     title = row.name;
-    meta = `${row.sensorCount} sensor${row.sensorCount === 1 ? "" : "s"}`;
+    count = `${row.sensorCount} sensor${row.sensorCount === 1 ? "" : "s"}`;
+    countLabel = count;
   } else if (row.kind === "hw") {
     Icon = HW_ICON[row.hw.kind] ?? HW_ICON.other;
     title = row.hw.name;
-    meta = row.sensorCount > 0 ? String(row.sensorCount) : "";
+    count = row.sensorCount > 0 ? String(row.sensorCount) : "";
+    countLabel = count ? `${count} sensors` : "";
   } else {
-    Icon = KIND_ICON[row.sensorKind];
     title = KIND_LABEL[row.sensorKind];
-    meta = String(row.sensorIds.length);
+    count = String(row.sensorIds.length);
+    countLabel = `${count} sensors`;
+    units = [...new Set(row.units.map((u) => unitText(u, tempUnit)))].join(" · ");
   }
 
   const isGroup = row.kind === "group";
+  const Chevron = row.expanded ? ChevronDown : ChevronRight;
 
   return (
     <div
@@ -47,20 +61,19 @@ function TreeNodeRowImpl({ row, rowIndex, domId, top, selected, focused, onPoint
       onMouseDown={(e) => onPointerSelect(e, row.key)}
       onDoubleClick={() => row.expandable && onToggle(row.key)}
       className={cn(
-        "absolute inset-x-0 grid select-none items-center gap-x-3 pr-3 transition-colors duration-100",
-        selected ? "bg-teal/[0.08]" : "hover:bg-white/[0.025]",
-        focused && "shadow-[inset_2px_0_0_0_var(--color-teal)]",
-        !isGroup && "border-t border-white/[0.04]",
+        "absolute inset-x-0 grid select-none items-center text-table",
+        selected ? "bg-selected" : cn(alt && "bg-row-alt", "hover:bg-hover"),
+        focused && "group-focus-visible/grid:shadow-[inset_0_0_0_2px_var(--color-control-on)]",
       )}
       style={{ top, height: ROW_H, gridTemplateColumns: GRID_COLS }}
     >
       <div
         role="gridcell"
         aria-colindex={1}
-        aria-colspan={6}
-        aria-label={meta ? `${title}, ${row.kind === "root" ? meta : `${meta} sensors`}` : title}
-        className="col-span-6 flex min-w-0 items-center gap-1.5"
-        style={{ paddingLeft: 4 + row.level * INDENT }}
+        aria-colspan={7}
+        aria-label={[title, units ? `in ${units}` : "", countLabel].filter(Boolean).join(", ")}
+        className="col-span-7 flex min-w-0 items-center pr-3"
+        style={{ paddingLeft: `calc(var(--page-pad-x) + ${row.level * INDENT}px)` }}
       >
         <button
           type="button"
@@ -74,37 +87,18 @@ function TreeNodeRowImpl({ row, rowIndex, domId, top, selected, focused, onPoint
             onToggle(row.key);
           }}
           className={cn(
-            "flex size-5 shrink-0 items-center justify-center rounded text-slate-500 hover:bg-white/[0.06] hover:text-slate-200",
+            "-ml-1 mr-0.5 flex size-[18px] shrink-0 items-center justify-center rounded-xs text-ink-3 hover:bg-pressed hover:text-ink",
             !row.expandable && "invisible",
           )}
         >
-          <ChevronRight
-            size={13}
-            strokeWidth={2.2}
-            className={cn("transition-transform duration-150", row.expanded && "rotate-90")}
-            aria-hidden="true"
-          />
+          <Chevron size={12} aria-hidden="true" />
         </button>
-        <Icon
-          size={isGroup ? 12 : 14}
-          strokeWidth={1.9}
-          aria-hidden="true"
-          className={cn("shrink-0", isGroup ? "text-slate-500" : row.kind === "root" ? "text-teal" : "text-slate-300")}
-        />
-        {isGroup ? (
-          <span className="truncate text-[10.5px] font-semibold uppercase tracking-[0.14em] text-slate-400">{title}</span>
-        ) : (
-          <span
-            className={cn(
-              "truncate font-semibold",
-              row.kind === "root" ? "text-[13px] tracking-wide text-ink" : "text-[12.5px] text-slate-100",
-            )}
-            title={title}
-          >
-            {title}
-          </span>
-        )}
-        {meta && <span className="num shrink-0 text-[10.5px] text-slate-600">{meta}</span>}
+        {!isGroup && <Icon size={15} aria-hidden="true" className="mr-[7px] shrink-0 text-icon-2" />}
+        <span className={cn("truncate font-semibold", isGroup ? "text-[12px] text-ink-2" : "text-ink")} title={title}>
+          {title}
+        </span>
+        {units && <span className="ml-1.5 shrink-0 whitespace-nowrap text-[12px] text-ink-3">· {units}</span>}
+        {count && <span className="ml-2 shrink-0 whitespace-nowrap text-[11.5px] text-ink-3 tnum">{count}</span>}
       </div>
     </div>
   );

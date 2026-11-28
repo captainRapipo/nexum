@@ -1,14 +1,15 @@
-import { useId, useMemo } from "react";
+import { useMemo } from "react";
 import { cn } from "../../lib/format";
+import { SERIES_HEX } from "./tones";
 
 export interface SparklineProps {
   /** null = no reading; when every point is null (or there are none) nothing is rendered (MF-2). */
   data: readonly (number | null | undefined)[];
-  /** Any CSS colour, including `var(--color-teal)`. */
-  color: string;
+  /** Any CSS colour, including `var(--color-series-cpu)`. Default: the neutral series grey. Never a status colour. */
+  color?: string;
   height?: number;
   className?: string;
-  /** Draw the gradient area under the line. Default true. */
+  /** Draw a flat 8 % area under the line. Default false. */
   fill?: boolean;
   /** Fixed scale bounds; auto-fit when omitted. */
   min?: number;
@@ -20,16 +21,14 @@ const VB_W = 100;
 
 export function Sparkline({
   data,
-  color,
+  color = SERIES_HEX.neutral,
   height = 32,
   className,
-  fill = true,
+  fill = false,
   min,
   max,
-  strokeWidth = 1.6,
+  strokeWidth = 1.5,
 }: SparklineProps) {
-  const gradId = `spark-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
-
   const paths = useMemo(() => {
     const pts = data.filter((v): v is number => typeof v === "number" && Number.isFinite(v));
     if (pts.length < 2) return null;
@@ -62,19 +61,13 @@ export function Sparkline({
       style={{ height }}
       aria-hidden="true"
     >
-      <defs>
-        <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" style={{ stopColor: color, stopOpacity: 0.32 }} />
-          <stop offset="100%" style={{ stopColor: color, stopOpacity: 0 }} />
-        </linearGradient>
-      </defs>
       {paths ? (
         <>
-          {fill && <path d={paths.area} fill={`url(#${gradId})`} stroke="none" />}
+          {fill && <path d={paths.area} style={{ fill: color }} fillOpacity={0.08} stroke="none" />}
           <path
             d={paths.line}
             fill="none"
-            style={{ stroke: color, filter: `drop-shadow(0 0 3px ${color})` }}
+            style={{ stroke: color }}
             strokeWidth={strokeWidth}
             strokeLinejoin="round"
             strokeLinecap="round"

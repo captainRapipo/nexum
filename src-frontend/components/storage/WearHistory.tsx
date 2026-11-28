@@ -1,18 +1,15 @@
 import { useMemo } from "react";
 import type { EChartsOption } from "echarts";
 import { Loader2, RefreshCw } from "lucide-react";
-import type { DriveForecast, DriveHistoryPoint } from "../../types";
-import { DottedLeaderRow, EChart, SERIES_HEX, Sparkline } from "../ui";
-import { useDriveHistory } from "../../hooks/useDriveHistory";
-import { fmtForecast } from "../../lib/alerts";
-import { fmtCount } from "../../lib/format";
+import type { DriveForecast, DriveHistory, DriveHistoryPoint } from "../../types";
+import { Button, CHART_HEX, EChart, SERIES_HEX } from "../ui";
+import { cn, fmtCount } from "../../lib/format";
 
-/** Forecast minimums (CONTRACT §2.11): ≥ 7 daily points spanning ≥ 14 days. */
+/** Forecast minimums (CONTRACT §2.11): at least 7 daily points spanning at least 14 days. */
 const MIN_POINTS = 7;
 const MIN_DAYS = 14;
-
-const HEALTH = SERIES_HEX.disk;
-const WRITTEN = "#94A3B8";
+const DAYS_PER_MONTH = 30.4375;
+const DAY_MS = 86_400_000;
 
 /** Day-level parse of "YYYY-MM-DD" as local midnight (the ledger stores local dates). */
 function dayTs(date: string): number {
@@ -20,87 +17,98 @@ function dayTs(date: string): number {
   return new Date(y, (m || 1) - 1, d || 1).getTime();
 }
 
-function fmtMonths(m: number): string {
-  if (m <= 0) return "At or below 10% now";
-  if (m < 24) return `About ${m.toFixed(m < 10 ? 1 : 0)} months`;
-  return `About ${(m / 12).toFixed(1)} years`;
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+function monthLabel(ts: number): string {
+  const d = new Date(ts);
+  return `${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
 }
 
-const NOT_REPORTED = <span className="text-muted">Not reported</span>;
+/** "12 months", "3 weeks", "5 days": how much history the ledger covers. */
+export function spanText(points: readonly DriveHistoryPoint[]): string | null {
+  if (points.length < 2) return null;
+  const days = Math.round((dayTs(points[points.length - 1].date) - dayTs(points[0].date)) / DAY_MS);
+  if (days >= 45) {
+    const m = Math.round(days / DAYS_PER_MONTH);
+    return `${m} month${m === 1 ? "" : "s"}`;
+  }
+  if (days >= 14) return `${Math.round(days / 7)} weeks`;
+  return `${days} day${days === 1 ? "" : "s"}`;
+}
 
-function forecastRows(f: DriveForecast) {
+/** Change of life left per month between the first and the last reading, or null when the span is too short. */
+function monthlyRate(points: readonly DriveHistoryPoint[]): number | null {
+  const pts = points.filter((p) => p.healthPct != null);
+  if (pts.length < 2) return null;
+  const a = pts[0];
+  const b = pts[pts.length - 1];
+  const days = (dayTs(b.date) - dayTs(a.date)) / DAY_MS;
+  if (days < MIN_DAYS) return null;
+  return (((b.healthPct as number) - (a.healthPct as number)) / days) * DAYS_PER_MONTH;
+}
+
+function rateText(rate: number): string {
+  const abs = Math.abs(rate);
+  if (abs < 0.05) return "No measurable change";
+  const n = abs >= 10 ? abs.toFixed(0) : abs.toFixed(1);
+  return `${rate < 0 ? "−" : "+"}${n} points a month`;
+}
+
+/** "5 of 7 daily readings, 9 of 14 days" while the forecast is still collecting data; null otherwise. */
+export function forecastProgress(f: DriveForecast): string | null {
+  if (f.status !== "notEnoughData") return null;
   return (
-    <div className="space-y-0.5">
-      <DottedLeaderRow
-        label="Written per month"
-        value={f.tbPerMonth != null ? `${f.tbPerMonth.toFixed(2)} TB` : NOT_REPORTED}
-        valueClassName="font-mono"
-      />
-      <DottedLeaderRow
-        label="Until 10% life left"
-        value={f.monthsTo10Pct != null ? fmtMonths(f.monthsTo10Pct) : <span className="text-muted">—</span>}
-        valueClassName="font-mono"
-      />
-      <DottedLeaderRow
-        label="Based on"
-        value={`${fmtCount(f.points)} daily reading${f.points === 1 ? "" : "s"} over ${fmtCount(f.basisDays)} day${f.basisDays === 1 ? "" : "s"}`}
-        valueClassName="font-mono"
-      />
-    </div>
+    `${fmtCount(Math.min(f.points, MIN_POINTS))} of ${MIN_POINTS} daily readings` +
+    (f.basisDays < MIN_DAYS ? `, ${fmtCount(f.basisDays)} of ${MIN_DAYS} days` : "")
   );
 }
 
 function WearChart({ points }: { points: readonly DriveHistoryPoint[] }) {
   const option = useMemo<EChartsOption>(() => {
     const health = points.map((p) => [dayTs(p.date), p.healthPct] as [number, number | null]);
-    const written = points.map((p) => [dayTs(p.date), p.dataWrittenTb] as [number, number | null]);
-    const hasWritten = written.some(([, v]) => v != null);
-    const axisLabel = { color: "#64748B", fontSize: 9.5, fontFamily: "JetBrains Mono, monospace" };
+    const written = new Map(points.map((p) => [dayTs(p.date), p.dataWrittenTb]));
+    const first = health[0]?.[0] ?? 0;
+    const last = health[health.length - 1]?.[0] ?? 0;
+    const color = SERIES_HEX.single;
     return {
-      backgroundColor: "transparent",
       animation: false,
-      grid: { left: 34, right: hasWritten ? 40 : 8, top: 10, bottom: 20 },
+      grid: { left: 36, right: 6, top: 6, bottom: 20, containLabel: false },
       xAxis: {
-        type: "time",
-        axisLine: { lineStyle: { color: "rgba(255,255,255,0.12)" } },
-        axisLabel: { ...axisLabel, hideOverlap: true },
+        type: "value",
+        min: first,
+        max: last,
+        // Only the two ends are labelled.
+        interval: Math.max(1, last - first),
+        axisLabel: {
+          formatter: (v: number) => monthLabel(v),
+          showMinLabel: true,
+          showMaxLabel: true,
+          alignMinLabel: "left",
+          alignMaxLabel: "right",
+        },
+        axisLine: { show: true, lineStyle: { color: CHART_HEX.axis, width: 1 } },
+        axisTick: { show: false },
         splitLine: { show: false },
       },
-      yAxis: [
-        {
-          type: "value",
-          name: "",
-          min: (v: { min: number }) => Math.max(0, Math.floor((v.min - 2) / 5) * 5),
-          // Zoom to the data (at least a 20-point span) so a slow decline stays visible.
-          max: (v: { min: number; max: number }) =>
-            Math.min(100, Math.max(Math.ceil((v.max + 2) / 5) * 5, Math.max(0, Math.floor((v.min - 2) / 5) * 5) + 20)),
-          axisLabel: { ...axisLabel, formatter: "{value}%" },
-          splitLine: { lineStyle: { color: "rgba(255,255,255,0.05)" } },
-        },
-        {
-          type: "value",
-          show: hasWritten,
-          scale: true,
-          axisLabel: { ...axisLabel, formatter: (v: number) => `${v} TB` },
-          splitLine: { show: false },
-        },
-      ],
+      yAxis: {
+        type: "value",
+        min: 0,
+        max: 100,
+        interval: 50,
+        axisLabel: { formatter: "{value}%" },
+      },
       tooltip: {
         trigger: "axis",
-        backgroundColor: "rgba(8,14,17,0.95)",
-        borderColor: "rgba(255,255,255,0.08)",
-        textStyle: { color: "#F8FAFC", fontSize: 11, fontFamily: "JetBrains Mono, monospace" },
         formatter: (params: unknown) => {
-          const arr = Array.isArray(params) ? params : [params];
-          const first = arr[0] as { value?: [number, number | null] } | undefined;
-          const day = first?.value ? new Date(first.value[0]).toLocaleDateString() : "";
-          const lines = arr.map((p) => {
-            const it = p as { seriesName?: string; color?: string; value?: [number, number | null] };
-            const v = it.value?.[1];
-            const text = v == null ? "—" : it.seriesName === "Life left" ? `${v}%` : `${v.toFixed(1)} TB`;
-            return `<span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${it.color};margin-right:6px"></span>${it.seriesName}: <b>${text}</b>`;
-          });
-          return [`<span style="color:#64748B">${day}</span>`, ...lines].join("<br/>");
+          const p = (Array.isArray(params) ? params[0] : params) as { value?: [number, number | null] } | undefined;
+          if (!p?.value) return "";
+          const [t, v] = p.value;
+          const w = written.get(t);
+          const day = new Date(t).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+          return (
+            `<span style="color:${CHART_HEX.label}">${day}</span><br/>` +
+            `Life left <b>${v == null ? "—" : `${v}%`}</b>` +
+            (w != null ? `<br/>Data written <b>${w.toFixed(1)} TB</b>` : "")
+          );
         },
       },
       series: [
@@ -108,133 +116,86 @@ function WearChart({ points }: { points: readonly DriveHistoryPoint[] }) {
           name: "Life left",
           type: "line",
           data: health,
-          yAxisIndex: 0,
-          showSymbol: points.length < 20,
-          symbolSize: 4,
+          showSymbol: false,
           connectNulls: false,
-          lineStyle: { width: 1.8, color: HEALTH },
-          itemStyle: { color: HEALTH },
+          lineStyle: { width: 1.5, color },
+          itemStyle: { color },
+          areaStyle: { color, opacity: 0.06 },
+          emphasis: { disabled: true },
         },
-        ...(hasWritten
-          ? [
-              {
-                name: "Data written",
-                type: "line" as const,
-                data: written,
-                yAxisIndex: 1,
-                showSymbol: false,
-                connectNulls: false,
-                lineStyle: { width: 1.2, color: WRITTEN, type: "dashed" as const },
-                itemStyle: { color: WRITTEN },
-              },
-            ]
-          : []),
       ],
     } as EChartsOption;
   }, [points]);
 
-  return <EChart option={option} style={{ width: "100%", height: 150 }} />;
+  return <EChart option={option} notMerge style={{ width: "100%", height: 74 }} className="min-h-0" />;
+}
+
+export interface WearHistoryProps {
+  history: DriveHistory | null;
+  loading: boolean;
+  error: string | null;
+  reload: () => Promise<void> | void;
+  /** Docked inspector: the caption sits under the chart instead of beside it. */
+  compact?: boolean;
 }
 
 /**
- * "Wear history" section of the S.M.A.R.T. drawer (CONTRACT §2.11, §4.10.2): daily life-left and
- * data-written readings from the local ledger, and the forecast Rust computes from them.
+ * "Wear history" section of the S.M.A.R.T. details (CONTRACT §2.11, §4.10.3): the daily life-left
+ * readings from the local ledger as one ink line, and how fast the figure moves. The forecast
+ * sentence is shown in the life hero above; the hover lists the data written by each day.
  */
-export default function WearHistory({ serial }: { serial: string }) {
-  const { history, loading, error, reload } = useDriveHistory(serial);
-
+export default function WearHistory({ history, loading, error, reload, compact = false }: WearHistoryProps) {
   if (error) {
     return (
-      <div className="flex items-center justify-between gap-3 rounded-lg border border-line bg-white/[0.02] px-3 py-2 text-[11.5px] text-slate-400">
+      <div className="flex items-center justify-between gap-3 rounded-lg bg-inset px-3 py-2 text-callout text-ink-2">
         <span className="min-w-0">Could not read the wear history: {error}</span>
-        <button
-          type="button"
-          onClick={() => void reload()}
-          className="inline-flex shrink-0 items-center gap-1 rounded-md border border-line px-2 py-0.5 text-[11px] text-silver hover:text-ink"
-        >
-          <RefreshCw size={11} aria-hidden="true" />
+        <Button size="sm" icon={RefreshCw} onClick={() => void reload()}>
           Try again
-        </button>
+        </Button>
       </div>
     );
   }
   if (!history) {
     return loading ? (
-      <div className="flex items-center gap-2 text-[11.5px] text-muted">
-        <Loader2 size={12} className="animate-spin" aria-hidden="true" />
+      <div className="flex items-center gap-2 text-callout text-ink-2">
+        <Loader2 size={13} className="animate-spin" aria-hidden="true" />
         Reading the wear history…
       </div>
     ) : null;
   }
 
   const f = history.forecast;
-  const chartable = history.points.filter((p) => p.healthPct != null || p.dataWrittenTb != null);
-  const progress =
-    f.status === "notEnoughData"
-      ? `${fmtCount(Math.min(f.points, MIN_POINTS))} of ${MIN_POINTS} daily readings` +
-        (f.basisDays < MIN_DAYS ? `, ${fmtCount(f.basisDays)} of ${MIN_DAYS} days` : "")
+  const chartable = history.points.filter((p) => p.healthPct != null);
+  const rate = monthlyRate(chartable);
+  const progress = forecastProgress(f);
+  const basis =
+    f.status !== "notEnoughData"
+      ? `Based on ${fmtCount(f.points)} daily reading${f.points === 1 ? "" : "s"} over ${fmtCount(f.basisDays)} day${f.basisDays === 1 ? "" : "s"}.`
       : null;
+  const note = [
+    progress ? `${progress} so far.` : null,
+    basis,
+    "One reading per drive per day, kept only on this PC. The forecast is a straight-line estimate and changes with how you use the drive.",
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
     <div>
       {chartable.length >= 2 ? (
-        <div className="-mx-1 mb-2">
+        <div className={cn(compact ? "flex flex-col gap-1.5" : "grid grid-cols-[minmax(0,1fr)_170px] items-center gap-[18px]")}>
           <WearChart points={chartable} />
-          <div className="mt-0.5 flex items-center gap-3 px-1 text-[10px] text-muted">
-            <span className="inline-flex items-center gap-1">
-              <span aria-hidden="true" className="h-[2px] w-3 rounded" style={{ background: HEALTH }} />
-              Life left
-            </span>
-            {chartable.some((p) => p.dataWrittenTb != null) && (
-              <span className="inline-flex items-center gap-1">
-                <span aria-hidden="true" className="h-0 w-3 border-t border-dashed" style={{ borderColor: WRITTEN }} />
-                Data written
-              </span>
-            )}
+          <div className="text-callout text-ink-2" title={note}>
+            <b className="tnum block text-headline text-ink">{rate == null ? "Collecting readings" : rateText(rate)}</b>
+            {!compact && <span>Life left as the drive reports it, one reading a day.</span>}
           </div>
         </div>
-      ) : null}
-      <p className="mb-2 text-[12px] leading-relaxed text-silver">{fmtForecast(f)}</p>
-      {progress && <p className="mb-2 font-mono text-[11px] text-muted">{progress}</p>}
-      {f.status !== "notEnoughData" && forecastRows(f)}
-      <p className="mt-1.5 text-[10.5px] leading-snug text-muted">
-        Nexum records one reading per drive per day while it runs, kept only on this PC. The forecast is a straight-line
-        estimate from the last year and changes with how you use the drive.
-      </p>
-    </div>
-  );
-}
-
-/**
- * One-line wear summary for a drive card (CONTRACT §2.11): life-left sparkline of the daily ledger and
- * the forecast sentence. Renders nothing until there is history to show.
- */
-export function DiskWearLine({ serial, onDetails }: { serial: string | null; onDetails?: () => void }) {
-  const { history } = useDriveHistory(serial && serial.trim() ? serial : null);
-  if (!history) return null;
-  const f = history.forecast;
-  const life = history.points.slice(-120).map((p) => p.healthPct);
-  const text = fmtForecast(f);
-  const progress =
-    f.status === "notEnoughData" ? ` ${fmtCount(Math.min(f.points, MIN_POINTS))} of ${MIN_POINTS} daily readings so far.` : "";
-  return (
-    <button
-      type="button"
-      onClick={onDetails}
-      disabled={!onDetails}
-      title={`${text}${progress} Open the S.M.A.R.T. details for the wear history.`}
-      className="mt-2 flex w-full min-w-0 items-center gap-2 rounded-md text-left text-[11px] text-slate-400 transition hover:text-slate-200 disabled:cursor-default"
-    >
-      <span className="shrink-0 text-[9.5px] uppercase tracking-[0.16em] text-muted">Wear</span>
-      {life.filter((v) => v != null).length >= 2 && (
-        <span className="w-[72px] shrink-0">
-          <Sparkline data={life} color={HEALTH} height={16} fill={false} strokeWidth={1.4} />
-        </span>
+      ) : (
+        <p className="text-callout text-ink-2">
+          {history.points.length === 0 ? "No readings recorded yet." : "The chart appears after two daily readings with a life figure."}
+        </p>
       )}
-      <span className="min-w-0 truncate">
-        {text}
-        {progress}
-      </span>
-    </button>
+      {(progress || chartable.length < 2) && <p className="mt-2 text-callout text-ink-3">{note}</p>}
+    </div>
   );
 }

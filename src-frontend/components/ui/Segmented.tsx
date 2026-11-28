@@ -6,19 +6,26 @@ export interface SegmentedOption<T extends string | number> {
   label: ReactNode;
   title?: string;
   disabled?: boolean;
+  /** [NEW 1.2] Count shown after the label in tertiary text ("Display 12"). */
+  count?: number;
 }
 
 export interface SegmentedProps<T extends string | number> {
   value: T;
   options: ReadonlyArray<SegmentedOption<T>>;
   onChange: (value: T) => void;
-  size?: "sm" | "md";
+  /** "sm" and "md": 22 px segments. "lg" (view tabs): 26 px, 13 px text. */
+  size?: "sm" | "md" | "lg";
   ariaLabel?: string;
   className?: string;
   disabled?: boolean;
 }
 
-/** Segmented control (radiogroup with arrow-key navigation). */
+/**
+ * Segmented control (radiogroup with arrow-key navigation). CONTRACT §4.7 / docs/design/SPEC.md §13:
+ * grey track, the selected segment is graphite with white 600 text (never crimson). `size="lg"` is the
+ * view-tab look (System, Cooling).
+ */
 export function Segmented<T extends string | number>({
   value,
   options,
@@ -60,7 +67,7 @@ export function Segmented<T extends string | number>({
       aria-label={ariaLabel}
       aria-disabled={disabled || undefined}
       className={cn(
-        "inline-flex items-center gap-0.5 rounded-lg border border-line bg-black/25 p-0.5",
+        "inline-flex items-center gap-0.5 rounded-[8px] bg-seg-track p-0.5",
         disabled && "pointer-events-none opacity-50",
         className,
       )}
@@ -82,15 +89,15 @@ export function Segmented<T extends string | number>({
             onClick={() => onChange(o.value)}
             onKeyDown={(e) => onKeyDown(e, i)}
             className={cn(
-              "num rounded-md font-semibold transition-[background-color,color,box-shadow] duration-150",
-              size === "sm" ? "h-6 px-2.5 text-[11px]" : "h-7 px-3 text-[12px]",
-              active
-                ? "bg-teal/[0.14] text-teal shadow-[inset_0_0_0_1px_rgba(45,212,191,0.45),0_0_14px_-4px_rgba(45,212,191,0.6)]"
-                : "text-slate-400 hover:bg-white/[0.05] hover:text-slate-200",
+              "tnum inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-sm leading-none",
+              "transition-[background-color,color,box-shadow] duration-(--dur-fast) ease-standard",
+              size === "lg" ? "h-[26px] px-3.5 text-[13px]" : "h-[22px] px-2.5 text-[12px]",
+              active ? "bg-control-on font-semibold text-white shadow-[0_1px_2px_var(--color-strong)]" : "font-medium text-ink enabled:hover:bg-fill/5",
               o.disabled && "opacity-40",
             )}
           >
             {o.label}
+            {o.count != null && <span className={cn("font-medium", active ? "text-seg-count" : "text-ink-3")}>{o.count}</span>}
           </button>
         );
       })}

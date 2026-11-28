@@ -26,6 +26,7 @@ import type {
   TrashScan,
   TuningProbeSummary,
   TuningState,
+  UpdateState,
   Volume,
 } from "../types";
 import { TRASH_DETAILS_LIMIT } from "../types";
@@ -168,12 +169,16 @@ export const api = {
 
   getAgentStatus: () => call<AgentStatus>("get_agent_status", undefined, (m) => m.getAgentStatus()),
 
+  /**
+   * [CHANGED 1.2] Restarts sensor reading and resets the automatic-restart counter (CONTRACT §2.3.1).
+   * This is the sensors banner's "Try again" and Settings › Sensors › "Restart sensor reading".
+   */
   restartAgent: () => call<void>("restart_agent", undefined, (m) => m.restartAgent()),
 
   openExternal: (target: string) =>
     call<void>("open_external", { target }, (m) => m.openExternal(target)),
 
-  /** [NEW] Cached LHM sensor tree, or null when the agent is down / did not answer within 5 s. */
+  /** [NEW] Cached LHM sensor tree, or null when sensor reading is down / did not answer within 5 s. */
   getSensorTree: () => call<SensorTree | null>("get_sensor_tree", undefined, (m) => m.getSensorTree()),
 
   /** [NEW] Prefer `useSensorStream(active)` (ref-counted) over calling this directly. */
@@ -282,7 +287,25 @@ export const api = {
     return call<TuningProbeSummary>("run_tuning_probe", { write: false }, (m) => m.runTuningProbe(false));
   },
 
-  /** App version (Tauri app metadata when native, package.json version otherwise). */
+  /* ── [NEW 1.2] In-app updates (CONTRACT §2.15). Prefer useUpdater(). The frontend has no network
+     API: Rust owns the check, the download, the signature check and the install. ── */
+
+  /** Current update state. Never touches the network. */
+  getUpdateState: () => call<UpdateState>("get_update_state", undefined, (m) => m.getUpdateState()),
+
+  /**
+   * A check the user asked for (a click). Resolves with the final state when the check has finished;
+   * rejects while Settings.updateCheck is still "ask" (save the answer first).
+   */
+  checkForUpdate: () => call<UpdateState>("check_for_update", undefined, (m) => m.checkForUpdate()),
+
+  /**
+   * Only from the "Install update" click: download → verify → stage → start the installer → exit.
+   * Resolves once the work has started; progress and failures arrive through the `update-state` event.
+   */
+  installUpdate: () => call<void>("install_update", undefined, (m) => m.installUpdate()),
+
+  /** App version (Tauri app metadata when native, package.json version otherwise). Prefer UpdateState.currentVersion when it is set. */
   getAppVersion: async (): Promise<string> => {
     if (!isTauri) return __NEXUM_VERSION__;
     try {

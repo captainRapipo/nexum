@@ -1,87 +1,140 @@
 import { useMemo } from "react";
 import type { EChartsOption } from "echarts";
-import { EChart } from "../ui";
-
-const TEAL = "#2DD4BF";
-const CYAN = "#22D3EE";
+import { CHART_FONT, CHART_HEX, EChart, SERIES_HEX, nexumLine, type SeriesKey } from "../ui";
+import { cn } from "../../lib/format";
 
 export interface ThroughputChartProps {
-  /** Unix ms timestamps aligned with read/write. */
-  ts: number[];
-  read: (number | null)[];
-  write: (number | null)[];
-  height?: number;
+  /** Unix ms timestamps aligned with read/write, oldest first. */
+  ts: readonly number[];
+  read: readonly (number | null)[];
+  write: readonly (number | null)[];
+  /** Width of the time window in seconds (the x axis runs from −rangeSec to Now). */
+  rangeSec?: number;
+  className?: string;
 }
 
-function fmtRate(v: number): string {
+export function fmtRate(v: number): string {
   if (v >= 1000) return `${(v / 1000).toFixed(2)} GB/s`;
   if (v >= 100) return `${v.toFixed(0)} MB/s`;
   if (v >= 10) return `${v.toFixed(1)} MB/s`;
   return `${v.toFixed(2)} MB/s`;
 }
 
-/** Mini read/write MB/s line chart for one disk (last ~120 telemetry samples). */
-export default function ThroughputChart({ ts, read, write, height = 70 }: ThroughputChartProps) {
+/** Number part of a rate for a line-end label, in MB/s ("1.95", "12.4", "310"). */
+function rateNumber(v: number): string {
+  if (v >= 100) return v.toFixed(0);
+  if (v >= 10) return v.toFixed(1);
+  return v.toFixed(2);
+}
+
+/** Next "nice" axis maximum (1, 2, 4, 5, 8 × 10ⁿ) at or above `v`; never below 1 MB/s so idle noise stays flat. */
+function niceMax(v: number): number {
+  const x = Math.max(1, v);
+  const p = Math.pow(10, Math.floor(Math.log10(x)));
+  for (const m of [1, 2, 4, 5, 8, 10]) if (m * p >= x) return m * p;
+  return 10 * p;
+}
+
+function endLabel(name: string, key: SeriesKey, inGb: boolean) {
+  return {
+    show: true,
+    distance: 10,
+    padding: [3, 0],
+    lineHeight: 16,
+    fontFamily: CHART_FONT,
+    fontSize: 11.5,
+    fontWeight: 500 as const,
+    color: CHART_HEX.text,
+    formatter: (p: { value?: unknown }) => {
+      const v = Array.isArray(p.value) ? p.value[p.value.length - 1] : p.value;
+      // On the MB/s axis the label is the bare number; on a GB/s axis it carries its own unit,
+      // because the live value is usually far below the axis maximum.
+      return v == null ? "" : `{s|} {v|${inGb ? fmtRate(Number(v)) : rateNumber(Number(v))}} ${name}`;
+    },
+    rich: {
+      s: { width: 10, height: 2.5, borderRadius: 2, backgroundColor: SERIES_HEX[key] },
+      v: { color: CHART_HEX.ink, fontWeight: 600 as const, fontFamily: CHART_FONT, fontSize: 11.5 },
+    },
+  };
+}
+
+/**
+ * Live read / write throughput of one drive (SPEC §25): two labelled lines, no legend, the tooltip
+ * only on hover. Read is navy, Write is teal; neither is a status colour.
+ */
+export default function ThroughputChart({ ts, read, write, rangeSec = 120, className }: ThroughputChartProps) {
   const option = useMemo<EChartsOption>(() => {
-    const series = (name: string, color: string, data: (number | null)[]) => ({
-      name,
-      type: "line" as const,
-      data: data.map((v, i) => [ts[i], v]),
-      showSymbol: false,
-      smooth: 0.35,
-      connectNulls: false,
-      lineStyle: { width: 1.6, color },
-      itemStyle: { color },
-      areaStyle: {
-        color: {
-          type: "linear" as const,
-          x: 0,
-          y: 0,
-          x2: 0,
-          y2: 1,
-          colorStops: [
-            { offset: 0, color: `${color}55` },
-            { offset: 1, color: `${color}00` },
-          ],
-        },
-      },
-      animation: false,
-    });
+    const last = ts.length > 0 ? ts[ts.length - 1] : 0;
+    const rel = (i: number) => Math.round((ts[i] - last) / 100) / 10;
+    const pairs = (data: readonly (number | null)[]) => {
+      const out: Array<[number, number | null]> = [];
+      for (let i = 0; i < ts.length; i++) {
+        const x = rel(i);
+        if (x >= -rangeSec) out.push([x, data[i] ?? null]);
+      }
+      return out;
+    };
+    const r = pairs(read);
+    const w = pairs(write);
+    let peak = 0;
+    for (const [, v] of r) if (v != null && v > peak) peak = v;
+    for (const [, v] of w) if (v != null && v > peak) peak = v;
+    const yMax = niceMax(peak * 1.1);
+
+    const line = (name: string, key: SeriesKey, data: Array<[number, number | null]>) =>
+      nexumLine(name, key, [], "", {
+        data,
+        areaStyle: undefined,
+        endLabel: endLabel(name, key, yMax >= 1000),
+      });
 
     return {
-      backgroundColor: "transparent",
-      grid: { left: 2, right: 2, top: 6, bottom: 2 },
-      xAxis: { type: "time", show: false },
+      animation: false,
+      grid: { left: 58, right: yMax >= 1000 ? 124 : 84, top: 8, bottom: 24, containLabel: false },
+      xAxis: {
+        type: "value",
+        min: -rangeSec,
+        max: 0,
+        interval: rangeSec / 2,
+        axisLabel: {
+          formatter: (v: number) => (v === 0 ? "Now" : `−${Math.abs(v) >= 120 ? `${Math.abs(v) / 60} min` : `${Math.abs(v)} s`}`),
+          showMinLabel: true,
+          showMaxLabel: true,
+          alignMinLabel: "left",
+          alignMaxLabel: "right",
+        },
+        axisLine: { show: true, lineStyle: { color: CHART_HEX.axis, width: 1 } },
+        axisTick: { show: false },
+        splitLine: { show: false },
+      },
       yAxis: {
         type: "value",
-        show: false,
         min: 0,
-        // Keep a small floor so an idle drive doesn't render noise as a full-height spike.
-        max: (v: { max: number }) => Math.max(1, v.max * 1.15),
+        max: yMax,
+        interval: yMax / 2,
+        axisLabel: {
+          formatter: (v: number) => {
+            const n = yMax >= 1000 ? v / 1000 : v;
+            return `${Number.isInteger(n) ? n : n.toFixed(1)} ${yMax >= 1000 ? "GB/s" : "MB/s"}`;
+          },
+        },
       },
       tooltip: {
         trigger: "axis",
-        backgroundColor: "rgba(8,14,17,0.95)",
-        borderColor: "rgba(255,255,255,0.08)",
-        textStyle: { color: "#F8FAFC", fontSize: 11, fontFamily: "JetBrains Mono, monospace" },
-        axisPointer: { type: "line", lineStyle: { color: "rgba(255,255,255,0.15)" } },
         formatter: (params: unknown) => {
-          const arr = Array.isArray(params) ? params : [params];
-          const first = arr[0] as { value?: [number, number | null] } | undefined;
-          const time = first?.value ? new Date(first.value[0]).toLocaleTimeString() : "";
+          const arr = (Array.isArray(params) ? params : [params]) as Array<{ seriesName?: string; color?: string; value?: [number, number | null] }>;
+          const x = arr[0]?.value?.[0];
+          const head = x == null ? "" : x === 0 ? "Now" : `${Math.abs(Math.round(x))} s ago`;
           const lines = arr.map((p) => {
-            const item = p as { seriesName?: string; color?: string; value?: [number, number | null] };
-            const v = item.value?.[1];
-            return `<span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${item.color};margin-right:6px"></span>${item.seriesName}: <b>${v == null ? "—" : fmtRate(v)}</b>`;
+            const v = p.value?.[1];
+            return `<span style="display:inline-block;width:10px;height:2.5px;border-radius:2px;background:${p.color};margin:0 6px 3px 0"></span>${p.seriesName} <b>${v == null ? "—" : fmtRate(v)}</b>`;
           });
-          return [`<span style="color:#64748B">${time}</span>`, ...lines].join("<br/>");
+          return [`<span style="color:${CHART_HEX.label}">${head}</span>`, ...lines].join("<br/>");
         },
       },
-      series: [series("Read", TEAL, read), series("Write", CYAN, write)],
+      series: [line("Write", "net", w), line("Read", "disk", r)],
     } as EChartsOption;
-  }, [ts, read, write]);
+  }, [ts, read, write, rangeSec]);
 
-  return <EChart option={option} style={{ width: "100%", height }} />;
+  return <EChart option={option} notMerge className={cn("h-full w-full", className)} />;
 }
-
-export { fmtRate };
